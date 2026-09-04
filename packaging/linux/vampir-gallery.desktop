@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Vampir gallery
+Comment=Every widget in the Vampir toolkit, in one window
+Exec=vampir-gallery
+# Matches the icon installed as vampir-gallery.png in the hicolor theme, and
+# nothing else: Wayland has no way for a window to hand its compositor an
+# icon, so it matches the window's app id to a file like this one and reads
+# the icon from here. Get the name wrong and the window has no icon, however
+# many pixels the program is holding.
+Icon=vampir-gallery
+Categories=Development;GTK;
+StartupWMClass=vampir-gallery

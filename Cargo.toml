@@ -1,0 +1,66 @@
+[package]
+name = "vampir"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Lit widget toolkit for GPUI: buttons, fields, pop-ups, menus and a text input, over a small OKLCH palette."
+repository = "https://github.com/404oops/vampir"
+homepage = "https://github.com/404oops/vampir"
+documentation = "https://docs.rs/vampir"
+readme = "README.md"
+keywords = ["gpui", "gui", "widgets", "ui", "toolkit"]
+categories = ["gui"]
+exclude = ["docs/", ".github/", "tools/"]
+
+[features]
+default = ["app-icon"]
+# Setting the application icon at runtime. The widgets need none of it, so
+# `default-features = false` gets back to a crate with two dependencies:
+#
+#   vampir = { version = "0.1", default-features = false }
+app-icon = ["dep:image", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
+
+[dependencies]
+# gpui-ce is the community edition of Zed's GPUI (Apache-2.0): the same API,
+# synced from Zed and published to crates.io, which is what lets this crate be
+# published too. Imported as `gpui` so the code reads as GPUI code.
+gpui = { package = "gpui-ce", version = "0.2.2" }
+unicode-segmentation = "1"
+
+# Only for `app-icon`, and only on the platform that wants them. Both are
+# already in the tree by way of GPUI's own backends, so on a machine that
+# builds GPUI at all they cost nothing to compile.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", optional = true }
+objc2-app-kit = { version = "0.3", optional = true, features = [
+    "NSApplication",
+    "NSGraphics",
+    "NSImage",
+    "NSResponder",
+] }
+objc2-foundation = { version = "0.3", optional = true, features = ["NSData"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+image = { version = "0.25", optional = true, default-features = false, features = [
+    "png",
+] }
+
+[dev-dependencies]
+# The examples open a real window; gpui itself is platform-agnostic and the
+# backend lives here. `runtime_shaders` compiles the Metal shaders when the
+# app starts instead of at build time, so a machine with only the command line
+# tools — no full Xcode — can build the gallery.
+gpui_ce_platform = { version = "0.1.0", features = [
+    "font-kit",
+    "runtime_shaders",
+    "wayland",
+    "x11",
+] }
+
+[[example]]
+name = "gallery"
+path = "examples/gallery.rs"
+
+[profile.release]
+lto = "thin"

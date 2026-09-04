@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+
+	<!-- The executable name inside Contents/MacOS. `cargo build --example
+	     gallery` produces `gallery`, and bundle.sh copies it under that
+	     name, so the two have to agree. -->
+	<key>CFBundleExecutable</key>
+	<string>gallery</string>
+
+	<key>CFBundleIconFile</key>
+	<string>icon.icns</string>
+
+	<!-- Without an identifier macOS has nowhere to hang the app: no Dock
+	     position it remembers, no entry in the privacy settings, no way to
+	     tell one build from another. An unbundled binary has none, which is
+	     why it reads as a stray process rather than an app. -->
+	<key>CFBundleIdentifier</key>
+	<string>rs.vampir.gallery</string>
+
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+
+	<!-- This is the name in the menu bar, and the only thing that puts it
+	     there. It is also why it is short: macOS truncates the application
+	     menu's title, so keep this under about sixteen characters. -->
+	<key>CFBundleName</key>
+	<string>Vampir gallery</string>
+
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+
+	<key>NSHighResolutionCapable</key>
+	<true/>
+
+	<!-- GPUI drives AppKit itself; this is the class it expects to be
+	     running under. -->
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
+</dict>
+</plist>

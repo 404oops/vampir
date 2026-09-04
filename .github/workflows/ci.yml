@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # GPUI's Linux backend links against the desktop's own libraries.
+      # This is the subset of Zed's `script/linux` that the toolkit needs.
+      - name: Linux libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev libfontconfig-dev libgit2-dev libglib2.0-dev \
+            libssl-dev libva-dev libwayland-dev libx11-xcb-dev \
+            libxkbcommon-x11-dev libzstd-dev libsqlite3-dev libvulkan-dev
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+      - name: Build the gallery
+        run: cargo build --example gallery
+
+      # The library's own promise: two dependencies, on every platform.
+      - name: Build the core alone
+        run: cargo build --no-default-features
