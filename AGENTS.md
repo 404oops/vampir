@@ -42,7 +42,9 @@ Keep these conventions in mind when changing the library. Each is explained in m
 
 **Select on release, not on press**, because pressing is also how a drag starts. Handle the release that never comes. Anything that blocks the mouse must forward moves and releases. Disable rather than remove. → [design.md](docs/design.md#interaction)
 
-**Ring the active element, and if it holds options, the current option inside it.** A group is one tab stop; the ring goes on the chosen dot, the active tab, the slider's thumb — never around the container. Clicking an option puts the keyboard on it, so Tab carries on from there. → [keyboard.md](docs/keyboard.md)
+**Ring the active element, and if it holds options, the current option inside it.** A group is one tab stop; the ring goes on the chosen dot, the active tab, the slider's thumb — never around the container. Clicking an option puts the keyboard on it, so Tab carries on from there. Tab, Shift-Tab, Escape and text editing are the toolkit's to bind (`bind_keys`, `root`); a host binds only its own shortcuts. Anything that takes the keyboard hands it back when it closes, or to the root when there is nowhere to hand it back to. → [keyboard.md](docs/keyboard.md)
+
+**The gallery shows widgets; the crate does the work.** Anything the gallery would have to implement to demonstrate a widget — focus return, key routing, a fade, a theme, a layout helper — belongs in the crate, so the next host gets it too. A host-side pattern in the gallery that runs to more than a few lines is a missing API, not an example. → [hosting.md](docs/hosting.md)
 
 **Ids are `&'static str`,** and are both the element id and the widget's identity in `ControlState`. Two widgets of the same kind in one view must not share one. → [hosting.md](docs/hosting.md#ids)
 
@@ -107,4 +109,4 @@ Check both schemes for anything visual. The gallery opens in whatever scheme the
 
 ## Scope
 
-The library is independent of any particular application. App-specific features such as a menu bar, key bindings and windows belong in the host, which is why [macos-apps.md](docs/macos-apps.md) is written as guidance for hosts and demonstrated in the gallery rather than built into the crate.
+The library is independent of any particular application. App-specific features such as a menu bar, key bindings and windows belong in the host, which is why [macos-apps.md](docs/macos-apps.md) is written as guidance for hosts and demonstrated in the gallery rather than built into the crate. The Edit menu is the one exception (`edit_menu`), because its items are the toolkit's own text actions.

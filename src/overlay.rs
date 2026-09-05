@@ -1,17 +1,20 @@
-//! Things that float above the view: tooltips and a command palette.
+//! Things that float above the view: tooltips and a command palette, and
+//! the search field with results that the palette is built from.
 
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, AnyView, App, Context, Div, ElementId, Entity, FontWeight, MouseButton,
-    MouseDownEvent, Render, SharedString, Window, deferred, div, prelude::*, px,
+    AnyElement, AnyView, App, Context, Div, ElementId, Entity, FontWeight, InteractiveElement,
+    MouseButton, MouseDownEvent, Render, SharedString, Window, deferred, div, prelude::*, px,
 };
 
 use crate::controls::search_field;
+use crate::easing::{ease_out_cubic, progress};
+use crate::keyboard::{self, Dismiss, Key, Orientation};
 use crate::lighting;
 use crate::palette::Palette;
-use crate::state::{ControlHost, MOVE, SWITCH_SLIDE};
-use crate::text_input::TextInput;
+use crate::state::{COMBO_REVEAL, ComboId, ControlHost, MOVE, SWITCH_SLIDE};
+use crate::text_input::{self as text, TextInput};
 
 // ---- Tooltip ----------------------------------------------------------------
 
@@ -26,47 +29,85 @@ pub struct Tooltip {
     palette: Palette,
 }
 
-impl Tooltip {
+/// What a tooltip says: a label, and optionally the shortcut after it.
+///
+/// A plain `&str` converts into one, so a control that takes a `Hint` can
+/// be handed `"Undo"`; `Hint::new("Favourite").shortcut(display("secondary-d"))`
+/// adds the accelerator. Purely a label: binding the key is the host's
+/// business.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hint {
+    pub text: SharedString,
+    pub shortcut: Option<SharedString>,
+}
+
+impl Hint {
+    pub fn new(text: impl Into<SharedString>) -> Self {
+        Self {
+            text: text.into(),
+            shortcut: None,
+        }
+    }
+
+    /// The accelerator shown after the label.
+    pub fn shortcut(mut self, shortcut: impl Into<SharedString>) -> Self {
+        self.shortcut = Some(shortcut.into());
+        self
+    }
+
     /// Builds the callback `.tooltip(..)` wants.
-    ///
-    /// ```ignore
-    /// controls::icon_button("undo", glyph, 26.0, false, true, &palette, cx, ..)
-    ///     .tooltip(Tooltip::text("Undo", palette))
-    /// ```
-    pub fn text(
-        text: impl Into<SharedString>,
-        palette: Palette,
-    ) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
-        let text = text.into();
+    pub fn tooltip(self, palette: Palette) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
         move |_window, cx| {
-            let text = text.clone();
+            let hint = self.clone();
             cx.new(move |_cx| Tooltip {
-                text,
-                shortcut: None,
+                text: hint.text,
+                shortcut: hint.shortcut,
                 palette,
             })
             .into()
         }
     }
+}
 
-    /// The same, with an accelerator shown after the label. Purely a label:
-    /// binding the key is the host's business.
+impl From<&str> for Hint {
+    fn from(text: &str) -> Self {
+        Hint::new(text.to_string())
+    }
+}
+
+impl From<String> for Hint {
+    fn from(text: String) -> Self {
+        Hint::new(text)
+    }
+}
+
+impl From<SharedString> for Hint {
+    fn from(text: SharedString) -> Self {
+        Hint::new(text)
+    }
+}
+
+impl Tooltip {
+    /// Builds the callback `.tooltip(..)` wants, for any interactive element
+    /// of the host's own. GPUI allows one tooltip per element.
+    ///
+    /// ```ignore
+    /// div().id("thumbnail").child(image).tooltip(Tooltip::text("Open", palette))
+    /// ```
+    pub fn text(
+        text: impl Into<SharedString>,
+        palette: Palette,
+    ) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+        Hint::new(text).tooltip(palette)
+    }
+
+    /// The same, with an accelerator shown after the label.
     pub fn with_shortcut(
         text: impl Into<SharedString>,
         shortcut: impl Into<SharedString>,
         palette: Palette,
     ) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
-        let text = text.into();
-        let shortcut = shortcut.into();
-        move |_window, cx| {
-            let (text, shortcut) = (text.clone(), shortcut.clone());
-            cx.new(move |_cx| Tooltip {
-                text,
-                shortcut: Some(shortcut),
-                palette,
-            })
-            .into()
-        }
+        Hint::new(text).shortcut(shortcut).tooltip(palette)
     }
 }
 
@@ -203,12 +244,10 @@ pub const COMMAND_ROW_HEIGHT: f32 = 30.0;
 
 /// A list of matching commands, one row each, with one highlighted.
 ///
-/// The rows the command palette shows, on their own — for a search field
-/// with its results underneath, an "open recent" list, anywhere a query has
-/// a list of answers. The host owns the matches and the highlight, because
-/// those are what its arrow keys move and what its Enter commits;
-/// [`fuzzy_filter`] does the ranking. Each row reports its `Command::id`
-/// when clicked.
+/// The rows on their own, for a host that filters and moves the highlight
+/// itself; [`search_list`] is these under a search field with the keys
+/// wired, and [`command_palette`] is that in an overlay. Each row reports
+/// its `Command::id` when clicked.
 pub fn command_list<V: ControlHost>(
     id: &'static str,
     matches: &[Command],
@@ -312,42 +351,42 @@ pub fn command_list<V: ControlHost>(
         .children(rows)
 }
 
-/// Centred overlay with a filter field and a list of matching commands.
+type Activate<V> = Rc<dyn Fn(&mut V, SharedString, &mut Window, &mut Context<V>)>;
+
+/// A search field with the rows that match it underneath, and the keys
+/// between the two: Up and Down move the highlight, Enter picks it.
 ///
-/// The host owns the query input, the filtered list and the highlighted
-/// index, because all three are also what the up and down keys move and
-/// what Enter commits, and those bindings belong with the host's other
-/// keys. [`fuzzy_filter`] does the ranking.
+/// The host owns the query input and the items; this filters the items by
+/// the query with [`fuzzy_filter`], keeps the keyboard's row in
+/// [`ControlState`](crate::ControlState) under `id`, and reports the picked
+/// `Command::id` — from a click and from Enter alike. The keys arrive as the
+/// field's own actions: a single-line field has no use for Up, Down or an
+/// Enter it has nothing to submit to, so it passes them on, and they are
+/// caught here on the element that holds the field — which is also why they
+/// only work while the field has the keyboard.
 #[allow(clippy::too_many_arguments)]
-pub fn command_palette<V: ControlHost>(
+pub fn search_list<V: ControlHost>(
     id: &'static str,
     query: &Entity<TextInput>,
-    matches: &[Command],
-    highlighted: usize,
+    items: &[Command],
     palette: Palette,
     view: &V,
     window: &Window,
     cx: &mut Context<V>,
     on_activate: impl Fn(&mut V, SharedString, &mut Window, &mut Context<V>) + 'static,
-    on_dismiss: impl Fn(&mut V, &mut Window, &mut Context<V>) + 'static,
-) -> impl IntoElement {
-    let dark = palette.is_dark;
-    let on_activate = Rc::new(on_activate);
-    let list_scroll = view
+) -> Div {
+    let on_activate: Activate<V> = Rc::new(on_activate);
+    let text = query.read(cx).text();
+    let matches = fuzzy_filter(&text, items);
+    let highlighted = view
         .control_state()
-        .scroll(ElementId::Name(format!("{id}-list").into()));
-    let fill = if dark {
-        palette.soft_fill
-    } else {
-        palette.field_surface
-    };
-
-    let empty = matches.is_empty();
+        .list_highlight(id, &text)
+        .min(matches.len().saturating_sub(1));
     let rows = {
         let on_activate = on_activate.clone();
         command_list(
             id,
-            matches,
+            &matches,
             highlighted,
             palette,
             view,
@@ -355,85 +394,212 @@ pub fn command_palette<V: ControlHost>(
             move |view, id, window, cx| on_activate(view, id, window, cx),
         )
     };
+    let ids = matches.iter().map(|command| command.id.clone()).collect();
+    let list = div()
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .child(search_field(id, query, palette, window, cx))
+        .child(rows);
+    list_keys(list, id, ids, cx, on_activate)
+}
 
-    deferred(
-        div()
-            .id(ElementId::Name(format!("{id}-scrim").into()))
-            .absolute()
-            .inset_0()
-            .flex()
-            .flex_col()
-            .items_center()
-            .bg(palette.scrim())
-            .occlude()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
-                    on_dismiss(this, window, cx);
-                    cx.notify();
-                }),
-            )
-            .child(
-                div()
-                    // A little above centre: the list grows downward, and a
-                    // palette pinned to the middle ends up low on the screen
-                    // as soon as it has results.
-                    .mt(gpui::relative(0.16))
-                    .w(px(520.0))
-                    .max_w(gpui::relative(0.9))
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.0))
-                    .p(px(8.0))
-                    .rounded(px(10.0))
-                    .bg(fill)
-                    .border_1()
-                    .border_color(lighting::rim(fill, dark))
-                    .shadow(lighting::panel(dark))
-                    .occlude()
-                    .child(search_field(id, query, palette, window, cx))
-                    .child(
-                        div()
-                            .relative()
-                            .child(
+/// Puts a filtering list's keys on the element that holds its query field:
+/// Up and Down move the highlight through `ids`, Enter picks the
+/// highlighted one.
+fn list_keys<V: ControlHost, E: InteractiveElement>(
+    element: E,
+    id: &'static str,
+    ids: Vec<SharedString>,
+    cx: &mut Context<V>,
+    on_activate: Activate<V>,
+) -> E {
+    let count = ids.len();
+    let step = move |this: &mut V, key: Key, cx: &mut Context<V>| {
+        let state = this.control_state();
+        let here = state.list_position(id).min(count.saturating_sub(1));
+        if let Some(moved) = keyboard::step(key, Orientation::Vertical, here, count) {
+            state.highlight_list(id, moved);
+            cx.notify();
+        }
+    };
+    let step_down = step;
+    element
+        .on_action(cx.listener(move |this, _: &text::Up, _window, cx| {
+            step(this, Key::Up, cx);
+        }))
+        .on_action(cx.listener(move |this, _: &text::Down, _window, cx| {
+            step_down(this, Key::Down, cx);
+        }))
+        .on_action(cx.listener(move |this, _: &text::Enter, window, cx| {
+            let here = this
+                .control_state()
+                .list_position(id)
+                .min(count.saturating_sub(1));
+            if let Some(picked) = ids.get(here) {
+                on_activate(this, picked.clone(), window, cx);
+                cx.notify();
+            }
+        }))
+}
+
+/// Centred overlay with a filter field and a list of matching commands.
+///
+/// Open it with [`ControlState::open_palette`](crate::ControlState::open_palette)
+/// — or [`toggle_palette`](crate::ControlState::toggle_palette), from
+/// whatever shortcut the host gives it; while `id` is not open this returns
+/// nothing. The host owns the query input and the commands. The palette
+/// filters them with [`fuzzy_filter`], moves the highlight with Up and Down,
+/// runs the highlighted command on Enter or a clicked one, and closes on
+/// Escape or a press on the scrim. It closes before a command runs, handing
+/// the keyboard back where it was, so a command that opens something starts
+/// from the right place.
+#[allow(clippy::too_many_arguments)]
+pub fn command_palette<V: ControlHost>(
+    id: ComboId,
+    query: &Entity<TextInput>,
+    commands: &[Command],
+    palette: Palette,
+    view: &V,
+    window: &Window,
+    cx: &mut Context<V>,
+    on_activate: impl Fn(&mut V, SharedString, &mut Window, &mut Context<V>) + 'static,
+) -> Option<impl IntoElement> {
+    let state = view.control_state();
+    let opened_at = state
+        .palette_overlay
+        .as_ref()
+        .filter(|open| open.id == id)?
+        .opened_at;
+    let dark = palette.is_dark;
+    let on_activate: Activate<V> = Rc::new(move |view: &mut V, picked, window, cx| {
+        view.control_state_mut().close_palette(window, cx);
+        on_activate(view, picked, window, cx);
+    });
+    // The panel arrives the way a menu does: the same reveal, a short drift
+    // down into place.
+    let reveal = ease_out_cubic(progress(opened_at, state.scaled(COMBO_REVEAL)));
+    let list_scroll = state.scroll(ElementId::Name(format!("{id}-list").into()));
+    let fill = if dark {
+        palette.soft_fill
+    } else {
+        palette.field_surface
+    };
+
+    let text = query.read(cx).text();
+    let matches = fuzzy_filter(&text, commands);
+    let highlighted = state
+        .list_highlight(id, &text)
+        .min(matches.len().saturating_sub(1));
+    let empty = matches.is_empty();
+    let rows = {
+        let on_activate = on_activate.clone();
+        command_list(
+            id,
+            &matches,
+            highlighted,
+            palette,
+            view,
+            cx,
+            move |view, id, window, cx| on_activate(view, id, window, cx),
+        )
+    };
+    let ids = matches.iter().map(|command| command.id.clone()).collect();
+
+    let panel = div()
+        // A little above centre: the list grows downward, and a palette
+        // pinned to the middle ends up low on the screen as soon as it has
+        // results.
+        .mt(gpui::relative(0.16))
+        .relative()
+        .top(px(-6.0 * (1.0 - reveal)))
+        .opacity(reveal)
+        .w(px(520.0))
+        .max_w(gpui::relative(0.9))
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .p(px(8.0))
+        .rounded(px(10.0))
+        .bg(fill)
+        .border_1()
+        .border_color(lighting::rim(fill, dark))
+        .shadow(lighting::panel(dark))
+        .occlude()
+        // Once `bind_keys` has run, Escape arrives as this action and never
+        // as a key. The query field has the keyboard, and this is the first
+        // thing above it.
+        .on_action(cx.listener(move |this, _: &Dismiss, window, cx| {
+            this.control_state_mut().close_palette(window, cx);
+            cx.notify();
+        }))
+        .child(search_field(id, query, palette, window, cx))
+        .child(
+            div()
+                .relative()
+                .child(
+                    div()
+                        .id(ElementId::Name(format!("{id}-list").into()))
+                        .max_h(px(340.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(1.0))
+                        .overflow_y_scroll()
+                        .restrict_scroll_to_axis()
+                        .track_scroll(&list_scroll)
+                        .child(rows)
+                        .when(empty, |el| {
+                            el.child(
                                 div()
-                                    .id(ElementId::Name(format!("{id}-list").into()))
-                                    .max_h(px(340.0))
+                                    .h(px(30.0))
+                                    .px(px(9.0))
                                     .flex()
-                                    .flex_col()
-                                    .gap(px(1.0))
-                                    .overflow_y_scroll()
-                                    .restrict_scroll_to_axis()
-                                    .track_scroll(&list_scroll)
-                                    .child(rows)
-                                    .when(empty, |el| {
-                                        el.child(
-                                            div()
-                                                .h(px(30.0))
-                                                .px(px(9.0))
-                                                .flex()
-                                                .items_center()
-                                                .text_size(px(12.5))
-                                                .font_weight(FontWeight::NORMAL)
-                                                .text_color(palette.text_secondary)
-                                                .child("No matching commands"),
-                                        )
-                                    }),
+                                    .items_center()
+                                    .text_size(px(12.5))
+                                    .font_weight(FontWeight::NORMAL)
+                                    .text_color(palette.text_secondary)
+                                    .child("No matching commands"),
                             )
-                            // A long list fades at the edge that has more
-                            // past it, rather than slicing a row in half.
-                            .children(crate::scroll::scroll_fades(
-                                view.control_state(),
-                                id,
-                                &list_scroll,
-                                crate::scroll::ScrollAxis::Vertical,
-                                fill,
-                                fill,
-                            )),
-                    ),
-            ),
+                        }),
+                )
+                // A long list fades at the edge that has more past it,
+                // rather than slicing a row in half.
+                .children(crate::scroll::scroll_fades(
+                    state,
+                    id,
+                    &list_scroll,
+                    crate::scroll::ScrollAxis::Vertical,
+                    fill,
+                    fill,
+                )),
+        );
+    let panel = list_keys(panel, id, ids, cx, on_activate);
+
+    Some(
+        deferred(
+            div()
+                .id(ElementId::Name(format!("{id}-scrim").into()))
+                .absolute()
+                .inset_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .bg(crate::color::with_alpha(
+                    palette.scrim(),
+                    palette.scrim().alpha * reveal,
+                ))
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
+                        this.control_state_mut().close_palette(window, cx);
+                        cx.notify();
+                    }),
+                )
+                .child(panel),
+        )
+        .with_priority(180),
     )
-    .with_priority(180)
 }
 
 #[cfg(test)]

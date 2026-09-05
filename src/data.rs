@@ -15,7 +15,7 @@ use gpui::{
 use crate::keyboard::{self, Key};
 use crate::lighting;
 use crate::palette::Palette;
-use crate::state::{ControlHost, SWITCH_SLIDE};
+use crate::state::{ControlHost, ControlState, MOVE, SWITCH_SLIDE};
 
 // ---- Tree -------------------------------------------------------------------
 
@@ -67,6 +67,45 @@ impl TreeRow {
         self.detail = Some(detail.into());
         self
     }
+}
+
+/// Walks a host's tree into the rows a [`tree_row`] draws, skipping the
+/// children of anything closed — which is the step that makes collapsing
+/// mean something. Keeping the flattened list *as* the model is the
+/// tempting shortcut, since it is what gets drawn, but then closing a
+/// branch has nothing to hide, because its children were never underneath
+/// it in the first place.
+///
+/// `row` makes the [`TreeRow`] for one node at a depth; its `expanded` is
+/// what decides whether `children` is walked.
+///
+/// ```ignore
+/// let rows = flatten_tree(&self.files, &|node, depth| node.row(depth), &|node| &node.children);
+/// ```
+pub fn flatten_tree<N>(
+    roots: &[N],
+    row: &impl Fn(&N, usize) -> TreeRow,
+    children: &impl Fn(&N) -> &[N],
+) -> Vec<TreeRow> {
+    fn walk<N>(
+        nodes: &[N],
+        depth: usize,
+        row: &impl Fn(&N, usize) -> TreeRow,
+        children: &impl Fn(&N) -> &[N],
+        rows: &mut Vec<TreeRow>,
+    ) {
+        for node in nodes {
+            let flat = row(node, depth);
+            let open = flat.expanded == Some(true);
+            rows.push(flat);
+            if open {
+                walk(children(node), depth + 1, row, children, rows);
+            }
+        }
+    }
+    let mut rows = Vec::new();
+    walk(roots, 0, row, children, &mut rows);
+    rows
 }
 
 /// How far each level of nesting is indented.
@@ -485,6 +524,57 @@ fn lay_out_cell<E: Styled + gpui::prelude::FluentBuilder>(el: E, layout: CellLay
 /// ```
 pub fn table_cell(column: &Column, content: impl IntoElement) -> impl IntoElement {
     lay_out_cell(div(), CellLayout::of(column)).child(content)
+}
+
+/// One body row of plain text, on the header's grid, that slides to its
+/// place: `slot` is where the row sits now, and a re-sort slides each row
+/// to its new slot rather than redealing the table. Keyed by `key` — what
+/// the row *is*, not where it is — so the row is seen to be the same row
+/// somewhere else. The first value is what the row is and is set in primary
+/// text; the rest describe it, and are set quieter.
+///
+/// For a row that is more than text — selectable, hoverable, with a control
+/// in it — lay it out with [`table_cell`] instead.
+pub fn table_row(
+    table: &'static str,
+    key: impl Into<SharedString>,
+    slot: usize,
+    columns: &[Column],
+    values: impl IntoIterator<Item = impl Into<SharedString>>,
+    palette: Palette,
+    state: &ControlState,
+) -> gpui::Div {
+    let place = slot as f32 * TABLE_ROW_HEIGHT;
+    let offset = state.tween(
+        ElementId::Name(format!("{table}-row-{}", key.into()).into()),
+        place,
+        MOVE,
+    ) - place;
+    div()
+        .relative()
+        .top(px(offset))
+        .h(px(TABLE_ROW_HEIGHT))
+        .flex()
+        .flex_none()
+        .items_center()
+        .children(
+            columns
+                .iter()
+                .zip(values)
+                .enumerate()
+                .map(|(index, (column, value))| {
+                    table_cell(
+                        column,
+                        div()
+                            .text_color(if index == 0 {
+                                palette.text_primary
+                            } else {
+                                palette.text_secondary
+                            })
+                            .child(value.into()),
+                    )
+                }),
+        )
 }
 
 /// Header row for a table: column labels, with an arrow on the sorted one.

@@ -9,28 +9,40 @@
 //! way in most applications built on it.
 //!
 //! So the keys in [`Key`] are handled by the controls themselves, through
-//! `on_key_down`, and need no setup at all. Everything else stays the
-//! host's.
+//! `on_key_down`, and need no setup at all.
 //!
-//! The one thing the host still has to bind is Tab, because moving focus is
-//! a window-wide decision rather than any one control's:
+//! Three keys are the same in every application but cannot be any one
+//! control's: Tab and Shift-Tab, which walk the window, and Escape, which
+//! closes whatever is open. Text editing is the same everywhere too. Those
+//! the toolkit binds itself, to its own actions, in [`bind_keys`], and
+//! [`handle_keys`] puts the handlers for them on the host's root:
 //!
 //! ```ignore
-//! KeyBinding::new("tab", FocusNext, None),
-//! KeyBinding::new("shift-tab", FocusPrevious, None),
-//! // ...and in the handlers:
-//! window.focus_next(cx);
-//! window.focus_prev(cx);
+//! // Once, when the application starts:
+//! vampir::bind_keys(cx);
+//! // On the root element of every view that hosts controls:
+//! vampir::root(div().id("root"), self, cx)
+//!     .child(..)
 //! ```
+//!
+//! Everything else — ⌘K, ⌘S, the application's own keys — stays the
+//! host's.
 
 use gpui::{
-    App, Div, ElementId, FocusHandle, InteractiveElement, KeyDownEvent, Stateful, Styled, Window,
-    div, px,
+    App, Context, Div, ElementId, FocusHandle, InteractiveElement, KeyBinding, KeyDownEvent, Menu,
+    MenuItem as OsMenuItem, MouseDownEvent, OsAction, Stateful, Styled, Window, actions, div, px,
 };
 
 use crate::lighting;
 use crate::palette::Palette;
 use crate::state::ControlHost;
+use crate::text_input as text;
+
+// The toolkit's own actions, which `bind_keys` binds and `handle_keys`
+// handles: Tab, Shift-Tab and Escape. Escape reaches whatever holds the
+// keyboard first — a pop-up list, a menu, a dialog — and the root only if
+// none of them took it.
+actions!(vampir, [FocusNext, FocusPrevious, Dismiss]);
 
 /// Makes a control a tab stop and rings it when the keyboard lands on it.
 ///
@@ -101,19 +113,185 @@ fn dress<E: InteractiveElement + Styled>(el: E, radius: f32, palette: Palette) -
         })
 }
 
+/// The bindings that are the same in every application: Tab and Shift-Tab
+/// walking the window, Escape closing whatever is open, and the text
+/// editing keys in the `TextInput` context. `secondary` is ⌘ on macOS and
+/// Ctrl everywhere else, so one binding serves both; the rest of the text
+/// keymap is the one place the platforms genuinely disagree — ⌥ moves by
+/// word on a Mac, Ctrl does elsewhere — so it is written out twice.
+///
+/// [`bind_keys`] installs them. This is the list on its own, for a host
+/// that wants to look at it or leave some out.
+pub fn standard_bindings() -> Vec<KeyBinding> {
+    const TEXT: Option<&str> = Some("TextInput");
+    let mut bindings = vec![
+        KeyBinding::new("tab", FocusNext, None),
+        KeyBinding::new("shift-tab", FocusPrevious, None),
+        KeyBinding::new("escape", Dismiss, None),
+        KeyBinding::new("backspace", text::Backspace, TEXT),
+        KeyBinding::new("delete", text::Delete, TEXT),
+        KeyBinding::new("left", text::Left, TEXT),
+        KeyBinding::new("right", text::Right, TEXT),
+        KeyBinding::new("up", text::Up, TEXT),
+        KeyBinding::new("down", text::Down, TEXT),
+        KeyBinding::new("shift-left", text::SelectLeft, TEXT),
+        KeyBinding::new("shift-right", text::SelectRight, TEXT),
+        KeyBinding::new("shift-up", text::SelectUp, TEXT),
+        KeyBinding::new("shift-down", text::SelectDown, TEXT),
+        KeyBinding::new("home", text::Home, TEXT),
+        KeyBinding::new("end", text::End, TEXT),
+        KeyBinding::new("shift-home", text::SelectToHome, TEXT),
+        KeyBinding::new("shift-end", text::SelectToEnd, TEXT),
+        KeyBinding::new("enter", text::Enter, TEXT),
+        KeyBinding::new("secondary-a", text::SelectAll, TEXT),
+        KeyBinding::new("secondary-c", text::Copy, TEXT),
+        KeyBinding::new("secondary-v", text::Paste, TEXT),
+        KeyBinding::new("secondary-x", text::Cut, TEXT),
+        KeyBinding::new("secondary-z", text::Undo, TEXT),
+        KeyBinding::new("secondary-shift-z", text::Redo, TEXT),
+    ];
+    if cfg!(target_os = "macos") {
+        bindings.extend([
+            KeyBinding::new("alt-backspace", text::DeleteWordLeft, TEXT),
+            KeyBinding::new("cmd-backspace", text::DeleteToLineStart, TEXT),
+            KeyBinding::new("alt-left", text::WordLeft, TEXT),
+            KeyBinding::new("alt-right", text::WordRight, TEXT),
+            KeyBinding::new("alt-shift-left", text::SelectWordLeft, TEXT),
+            KeyBinding::new("alt-shift-right", text::SelectWordRight, TEXT),
+            KeyBinding::new("cmd-left", text::Home, TEXT),
+            KeyBinding::new("cmd-right", text::End, TEXT),
+            KeyBinding::new("cmd-shift-left", text::SelectToHome, TEXT),
+            KeyBinding::new("cmd-shift-right", text::SelectToEnd, TEXT),
+            KeyBinding::new("cmd-up", text::DocumentStart, TEXT),
+            KeyBinding::new("cmd-down", text::DocumentEnd, TEXT),
+        ]);
+    } else {
+        bindings.extend([
+            KeyBinding::new("ctrl-backspace", text::DeleteWordLeft, TEXT),
+            KeyBinding::new("ctrl-left", text::WordLeft, TEXT),
+            KeyBinding::new("ctrl-right", text::WordRight, TEXT),
+            KeyBinding::new("ctrl-shift-left", text::SelectWordLeft, TEXT),
+            KeyBinding::new("ctrl-shift-right", text::SelectWordRight, TEXT),
+            KeyBinding::new("ctrl-home", text::DocumentStart, TEXT),
+            KeyBinding::new("ctrl-end", text::DocumentEnd, TEXT),
+        ]);
+    }
+    bindings
+}
+
+/// Binds the keys that are the same in every application — see
+/// [`standard_bindings`]. Call it once, when the application starts. A
+/// host's own bindings go in after it; GPUI gives a later binding for the
+/// same key precedence, so a host that needs Escape for something of its
+/// own can still take it.
+pub fn bind_keys(cx: &mut App) {
+    cx.bind_keys(standard_bindings());
+}
+
+/// Puts the handlers for the standard keys on the host's root element, so
+/// the actions [`bind_keys`] binds have somewhere to arrive when the focused
+/// control has not taken them itself. Tab and Shift-Tab go through
+/// [`move_focus`]; Escape closes any pop-up list, menu or command palette
+/// still open; and a mouse press anywhere marks the mouse as being in
+/// charge, so that the next Tab shows where the keyboard is rather than
+/// moving it.
+///
+/// It also gives the root the toolkit's root focus handle
+/// ([`ControlState::root_focus`](crate::ControlState::root_focus)), which is
+/// where the keyboard goes when whatever had it has gone: an overlay
+/// closing with nothing to hand back to, a host switching pages
+/// ([`ControlState::focus_root`](crate::ControlState::focus_root)). GPUI
+/// dispatches nothing from a handle that is no longer in the tree — not even
+/// the root's own shortcuts — so the keyboard always needs somewhere live.
+///
+/// The host adds its own `on_action`s after this. An Escape nothing of the
+/// toolkit's was open for is passed on to them, so a host closes its own
+/// overlays with the same key by listening for [`Dismiss`] too.
+pub fn handle_keys<E: InteractiveElement, V: ControlHost>(
+    root: E,
+    view: &V,
+    cx: &mut Context<V>,
+) -> E {
+    root.track_focus(&view.control_state().root_focus(cx))
+        .on_action(cx.listener(|this, _: &FocusNext, window, cx| {
+            move_focus(this, window, cx, false);
+            cx.notify();
+        }))
+        .on_action(cx.listener(|this, _: &FocusPrevious, window, cx| {
+            move_focus(this, window, cx, true);
+            cx.notify();
+        }))
+        .on_action(cx.listener(|this, _: &Dismiss, window, cx| {
+            if !this.control_state_mut().dismiss_overlays(window, cx) {
+                cx.propagate();
+                return;
+            }
+            cx.notify();
+        }))
+        .on_any_mouse_down(cx.listener(|this, _: &MouseDownEvent, _window, _cx| {
+            this.control_state_mut().ring_hidden = true;
+        }))
+}
+
+/// Everything the toolkit needs on a host's root element: [`handle_keys`]
+/// and [`crate::handle_mouse`] together.
+///
+/// ```ignore
+/// vampir::root(div().id("root"), self, cx)
+///     .on_action(cx.listener(Self::toggle_palette))  // the host's own
+///     .child(..)
+/// ```
+pub fn root<E: InteractiveElement, V: ControlHost>(root: E, view: &V, cx: &mut Context<V>) -> E {
+    handle_keys(crate::state::handle_mouse(root, cx), view, cx)
+}
+
+/// The Edit menu for the menu bar: Undo, Redo, Cut, Copy, Paste and Select
+/// All, wired to the text input's actions.
+///
+/// Each item carries an `OsAction`, so macOS routes it through the responder
+/// chain to whatever text is focused — which is what makes one Edit menu
+/// work for the toolkit's [`TextInput`](crate::TextInput) and for the
+/// system's own fields alike. Put it in `cx.set_menus(..)` between the
+/// application's own menus; see the macOS guide for the rest of the bar.
+pub fn edit_menu() -> Menu {
+    Menu::new("Edit").items([
+        OsMenuItem::os_action("Undo", text::Undo, OsAction::Undo),
+        OsMenuItem::os_action("Redo", text::Redo, OsAction::Redo),
+        OsMenuItem::separator(),
+        OsMenuItem::os_action("Cut", text::Cut, OsAction::Cut),
+        OsMenuItem::os_action("Copy", text::Copy, OsAction::Copy),
+        OsMenuItem::os_action("Paste", text::Paste, OsAction::Paste),
+        OsMenuItem::os_action("Select All", text::SelectAll, OsAction::SelectAll),
+    ])
+}
+
 /// Moves the keyboard to the next control, or back to the previous one.
 ///
-/// Moving focus is the one keyboard job the toolkit leaves to the host, and
-/// this is what the host's Tab handler should call. It closes any pop-up the
-/// keyboard is walking away from, keeps Tab cycling inside a modal dialog
-/// while one is up, and otherwise moves to the next stop in the window.
+/// What Tab and Shift-Tab do, by way of [`handle_keys`]. It closes any
+/// pop-up the keyboard is walking away from, keeps Tab cycling inside a
+/// modal dialog while one is up, and otherwise moves to the next stop in
+/// the window.
 ///
-/// It cannot be done from inside the dialog: Tab is bound by the host, and
-/// in GPUI a keystroke that matches a binding is dispatched as that action
-/// and never reaches a key listener — so the only place the dialog can be
-/// consulted is here, on the host's side of that binding.
+/// One more thing, for a hand that has just come from the mouse: the first
+/// Tab after a mouse press only shows where the keyboard already is. The
+/// ring is hidden while the mouse is in charge, so a Tab that moved would
+/// look as though it had skipped a control — you clicked one thing and the
+/// ring appeared on the next.
+///
+/// None of it can be done from inside the dialog: Tab is bound, and in GPUI
+/// a keystroke that matches a binding is dispatched as that action and
+/// never reaches a key listener — so the only place the dialog can be
+/// consulted is here, on the action's side of that binding.
 pub fn move_focus<V: ControlHost>(view: &mut V, window: &mut Window, cx: &mut App, backward: bool) {
-    view.control_state_mut().dismiss_popups();
+    let state = view.control_state_mut();
+    // A dropdown is a question; walking to another control answers it by
+    // leaving, and a list still on screen looks as though the next key
+    // pressed will land in it.
+    state.dismiss_popups();
+    let reveal = std::mem::take(&mut state.ring_hidden) && window.focused(cx).is_some();
+    if reveal {
+        return;
+    }
     if let Some(next) = view.control_state().trap_next(window, backward) {
         window.focus(&next, cx);
         return;
@@ -142,7 +320,9 @@ pub enum Key {
     PageUp,
     /// A larger step through a range.
     PageDown,
-    /// Escape. Only pop-ups act on it; everything else leaves it to the host.
+    /// Escape, when no binding has claimed it. Once [`bind_keys`] has run it
+    /// arrives as the [`Dismiss`] action instead, and the pop-ups listen for
+    /// both.
     Dismiss,
 }
 
@@ -279,7 +459,7 @@ pub fn nudge_stepped(key: Key, orientation: Orientation, value: f32, stops: u32)
 
 #[cfg(test)]
 mod tests {
-    use super::{Key, Orientation, nudge, nudge_stepped, step};
+    use super::{Key, KeyBinding, Orientation, nudge, nudge_stepped, standard_bindings, step};
 
     #[test]
     fn a_group_wraps_at_both_ends() {
@@ -369,5 +549,60 @@ mod tests {
             nudge_stepped(Key::Right, Orientation::Horizontal, 0.6, 4),
             Some(0.75)
         );
+    }
+
+    /// The Edit menu has the six clipboard and history items every
+    /// application's does, in the order every application lists them.
+    #[test]
+    fn the_edit_menu_is_the_usual_one() {
+        let menu = super::edit_menu();
+        assert_eq!(menu.name.as_ref(), "Edit");
+        let names: Vec<String> = menu
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                gpui::MenuItem::Action {
+                    name, os_action, ..
+                } => {
+                    assert!(os_action.is_some(), "{name} needs an OsAction");
+                    Some(name.to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            names,
+            ["Undo", "Redo", "Cut", "Copy", "Paste", "Select All"]
+        );
+    }
+
+    #[test]
+    fn the_standard_bindings_parse_and_do_not_collide() {
+        let bindings = standard_bindings();
+        let keys = |binding: &KeyBinding| -> String {
+            binding
+                .keystrokes()
+                .iter()
+                .map(|keystroke| keystroke.unparse())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let mut seen = std::collections::HashSet::new();
+        for binding in &bindings {
+            let scoped = binding.predicate().is_some();
+            assert!(
+                seen.insert((keys(binding), scoped)),
+                "{} is bound twice",
+                keys(binding)
+            );
+        }
+        // The window-wide keys are the unscoped ones; everything else is a
+        // text field's, and stays out of the way of every other control.
+        let unscoped: Vec<String> = bindings
+            .iter()
+            .filter(|binding| binding.predicate().is_none())
+            .map(keys)
+            .collect();
+        assert_eq!(unscoped, ["tab", "shift-tab", "escape"]);
     }
 }

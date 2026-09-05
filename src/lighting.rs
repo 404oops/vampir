@@ -74,6 +74,24 @@ pub fn lit_mix(flat: Rgba, base: Rgba, lift: f32, on: f32) -> Background {
     )
 }
 
+/// How much the window's ground is lit: less than a control, because it is
+/// the thing everything else is judged against.
+pub const GROUND_LIFT: f32 = 0.035;
+
+/// The window's ground: [`Palette::backdrop`](crate::Palette::backdrop),
+/// lit from above. Put it on the root with `.bg(ground(palette.backdrop))`.
+pub fn ground(backdrop: Rgba) -> Background {
+    lit(backdrop, GROUND_LIFT)
+}
+
+/// The ground's colour `fraction` of the way down the window, 0 at the top
+/// and 1 at the bottom. What anything that has to blend into the ground — a
+/// scroll-edge fade, say — has to land on at its own height.
+pub fn ground_at(backdrop: Rgba, fraction: f32) -> Rgba {
+    let (top, bottom) = lit_stops(backdrop, GROUND_LIFT);
+    crate::color::lerp(top, bottom, fraction.clamp(0.0, 1.0))
+}
+
 /// The colours [`lit`] runs between, top then bottom.
 ///
 /// For anything that has to land exactly on a lit surface — a scroll-edge

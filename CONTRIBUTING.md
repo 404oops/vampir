@@ -29,9 +29,11 @@ src/
   text_input.rs   the full text input: selection, IME, undo, wrapping
   swatch.rs       the Oklch colour pickers
   palette.rs      the colour roles, and from_hue
+  theme.rs        one hue and a scheme that follows the desktop; the pickers bound to them
   lighting.rs     the shadow and gradient recipes everything draws with
-  state.rs        ControlState and the ControlHost trait
-  scroll.rs  easing.rs  color.rs  shortcut.rs
+  state.rs        ControlState and the ControlHost trait; the host's root handlers
+  keyboard.rs     the standard bindings, focus movement, the ring, the Edit menu
+  scroll.rs  easing.rs  color.rs  shortcut.rs  typography.rs
 
 examples/gallery.rs   every widget in one window, and a complete host
 packaging/macos/      Info.plist and the .app bundle script

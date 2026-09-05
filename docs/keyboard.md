@@ -1,6 +1,6 @@
 # Keyboard and focus
 
-Every control in the toolkit can be reached and operated from the keyboard, and none of it needs setting up beyond binding Tab.
+Every control in the toolkit can be reached and operated from the keyboard, and none of it needs setting up beyond two calls: `vampir::bind_keys(cx)` when the application starts, and `vampir::root(element, self, cx)` on the root element of a view.
 
 ## The principle
 
@@ -22,28 +22,31 @@ They belong to different owners, and the split is the whole design.
 
 ## What the host has to do
 
-One thing. Tab moves focus around a window, which is a window-wide decision no single control is in a position to make:
+Two calls. `bind_keys` binds the keys that are the same in every application — Tab and Shift-Tab, which walk the window; Escape, which closes whatever is open; and the text-editing keymap for `TextInput`, in the macOS dialect or the Ctrl-key one as the platform expects — to the toolkit's own actions, `FocusNext`, `FocusPrevious` and `Dismiss`. `root` puts the handlers for those actions on the root element, where they arrive when no control has taken them itself, along with the mouse handlers the toolkit's drags need and the root focus handle described below:
 
 ```rust
-actions!(app, [FocusNext, FocusPrevious]);
+// Once, when the application starts:
+vampir::bind_keys(cx);
 
-cx.bind_keys([
-    KeyBinding::new("tab", FocusNext, None),
-    KeyBinding::new("shift-tab", FocusPrevious, None),
-]);
-
-// ...on the root element:
-.on_action(cx.listener(|this, _: &FocusNext, window, cx| vampir::move_focus(this, window, cx, false)))
-.on_action(cx.listener(|this, _: &FocusPrevious, window, cx| vampir::move_focus(this, window, cx, true)))
+// On the root element of the view. The host's own actions go after it.
+vampir::root(div().id("root"), self, cx)
+    .on_action(cx.listener(Self::toggle_palette))
+    .child(..)
 ```
 
-`move_focus` rather than `window.focus_next` directly: it closes any pop-up the keyboard is walking away from, and keeps Tab cycling inside a modal dialog while one is up. It has to live on the host's side of the binding — in GPUI a keystroke that matches a binding is dispatched as that action and never reaches a key listener, so the dialog cannot intercept Tab itself.
+`root` is `handle_keys` and `handle_mouse` together; a host that tracks the mouse itself at the root uses `handle_keys` on its own. See [Hosting](hosting.md#drags).
 
-Two details the gallery adds on top, both worth copying.
+Tab goes through `move_focus` rather than `window.focus_next` directly: it closes any pop-up the keyboard is walking away from, and keeps Tab cycling inside a modal dialog while one is up. That has to happen on the action's side of the binding — in GPUI a keystroke that matches a binding is dispatched as that action and never reaches a key listener, so the dialog cannot intercept Tab itself.
 
-**The first Tab after using the mouse shows where the keyboard already is, rather than moving on.** The ring is hidden while the mouse is in charge, so a Tab that moved would look as though it had skipped a control: you clicked one thing and the ring appeared on the next. Track whether the mouse has taken over — an `on_any_mouse_down` at the root is enough — and let the first Tab after that only reveal.
+Escape is answered by whatever holds the keyboard: a pop-up list closes and leaves its value alone, a menu or the command palette closes and hands focus back, a dialog runs its dismiss callback. An Escape nothing of the toolkit's was open for is passed on, so a host that listens for `vampir::Dismiss` on the root — after `root` — closes its own overlays with the same key.
 
-**Moving the keyboard closes anything a pop-up has open.** `ControlState::dismiss_popups` does it in one call. A dropdown is a question the view is asking; walking to another control answers it by leaving, and a list still on screen looks as though the next key pressed will land in it.
+Two more things come with it.
+
+**The first Tab after using the mouse shows where the keyboard already is, rather than moving on.** The ring is hidden while the mouse is in charge, so a Tab that moved would look as though it had skipped a control: you clicked one thing and the ring appeared on the next. `handle_keys` notices the mouse taking over, and `move_focus` lets the first Tab after that only reveal.
+
+**Moving the keyboard closes anything a pop-up has open.** A dropdown is a question the view is asking; walking to another control answers it by leaving, and a list still on screen looks as though the next key pressed will land in it. `move_focus` does it, and `ControlState::dismiss_popups` is the same in one call for a host that moves focus some other way.
+
+The application's own keys — ⌘K, ⌘S — are still the host's to bind, after `bind_keys`; a later binding for the same key wins, so a host can even take Escape for itself if it must. Write them with `secondary` for the platform's primary modifier — see [Hosting](hosting.md#key-bindings-and-menus). What the key *does* is usually one call: the gallery's ⌘K is `self.controls.toggle_palette(..)`.
 
 ## What each control does
 
@@ -55,8 +58,8 @@ Two details the gallery adds on top, both worth copying.
 | `segmented`, `tab_bar` | One tab stop. Left and right move the selection and wrap. |
 | `combo` | Space, Enter or Down opens; moving the keyboard away closes it. Up and down move the highlight, Enter commits it, Escape closes and leaves the value alone — arrowing through a list is looking, not choosing. |
 | `slider` | Arrows move one step, Page ten, Home and End the ends. A stepped track moves one notch. |
-| `spinbox` | Up and down step the value from inside the field; the steppers are tab stops too. |
 | `dialog` | Takes the keyboard when it opens, on the primary button or failing one the first. Tab cycles among its buttons. Enter is the default action, Escape dismisses, and closing hands the keyboard back where it was. |
+| `command_palette`, `search_list` | The query field has the keyboard. Up and down move the highlight, Enter picks it; a new query puts the highlight back on the best match. The palette opens with the keyboard in its query, closes on Escape, and hands the keyboard back where it was. |
 | `collapsible` | Space toggles, Left closes, Right opens. |
 | `split_handle` | Arrows move the divider. A divider only the mouse can move is content a keyboard user cannot reach. |
 | `context_menu` | Takes focus when it opens. Up and down move over the enabled rows only, Enter runs one, Escape closes. Focus goes back where it was. |
@@ -64,15 +67,16 @@ Two details the gallery adds on top, both worth copying.
 | `tree_row` | One tab stop, on the selected row. Up and down walk the flattened rows without wrapping. Right opens a closed branch and then steps into it; left closes an open one and then steps out to the parent. |
 | `color_pad` | Left and right move chroma, up and down move lightness. |
 | `swatch_grid` | Each swatch is a tab stop. |
-| `text_field`, `text_area`, `search_field`, `shortcut_recorder` | Tab stops. Their editing keys are actions the host binds — see [Hosting](hosting.md#key-bindings-and-menus). |
+| `spinbox` | Up and down step the value from inside the field, Enter commits a typed one; the steppers are tab stops too. |
+| `text_field`, `text_area`, `search_field`, `shortcut_recorder` | Tab stops. Their editing keys are bound by `bind_keys`; the actions are public for a host that wants them bound differently — see [Hosting](hosting.md#key-bindings-and-menus). |
 
 ## Keys a field passes on
 
-A single-line `TextInput` has no line to move to, so it passes Up and Down on rather than swallowing them, and an Enter it has nothing to submit to likewise. Whatever holds the field is what those keys mean there: a spin box steps, a command palette moves its highlight and runs the highlighted command. Listen for `text_input::Up`, `Down` and `Enter` as *actions* on the container — a keystroke that matched a binding never arrives as a raw key.
+A single-line `TextInput` has no line to move to, so it passes Up and Down on rather than swallowing them, and an Enter it has nothing to submit to likewise. Whatever holds the field is what those keys mean there: a spin box steps, a search list or a command palette moves its highlight and picks the highlighted row. That is how those are built, and how to build another: listen for `text_input::Up`, `Down` and `Enter` as *actions* on the element that holds the field — a keystroke that matched a binding never arrives as a raw key — and they only fire while the field has the keyboard, which is exactly when they should.
 
 ## Focus that outlives its element
 
-GPUI dispatches nothing from a focus handle whose element is no longer in the tree — not even the window's own shortcuts. So anything that removes the focused element has to put the keyboard somewhere live first: a dialog or menu closing hands it back where it was (`restore_dialog_focus`, `menu_return_focus`), and a host switching pages should re-home it to the root, as the gallery's `show_page` does. A shortcut that "stopped working" is almost always focus left on something that has gone.
+GPUI dispatches nothing from a focus handle whose element is no longer in the tree — not even the window's own shortcuts. So anything that removes the focused element has to put the keyboard somewhere live first. A dialog, a menu or the command palette closing hands it back where it was, and when there was nowhere to hand it back to, to the root: `root` gives the root element the handle in `ControlState::root_focus`, so there is always somewhere live. A host switching pages does the same with `ControlState::focus_root`, as the gallery's `show_page` does. A shortcut that "stopped working" is almost always focus left on something that has gone.
 
 ## How focus is held
 

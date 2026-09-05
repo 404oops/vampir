@@ -28,10 +28,10 @@ cx.set_menus(vec![
 Two details worth knowing:
 
 - A menu named exactly **`"Window"`** is handed to AppKit as the windows menu, which is what fills it with the window list and adds Enter Full Screen. Name it anything else and you get an inert menu.
-- Clipboard items should carry an `OsAction`, so macOS routes them through the responder chain to whatever is focused:
+- Clipboard items should carry an `OsAction`, so macOS routes them through the responder chain to whatever is focused. `vampir::edit_menu()` is the Edit menu built that way — Undo, Redo, Cut, Copy, Paste and Select All, wired to the text input's actions — so it goes into the list as one item:
 
   ```rust
-  MenuItem::os_action("Copy", text_input::Copy, OsAction::Copy)
+  cx.set_menus(vec![app_menu, vampir::edit_menu(), view_menu, window_menu]);
   ```
 
 That is what makes one Edit menu work for Vampir's `TextInput` and for the system's own fields alike.

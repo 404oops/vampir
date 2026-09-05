@@ -14,6 +14,7 @@ Everything reads as a physical surface lit from the top. That is the entire visu
 - `glow(color, alpha, radius)` — focus rings and current-item halos.
 - `shade(color, amount)` — toward white or black.
 - `faded(shadows, t)` — the same shadows at `t` strength, for fades.
+- `ground(backdrop)` — the window's own ground, lit less than anything on it. `ground_at` is its colour at a height, for anything that has to blend into it.
 
 **Raised means you press it. Recessed means you put something in it.** If a new control is neither, work out which it is before drawing it.
 
@@ -42,11 +43,11 @@ If a new control genuinely needs one of these patterns, explain the reason and t
 
 Nested radii step down by 1 or 2, never up.
 
-Text is 12.5px for controls, 11.5px for secondary text, 14px for a dialog title. Do not introduce a fourth size without a reason you can write down.
+Text is 12.5px for controls, 11.5px for secondary text, 14px for a dialog title — `TEXT_SIZE`, `SMALL_TEXT_SIZE` and `TITLE_TEXT_SIZE` in `typography`. Do not introduce a fourth size without a reason you can write down.
 
 ## Colour
 
-Only the roles in `Palette`. If a control needs a colour that is not there, either it is one of the existing roles under another name, or the palette is genuinely missing a role — and adding one means adding it to `from_hue` for every hue and both schemes, and checking the result.
+Only the roles in `Palette`. If a control needs a colour that is not there, either it is one of the existing roles under another name, or the palette is genuinely missing a role — and adding one means adding it to `from_hue` for every hue and both schemes, to `mix`, and checking the result. `backdrop` is the window's ground and the one role no control paints: it is there so a host's ground and the toolkit's panels are derived from the same hue.
 
 **Both schemes always.** A light-mode-only or dark-mode-only path is a bug; the `is_dark` flag exists so one code path covers both.
 
@@ -63,6 +64,7 @@ Only the roles in `Palette`. If a control needs a colour that is not there, eith
 - **Disable, do not remove.** A control at its limit greys out and stays put. Removing it shifts its neighbour under the pointer.
 - **Full width is a decision, not a default.** `button` fills its slot, which is right for a dialog footer and wrong for a list of twenty choices. When the options are a set rather than a sequence of actions, use `chip`.
 - **Pop-up triggers toggle their pop-up.** Pressing an open menu or pop-up button closes it. Dismiss-on-press-outside must ignore the trigger; otherwise it closes on press and reopens on click. `context_menu` and `combo` both check the trigger before dismissing.
+- **Pop-up lists open over their button.** The current option lands on the button, so the pointer is already on it and every other option is one row away; a list too long to show whole starts scrolled so that row is in view. `anchored` shifts the list back inside the window when that would put it over an edge. A menu picks an action rather than shows a value, so it drops below its button instead.
 - **Deferred priorities:** context menus 200, command palette 180, dialogs 150, pop-up lists 100. Keep new overlays inside that ordering.
 
 ## Motion
@@ -71,7 +73,7 @@ Nothing on screen changes in a single frame. A state that flips slides between i
 
 - **Three speeds, and only three.** `SWITCH_SLIDE` (140ms) for a state flipping: a switch, a tick drawing in, a highlight moving to another row, a chevron turning. `MOVE` (180ms) for something going somewhere: the pill under a segmented control or a tab bar, a row taking its sorted place, a page arriving. `SCHEME_FADE` (240ms) for everything changing at once: light to dark, one hue to another. Pop-ups and menus reveal over `COMBO_REVEAL`. A new control picks one of these; it does not invent a fourth.
 - **Ease out to arrive, ease in to leave.** Fast start, settling into the end value, for anything coming in; the reverse for anything going, so both ends of a motion sit against the control rather than drifting from it.
-- **Animate the state, not the click.** A control notices its value changed while it renders — `ControlState::transition` and `blend` for two states, `tween` for a continuous value — so a change from a shortcut, a menu item, the command palette, the host's own code or the desktop switching to dark at sunset moves exactly as a click does.
+- **Animate the state, not the click.** A control notices its value changed while it renders — `ControlState::transition` and `blend` for two states, `tween` for a continuous value — so a change from a shortcut, a menu item, the command palette, the host's own code or the desktop switching to dark at sunset moves exactly as a click does. The same goes for what a host shows: `arriving` for content that changes, `fading_text` for words that do, `ControlState::palette` for the whole scheme.
 - **Nothing animates in from nowhere.** The first time an element is seen it paints its end state. Rows joining a list that is already up fade in at their place; a list that has just appeared arrives whole, with whatever brought it — `ControlState::present` tells the two apart.
 - **A slide that changes its mind bends.** A new target sets off from wherever the value is now, never from either end, so a toggle mid-turn reverses smoothly.
 - **The hand is the motion.** A value under the pointer — a slider being dragged, a colour-pad marker, a tab being reordered — snaps to it (`ControlState::snap`). Only a value set from elsewhere glides. A thumb trailing the pointer reads as lag, not as polish; a dragged tab that lags the hand reads as a tab that will not come. The tab rides under the pointer from the point where it was grabbed, the others slide out of its way, and on release it slides the last few pixels home.

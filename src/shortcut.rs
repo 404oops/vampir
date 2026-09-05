@@ -5,8 +5,8 @@
 //! actions are and gpui wants a keymap, not a widget, to own them.
 
 use gpui::{
-    Context, ElementId, FocusHandle, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent,
-    SharedString, Window, div, prelude::*, px,
+    Context, ElementId, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, SharedString, Window,
+    div, prelude::*, px,
 };
 
 use crate::controls::{CONTROL_HEIGHT, CONTROL_RADIUS};
@@ -147,19 +147,19 @@ fn pretty_key(key: &str) -> String {
 
 /// A field that shows a shortcut and, when clicked, captures the next chord.
 ///
-/// `focus` must be a handle the host keeps for this recorder: capturing keys
-/// means taking focus, and focus has to outlive a frame. While recording,
-/// Escape cancels and every other chord is recorded and ends the capture.
-#[allow(clippy::too_many_arguments)]
+/// Capturing keys means taking focus, and focus has to outlive a frame, so
+/// the recorder's handle lives in [`ControlState`](crate::ControlState)
+/// under `id` like a composite control's. While recording, Escape cancels
+/// and every other chord is recorded and ends the capture.
 pub fn shortcut_recorder<V: ControlHost>(
     id: ComboId,
     current: Option<&Chord>,
-    focus: &FocusHandle,
     palette: Palette,
     view: &V,
     cx: &mut Context<V>,
     on_record: impl Fn(&mut V, Chord, &mut Window, &mut Context<V>) + 'static,
 ) -> impl IntoElement {
+    let focus = view.control_state().focus(id, cx);
     let recording = view.control_state().recording == Some(id);
     let label: SharedString = match (recording, current) {
         (true, _) => "Press a shortcut\u{2026}".into(),
@@ -172,7 +172,7 @@ pub fn shortcut_recorder<V: ControlHost>(
         .id(ElementId::Name(format!("{id}-recorder").into()))
         // The recorder is a tab stop like any other field: it is where a
         // chord gets typed, so the keyboard has to be able to get to it.
-        .track_focus(&focus.clone().tab_stop(true))
+        .track_focus(&focus)
         .key_context("ShortcutRecorder")
         .h(px(CONTROL_HEIGHT))
         .w_full()

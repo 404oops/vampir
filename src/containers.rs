@@ -1,24 +1,26 @@
 //! Things that hold other things: a tab bar, a split divider, a collapsible
-//! section and a modal dialog.
+//! section, a modal dialog, a scrolling area, a card, and the rows and
+//! columns a page is laid out in.
 //!
 //! These take content rather than data. Where a control renders a value, a
 //! container renders whatever the host puts inside it, so each one takes
 //! elements and returns a bigger element.
 
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, Context, Div, ElementId, FocusHandle, FontWeight, KeyDownEvent, MouseButton,
-    MouseDownEvent, PathBuilder, SharedString, Window, canvas, deferred, div, point, prelude::*,
-    px,
+    AnyElement, Context, Div, ElementId, FocusHandle, FontWeight, KeyDownEvent, MouseButton,
+    MouseDownEvent, PathBuilder, ScrollHandle, SharedString, Window, canvas, deferred, div, point,
+    prelude::*, px,
 };
 
-use crate::controls::{ButtonVariant, CONTROL_RADIUS, button_focused};
-use crate::keyboard::{self, Key, Orientation};
+use crate::controls::{ButtonVariant, CONTROL_RADIUS, button_focused, caption, scrollbar};
+use crate::keyboard::{self, Dismiss, Key, Orientation};
 use crate::lighting;
 use crate::palette::Palette;
-use crate::state::{ComboId, ControlHost, MOVE, SWITCH_SLIDE, TabDrag, TrackAxis};
+use crate::scroll::{ScrollAxis, scroll_fades};
+use crate::state::{ComboId, ControlHost, ControlState, MOVE, SWITCH_SLIDE, TabDrag, TrackAxis};
 
 // ---- Tab bar ----------------------------------------------------------------
 
@@ -597,7 +599,7 @@ pub fn split_area<V: ControlHost>(id: ComboId, cx: &mut Context<V>) -> impl Into
 ///
 /// The host owns `expanded`, because whether a section is open usually
 /// outlives the view and belongs with the rest of its settings. The turn of
-/// the chevron is animated from [`ControlState`](crate::ControlState).
+/// the chevron is animated from [`ControlState`].
 #[allow(clippy::too_many_arguments)]
 pub fn collapsible<V: ControlHost>(
     id: &'static str,
@@ -772,20 +774,20 @@ impl<V: ControlHost> DialogButton<V> {
 /// Modal dialog: a scrim over the view and a centred panel with a title, a
 /// body and a row of buttons.
 ///
-/// `opacity` drives both the scrim and the panel, so a host animates the
-/// whole thing with one number from
-/// [`modal_opacity`](crate::easing::modal_opacity). At zero the dialog is
-/// gone and this returns nothing, which is how a host stops rendering a
-/// dialog that has finished leaving.
+/// Open it with [`ControlState::open_dialog`]; while `id` is not open this
+/// returns nothing. It fades in, takes the keyboard on its primary button —
+/// failing one, the first — and keeps Tab among its buttons. A button,
+/// Enter, Escape or a press on the scrim hands the keyboard back where it
+/// was, runs the button's callback or `on_dismiss`, and closes the dialog,
+/// which fades out and is then gone. A callback that opens a dialog of its
+/// own keeps that one.
 ///
 /// Buttons go last-is-rightmost, so the confirming one belongs at the end.
 #[allow(clippy::too_many_arguments)]
 pub fn dialog<V: ControlHost>(
-    id: &'static str,
+    id: ComboId,
     title: &str,
     width: f32,
-    opacity: f32,
-    closing: bool,
     palette: Palette,
     view: &V,
     cx: &mut Context<V>,
@@ -794,10 +796,14 @@ pub fn dialog<V: ControlHost>(
     on_dismiss: impl Fn(&mut V, &mut Window, &mut Context<V>) + 'static,
 ) -> Option<impl IntoElement> {
     let state = view.control_state();
-    if opacity <= 0.0 {
+    let Some((opacity, _)) = state.dialog_fade(id) else {
         state.set_dialog_trap(None);
         return None;
-    }
+    };
+    let closing = !state.is_dialog_open(id);
+    // Identifies this opening, so a button can close the dialog it was in
+    // without closing one its callback opened in its place.
+    let opening = state.dialog.as_ref().map(|dialog| dialog.opened_at);
     let dark = palette.is_dark;
     let opacity = opacity.clamp(0.0, 1.0);
 
@@ -819,13 +825,14 @@ pub fn dialog<V: ControlHost>(
     let panel_focus = state
         .focus(ElementId::Name(format!("{id}-panel").into()), cx)
         .tab_stop(false);
-    // Tab is the host's; this is how the host finds out there is a dialog to
-    // stay inside. See `keyboard::move_focus`. A dialog on its way out is
-    // not one to stay inside of.
+    // Tab is bound to an action and handled at the root; this is how
+    // `keyboard::move_focus` finds out there is a dialog to stay inside. A
+    // dialog on its way out is not one to stay inside of.
     state.set_dialog_trap((!closing).then(|| handles.clone()));
 
     let on_dismiss: Press<V> = Rc::new(on_dismiss);
     let dismiss_from_scrim = on_dismiss.clone();
+    let dismiss_from_key = on_dismiss.clone();
 
     let mut footer: Vec<AnyElement> = Vec::with_capacity(buttons.len());
     let mut presses: Vec<Press<V>> = Vec::with_capacity(buttons.len());
@@ -845,13 +852,7 @@ pub fn dialog<V: ControlHost>(
                     &handles[n],
                     palette,
                     cx,
-                    move |host, window, cx| {
-                        // The keyboard goes back before the host acts, so a
-                        // host that opens something else from here starts
-                        // from the right place.
-                        restore_dialog_focus(host, window, cx);
-                        press(host, window, cx)
-                    },
+                    move |host, window, cx| finish(host, opening, window, cx, &*press),
                 ))
                 .into_any_element(),
         );
@@ -881,8 +882,10 @@ pub fn dialog<V: ControlHost>(
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
-                        restore_dialog_focus(this, window, cx);
-                        dismiss_from_scrim(this, window, cx);
+                        if closing {
+                            return;
+                        }
+                        finish(this, opening, window, cx, &*dismiss_from_scrim);
                         cx.notify();
                     }),
                 )
@@ -911,20 +914,28 @@ pub fn dialog<V: ControlHost>(
                         // the keyboard, in which case it is that button's,
                         // and its ring has already handled it before this
                         // runs. Tab and Escape are not here: both are bound
-                        // by the host and never arrive as keys. Tab goes
-                        // through `keyboard::move_focus`, Escape through the
-                        // host's own dismissal, which calls
-                        // `restore_dialog_focus`.
+                        // to actions and never arrive as keys. Tab goes
+                        // through `keyboard::move_focus`; Escape arrives as
+                        // `Dismiss`, below.
                         .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
-                            if event.keystroke.key != "enter" {
+                            if event.keystroke.key != "enter" || closing {
                                 return;
                             }
                             let Some(press) = enter_press.clone() else {
                                 return;
                             };
                             cx.stop_propagation();
-                            restore_dialog_focus(this, window, cx);
-                            press(this, window, cx);
+                            finish(this, opening, window, cx, &*press);
+                            cx.notify();
+                        }))
+                        // A dialog on its way out has already let go of the
+                        // keyboard, and leaves Escape to whoever has it now.
+                        .on_action(cx.listener(move |this, _: &Dismiss, window, cx| {
+                            if closing {
+                                cx.propagate();
+                                return;
+                            }
+                            finish(this, opening, window, cx, &*dismiss_from_key);
                             cx.notify();
                         }))
                         .child(
@@ -978,13 +989,226 @@ pub fn dialog<V: ControlHost>(
     )
 }
 
-type Press<V> = Rc<dyn Fn(&mut V, &mut Window, &mut Context<V>)>;
-
-fn restore_dialog_focus<V: ControlHost>(view: &mut V, window: &mut Window, cx: &mut App) {
-    view.control_state_mut().restore_dialog_focus(window, cx);
+/// What every way out of a dialog does, in the order it has to happen in:
+/// the keyboard goes back first, so a host that opens something else from
+/// here starts from the right place; then the host acts; then the dialog
+/// closes — unless the host's action opened a dialog of its own, which a
+/// "Rename" that asks a second question is entitled to do.
+fn finish<V: ControlHost>(
+    host: &mut V,
+    opening: Option<Instant>,
+    window: &mut Window,
+    cx: &mut Context<V>,
+    act: &dyn Fn(&mut V, &mut Window, &mut Context<V>),
+) {
+    host.control_state_mut().restore_dialog_focus(window, cx);
+    act(host, window, cx);
+    let state = host.control_state_mut();
+    if state.dialog.as_ref().map(|dialog| dialog.opened_at) == opening {
+        state.close_dialog();
+    }
 }
+
+type Press<V> = Rc<dyn Fn(&mut V, &mut Window, &mut Context<V>)>;
 
 /// How long a dialog takes to arrive and to leave, re-exported so a host can
 /// drive its own timers off the same numbers.
 pub const DIALOG_ENTER: Duration = crate::easing::MODAL_ENTER;
 pub const DIALOG_EXIT: Duration = crate::easing::MODAL_EXIT;
+
+// ---- Surfaces and layout ----------------------------------------------------
+
+/// A card: the lit panel everything else sits on, with a caption naming
+/// what is in it. One level of these on the window's ground is the whole
+/// hierarchy a page needs; cards inside cards are on the list of patterns
+/// the design guide rejects.
+pub fn card(palette: Palette, title: &str, body: impl IntoElement) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(12.0))
+        .flex_none()
+        .p(px(16.0))
+        .rounded(px(10.0))
+        .bg(lighting::lit(palette.area_surface, 0.04))
+        .border_1()
+        .border_color(palette.area_border)
+        .shadow(lighting::panel(palette.is_dark))
+        .child(caption(palette, title))
+        .child(body)
+}
+
+/// A caption over a control, as a column, so a row of labelled controls
+/// lines up along their captions and along their controls.
+pub fn labelled(palette: Palette, label: &str, control: impl IntoElement) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .child(caption(palette, label))
+        .child(control)
+}
+
+/// A row of controls, centred on one another and spaced the toolkit's way.
+///
+/// `flex_none`, because a `div` is a flex item as well as a flex container:
+/// a row that could shrink would be squeezed to fit its parent instead of
+/// scrolling out of it.
+pub fn row() -> Div {
+    div().flex().flex_none().items_center().gap(px(10.0))
+}
+
+/// A column of rows or cards, spaced the toolkit's way. `flex_none` for the
+/// same reason as [`row`].
+pub fn column() -> Div {
+    div().flex().flex_none().flex_col().gap(px(14.0))
+}
+
+/// Content arriving: a page, a panel, a step of a wizard. It fades in and
+/// settles up into place over [`MOVE`] each time `key` changes, and paints
+/// at rest the first time it is seen. Key it by what is shown — the page,
+/// not the tab's position — so reordering the tabs is not a page change.
+pub fn arriving(
+    id: &'static str,
+    key: u64,
+    state: &ControlState,
+    content: impl IntoElement,
+) -> Div {
+    let arrived =
+        crate::easing::ease_out_cubic(state.transition(&ElementId::Name(id.into()), key, MOVE));
+    div()
+        .opacity(arrived)
+        .relative()
+        .top(px(8.0 * (1.0 - arrived)))
+        .child(content)
+}
+
+/// A scrolling area on the window's ground, with the edges and the bar a
+/// scrolling area needs: content leaving an edge fades into the ground
+/// rather than being cut off against it, and an overlay [`scrollbar`]
+/// appears when the content stops fitting.
+///
+/// The ground is a lit gradient, so each fade lands on whatever the ground
+/// is at its own height — a single colour would show as a band. Size the
+/// result as you would any element; it fills its slot with the scroller,
+/// and `content` scrolls inside that.
+///
+/// ```ignore
+/// scroll_area("page", &self.scroll, ScrollAxis::Vertical, palette, self, window, cx, body)
+///     .flex_1()
+/// ```
+#[allow(clippy::too_many_arguments)]
+pub fn scroll_area<V: ControlHost>(
+    id: &'static str,
+    handle: &ScrollHandle,
+    axis: ScrollAxis,
+    palette: Palette,
+    view: &V,
+    window: &Window,
+    cx: &mut Context<V>,
+    content: impl IntoElement,
+) -> Div {
+    let window_height = f32::from(window.viewport_size().height).max(1.0);
+    let bounds = handle.bounds();
+    let ground_at =
+        |y: gpui::Pixels| lighting::ground_at(palette.backdrop, f32::from(y) / window_height);
+    let (start, end) = match axis {
+        ScrollAxis::Vertical => (ground_at(bounds.top()), ground_at(bounds.bottom())),
+        // A fade down the side spans the area's height. It cannot follow the
+        // gradient, so it takes the ground at the area's middle.
+        ScrollAxis::Horizontal => {
+            let middle = ground_at(bounds.center().y);
+            (middle, middle)
+        }
+    };
+    div()
+        .relative()
+        .overflow_hidden()
+        .child(
+            div()
+                .id(id)
+                .size_full()
+                .flex()
+                .flex_col()
+                .when(axis == ScrollAxis::Vertical, |el| el.overflow_y_scroll())
+                .when(axis == ScrollAxis::Horizontal, |el| el.overflow_x_scroll())
+                // Without this a sideways trackpad swipe scrolls a vertical
+                // area: GPUI maps an x-delta onto y for a container that only
+                // scrolls one way.
+                .restrict_scroll_to_axis()
+                .track_scroll(handle)
+                .child(content),
+        )
+        .children(scroll_fades(
+            view.control_state(),
+            id,
+            handle,
+            axis,
+            start,
+            end,
+        ))
+        .child(scrollbar(id, handle, axis, palette, view, cx))
+}
+
+/// Moves `items[from]` to `to`, and moves `selected` with the item it was
+/// on: what a host does with [`ControlHost::tabs_reordered`].
+///
+/// ```ignore
+/// fn tabs_reordered(&mut self, bar: ComboId, from: usize, to: usize, cx: &mut Context<Self>) {
+///     match bar {
+///         "documents" => reorder(&mut self.documents, &mut self.current, from, to),
+///         _ => return,
+///     }
+///     cx.notify();
+/// }
+/// ```
+pub fn reorder<T>(items: &mut Vec<T>, selected: &mut usize, from: usize, to: usize) {
+    if from >= items.len() || to >= items.len() {
+        return;
+    }
+    let item = items.remove(from);
+    items.insert(to, item);
+    *selected = moved_selection(*selected, from, to);
+}
+
+/// Where `selected` ends up after the item at `from` is dropped at `to`.
+fn moved_selection(selected: usize, from: usize, to: usize) -> usize {
+    if selected == from {
+        to
+    } else if from < selected && selected <= to {
+        selected - 1
+    } else if to <= selected && selected < from {
+        selected + 1
+    } else {
+        selected
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::{moved_selection, reorder};
+
+    /// The selection stays on the item it was on, wherever that item goes.
+    #[test]
+    fn a_reorder_keeps_the_selection_on_its_item() {
+        let mut items = vec!["a", "b", "c", "d"];
+        let mut selected = 2; // "c"
+        reorder(&mut items, &mut selected, 0, 3); // "a" to the end
+        assert_eq!(items, ["b", "c", "d", "a"]);
+        assert_eq!(items[selected], "c");
+        reorder(&mut items, &mut selected, 1, 0); // "c" itself to the front
+        assert_eq!(items, ["c", "b", "d", "a"]);
+        assert_eq!(selected, 0);
+        // Out of range: nothing happens.
+        reorder(&mut items, &mut selected, 9, 0);
+        assert_eq!(items, ["c", "b", "d", "a"]);
+    }
+
+    #[test]
+    fn a_selection_outside_the_moved_span_does_not_move() {
+        assert_eq!(moved_selection(0, 2, 3), 0);
+        assert_eq!(moved_selection(3, 0, 1), 3);
+        assert_eq!(moved_selection(2, 0, 3), 1);
+        assert_eq!(moved_selection(1, 3, 0), 2);
+    }
+}

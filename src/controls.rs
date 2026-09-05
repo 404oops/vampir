@@ -11,16 +11,21 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use gpui::{
-    Context, ElementId, Entity, FocusHandle, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent,
-    PathBuilder, ScrollHandle, SharedString, Window, canvas, deferred, div, point, prelude::*, px,
+    Anchor, Context, Div, ElementId, Entity, FocusHandle, FontWeight, KeyDownEvent, MouseButton,
+    MouseDownEvent, PathBuilder, ScrollHandle, SharedString, Window, anchored, canvas, deferred,
+    div, point, prelude::*, px,
 };
 
 use crate::easing::{ease_in_cubic, ease_out_cubic, lerp_f32, progress};
-use crate::keyboard::{self, Key, Orientation};
+use crate::keyboard::{self, Dismiss, Key, Orientation};
 use crate::lighting;
+use crate::menu::VIEWPORT_MARGIN;
+use crate::overlay::Hint;
 use crate::palette::Palette;
 use crate::scroll::{SCROLLBAR_THICKNESS, ScrollAxis, ScrollDrag, THUMB_THICKNESS};
-use crate::state::{COMBO_REVEAL, ComboId, ControlHost, MOVE, SWITCH_SLIDE, TrackAxis};
+use crate::state::{
+    COMBO_REVEAL, ComboId, ControlHost, ControlState, MOVE, SWITCH_SLIDE, TrackAxis,
+};
 use crate::text_input::TextInput;
 
 /// Shared metrics: every field, pop-up and button is this tall and this
@@ -40,6 +45,23 @@ pub fn caption(palette: Palette, text: &str) -> impl IntoElement {
         .text_color(palette.text_secondary)
         .whitespace_nowrap()
         .child(SharedString::from(text.to_string()))
+}
+
+/// Text that fades its new words in when it changes — a status line, a
+/// "last action", a count. Words cannot be interpolated, so the change of
+/// value is what is noticed, and the new text arrives over the old rather
+/// than replacing it mid-glance. Style it as any `div`: colour, size.
+pub fn fading_text(id: &'static str, text: impl Into<SharedString>, state: &ControlState) -> Div {
+    use std::hash::{Hash, Hasher};
+    let text = text.into();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    let arrived = ease_out_cubic(state.transition(
+        &ElementId::Name(id.into()),
+        hasher.finish(),
+        SWITCH_SLIDE,
+    ));
+    div().opacity(arrived).child(text)
 }
 
 // ---- Buttons ----------------------------------------------------------------
@@ -327,10 +349,12 @@ pub fn switch<V: ControlHost>(
 // ---- Spin box ---------------------------------------------------------------
 
 /// Spin box: an editable value field between decrement and increment
-/// buttons. The value is a real text input, so it can also be typed.
+/// buttons. The value is a real text input, so it can also be typed; Enter
+/// commits what was typed, clamped to the range.
 ///
 /// `edit_input` is the host's [`TextInput`] for the value; `value` is the
-/// committed number the steppers work from.
+/// committed number the steppers work from. The box writes each new value
+/// into the field before reporting it, so the host only has to store it.
 #[allow(clippy::too_many_arguments)]
 pub fn spinbox<V: ControlHost>(
     id_prefix: &'static str,
@@ -341,11 +365,23 @@ pub fn spinbox<V: ControlHost>(
     edit_input: &Entity<TextInput>,
     palette: Palette,
     cx: &mut Context<V>,
-    on_change: impl Fn(&mut V, i32, &mut Window, &mut Context<V>) + Clone + 'static,
+    on_change: impl Fn(&mut V, i32, &mut Window, &mut Context<V>) + 'static,
 ) -> impl IntoElement {
-    let dec = on_change.clone();
-    let key_step = on_change.clone();
-    let inc = on_change;
+    edit_input.update(cx, |input, _cx| {
+        input.restyle(palette);
+    });
+    // The box draws its input, not its value, so a step writes the number
+    // into the field before the host hears about it.
+    let edit = edit_input.clone();
+    let commit: Commit<V> = Rc::new(move |this, value, window, cx| {
+        edit.update(cx, |input, cx| input.set_text(&value.to_string(), cx));
+        on_change(this, value, window, cx);
+    });
+    let dec = commit.clone();
+    let key_step = commit.clone();
+    let typed = commit.clone();
+    let typed_from = edit_input.clone();
+    let inc = commit;
 
     type Step<V> = Box<dyn Fn(&mut V, &mut Window, &mut Context<V>) + 'static>;
     let step_button = |id: ElementId,
@@ -422,12 +458,27 @@ pub fn spinbox<V: ControlHost>(
                     }
                 }),
             )
-            .on_action(cx.listener(
-                move |this, _: &crate::text_input::Down, window, cx| {
+            .on_action(
+                cx.listener(move |this, _: &crate::text_input::Down, window, cx| {
                     if value > min {
                         step_down(this, (value - 1).max(min), window, cx);
                         cx.notify();
                     }
+                }),
+            )
+            // Enter commits what was typed. Something that is not a number
+            // goes back to the value it replaced, so the field never shows a
+            // number the host does not have.
+            .on_action(cx.listener(
+                move |this, _: &crate::text_input::Enter, window, cx| {
+                    let text = typed_from.read(cx).text();
+                    match text.trim().parse::<i32>() {
+                        Ok(entered) => typed(this, entered.clamp(min, max), window, cx),
+                        Err(_) => typed_from.update(cx, |input, cx| {
+                            input.set_text(&value.to_string(), cx);
+                        }),
+                    }
+                    cx.notify();
                 },
             ))
         })
@@ -459,6 +510,9 @@ pub fn spinbox<V: ControlHost>(
         ))
 }
 
+/// A spin box's new value on its way to the host.
+type Commit<V> = Rc<dyn Fn(&mut V, i32, &mut Window, &mut Context<V>)>;
+
 // ---- Text field and area ----------------------------------------------------
 
 /// Recessed well, plus the accent glow while focused.
@@ -474,13 +528,18 @@ fn well_shadows(palette: Palette, focused: bool) -> Vec<gpui::BoxShadow> {
 ///
 /// The chrome takes the press itself and forwards it, so clicking the
 /// padding either side of the text still places the caret instead of
-/// missing the input entirely.
+/// missing the input entirely. An input styled with
+/// [`InputStyle::from_palette`](crate::InputStyle::from_palette) is kept in
+/// step with `palette` here, so a theme crossing over carries the text.
 pub fn text_field<V: ControlHost>(
     input: &Entity<TextInput>,
     palette: Palette,
     window: &Window,
-    cx: &Context<V>,
+    cx: &mut Context<V>,
 ) -> impl IntoElement {
+    input.update(cx, |input, _cx| {
+        input.restyle(palette);
+    });
     let focused = input.read(cx).focus_handle.is_focused(window);
     let click_input = input.clone();
     div()
@@ -521,8 +580,11 @@ pub fn text_area<V: ControlHost>(
     enabled: bool,
     palette: Palette,
     window: &Window,
-    cx: &Context<V>,
+    cx: &mut Context<V>,
 ) -> impl IntoElement {
+    input.update(cx, |input, _cx| {
+        input.restyle(palette);
+    });
     let focused = input.read(cx).focus_handle.is_focused(window);
     let click_input = input.clone();
     div()
@@ -565,18 +627,62 @@ pub fn text_area<V: ControlHost>(
 
 // ---- Pop-up menu ------------------------------------------------------------
 
-/// Which way a pop-up's list opens.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum ComboDirection {
-    #[default]
-    Down,
-    /// For a pop-up near the bottom of a window, where a list opening
-    /// downward would be cut off.
-    Up,
+/// The list's metrics: each row's height, the gap between rows, the list's
+/// padding and border, and the most of it that shows before it scrolls.
+/// Named because [`combo_placement`] works from them as well as the styles.
+const COMBO_ROW_HEIGHT: f32 = 28.0;
+const COMBO_ROW_GAP: f32 = 2.0;
+const COMBO_LIST_PADDING: f32 = 5.0;
+const COMBO_LIST_BORDER: f32 = 1.0;
+const COMBO_LIST_MAX_HEIGHT: f32 = 240.0;
+
+/// Where a pop-up's list goes when it opens.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ComboPlacement {
+    /// The list's top edge relative to the button's, before the window's
+    /// edges have their say.
+    top: f32,
+    /// How far the list starts scrolled, so the chosen row is in the part
+    /// of it that shows.
+    scroll: f32,
+}
+
+/// Places the list so that row `chosen` lies centred over the button, the
+/// way a native pop-up opens: the pointer is already on the current value,
+/// and every other value is one row away.
+///
+/// A list taller than it may be scrolls, and a row past the part that shows
+/// cannot lie on the button unless the list starts scrolled to it. So it
+/// does, by the least that brings the row fully into view, and the list's
+/// top moves up by the same amount so the row stays where it was put.
+fn combo_placement(chosen: usize, count: usize) -> ComboPlacement {
+    let pitch = COMBO_ROW_HEIGHT + COMBO_ROW_GAP;
+    // The row's edges within the list's scrolling content, padding included.
+    let row_top = COMBO_LIST_PADDING + chosen as f32 * pitch;
+    let row_bottom = row_top + COMBO_ROW_HEIGHT;
+    let content = 2.0 * COMBO_LIST_PADDING + (count as f32 * pitch - COMBO_ROW_GAP).max(0.0);
+    let furthest = (content - COMBO_LIST_MAX_HEIGHT).max(0.0);
+    let scroll = (row_bottom - COMBO_LIST_MAX_HEIGHT).clamp(0.0, furthest);
+    let top = (CONTROL_HEIGHT - COMBO_ROW_HEIGHT) / 2.0 - COMBO_LIST_BORDER - row_top + scroll;
+    ComboPlacement { top, scroll }
+}
+
+/// Opens `id`'s list on `chosen`, scrolled as [`combo_placement`] asks, so
+/// the row that lands on the button is one the list is actually showing.
+fn open_list(state: &mut ControlState, id: ComboId, chosen: usize, count: usize) {
+    state.open_combo(id, chosen);
+    let placement = combo_placement(chosen, count);
+    state
+        .scroll(id)
+        .set_offset(point(px(0.0), px(-placement.scroll)));
 }
 
 /// Pop-up menu: a raised button showing the current option, with an accent
 /// chevron chip, and a floating list when open.
+///
+/// The list opens over the button with the current option lying on it, and
+/// is shifted back inside the window if that would put it over an edge, so
+/// a pop-up near the bottom of a window needs nothing special.
 ///
 /// `id` is both the element id and the pop-up's identity in
 /// [`crate::ControlState`], so no two pop-ups in one view may share it.
@@ -586,7 +692,6 @@ pub fn combo<V: ControlHost>(
     current_index: usize,
     options: &[String],
     width: Option<f32>,
-    direction: ComboDirection,
     palette: Palette,
     view: &V,
     cx: &mut Context<V>,
@@ -601,9 +706,9 @@ pub fn combo<V: ControlHost>(
         (closing == id && since.elapsed() < state.scaled(COMBO_REVEAL)).then_some(since)
     });
     let showing = is_open || closing_since.is_some();
-    // Reveal progress: opacity, plus a short slide between the button and
-    // the list's resting place. Opening eases out and closing eases in, so
-    // both ends of the motion sit against the button.
+    // Reveal progress: opacity, plus the short drift down into place a menu
+    // makes, so the two things that drop out of a click arrive the same
+    // way. Opening eases out and closing eases in.
     let reveal = if is_open {
         state
             .combo_opened_at
@@ -614,8 +719,7 @@ pub fn combo<V: ControlHost>(
     } else {
         1.0
     };
-    let slide = 6.0 * (1.0 - reveal);
-    let opens_upward = direction == ComboDirection::Up;
+    let drift = -4.0 * (1.0 - reveal);
 
     let display: SharedString = options
         .get(current_index)
@@ -624,6 +728,14 @@ pub fn combo<V: ControlHost>(
         .into();
     let options_owned: Vec<String> = options.to_vec();
     let count = options.len();
+    // The list lies over the row that was current when it opened — that
+    // rather than `current_index`, which a pick changes under a list still
+    // fading out.
+    let placement = combo_placement(state.combo_opened_on.unwrap_or(current_index), count);
+    // Where the button was last frame, in window coordinates: what the list
+    // is laid over, whatever the button is nested inside.
+    let button = state.track_bounds.get(id).copied();
+    let weak = cx.entity().downgrade();
     let keyboard_at = if is_open {
         state.combo_highlight_or(current_index)
     } else {
@@ -645,6 +757,21 @@ pub fn combo<V: ControlHost>(
         .relative()
         .when_some(width, |el, w| el.w(px(w)).flex_none())
         .when(width.is_none(), |el| el.w_full())
+        // Records where the button is, so the list can be laid over it.
+        .child(
+            canvas(
+                move |bounds, _window, cx| {
+                    if let Some(host) = weak.upgrade() {
+                        host.update(cx, |host, _cx| {
+                            host.control_state_mut().track_bounds.insert(id, bounds);
+                        });
+                    }
+                },
+                |_bounds, _state, _window, _cx| {},
+            )
+            .absolute()
+            .size_full(),
+        )
         .child(
             div()
                 .id(ElementId::Name(format!("{id}-toggle").into()))
@@ -679,6 +806,16 @@ pub fn combo<V: ControlHost>(
                         CONTROL_RADIUS,
                         palette,
                     )
+                    // Once `bind_keys` has run, Escape arrives as this action
+                    // and never as a key. With no list open it is the host's.
+                    .on_action(cx.listener(move |this, _: &Dismiss, _window, cx| {
+                        if !this.control_state().is_combo_open(id) {
+                            cx.propagate();
+                            return;
+                        }
+                        this.control_state_mut().close_combo();
+                        cx.notify();
+                    }))
                     .on_key_down(cx.listener(
                         move |this, event: &KeyDownEvent, window, cx| {
                             let Some(key) = keyboard::key(event) else {
@@ -690,9 +827,7 @@ pub fn combo<V: ControlHost>(
                                 // they would anywhere else.
                                 if matches!(key, Key::Activate | Key::Down) {
                                     cx.stop_propagation();
-                                    let state = this.control_state_mut();
-                                    state.open_combo(id);
-                                    state.highlight_combo(current_index);
+                                    open_list(this.control_state_mut(), id, current_index, count);
                                     cx.notify();
                                 }
                                 return;
@@ -744,114 +879,123 @@ pub fn combo<V: ControlHost>(
                     if state.is_combo_open(id) {
                         state.close_combo();
                     } else {
-                        state.open_combo(id);
-                        state.highlight_combo(current_index);
+                        open_list(state, id, current_index, count);
                     }
                     cx.notify();
                 })),
         )
-        .when(showing, |el| {
+        // Anchored in window coordinates rather than hung under the button
+        // in the tree, because `anchored` is what knows where the window's
+        // edges are and shifts the list back inside them.
+        .when_some(button.filter(|_| showing), |el, button| {
             el.child(
                 deferred(
-                    div()
-                        .id(ElementId::Name(format!("{id}-popup").into()))
-                        .absolute()
-                        .opacity(reveal)
-                        .when(opens_upward, |el| {
-                            el.bottom(px(CONTROL_HEIGHT + 4.0 - slide))
-                        })
-                        .when(!opens_upward, |el| el.top(px(CONTROL_HEIGHT + 4.0 - slide)))
-                        .left_0()
-                        .w_full()
-                        .rounded(px(CONTROL_RADIUS + 1.0))
-                        .bg(body_fill)
-                        .border_1()
-                        .border_color(lighting::rim(body_fill, dark))
-                        .shadow(lighting::panel(dark))
-                        // Clipped to its own rounding, so the edge fades
-                        // below do not square off the corners.
-                        .overflow_hidden()
-                        .relative()
-                        // A list on its way out takes no clicks and lets
-                        // them through to whatever is beneath it.
-                        .when(is_open, |el| {
-                            el.occlude().on_mouse_down_out(cx.listener(
-                                move |this, _event, _window, cx| {
-                                    let state = this.control_state_mut();
-                                    state.close_combo();
-                                    state.combo_dismissed = Some(id);
-                                    state.combo_dismissed_at = Some(Instant::now());
-                                    cx.notify();
-                                },
-                            ))
-                        })
+                    anchored()
+                        .position(point(button.origin.x, button.origin.y + px(placement.top)))
+                        .anchor(Anchor::TopLeft)
+                        .offset(point(px(0.0), px(drift)))
+                        .snap_to_window_with_margin(px(VIEWPORT_MARGIN))
                         .child(
                             div()
-                                .id(ElementId::Name(format!("{id}-popup-list").into()))
-                                .max_h(px(240.0))
-                                .p(px(5.0))
-                                .flex()
-                                .flex_col()
-                                .gap(px(2.0))
-                                .overflow_y_scroll()
-                                .restrict_scroll_to_axis()
-                                .track_scroll(&list_scroll)
-                                .children(options_owned.into_iter().enumerate().map(
-                                    |(index, option)| {
-                                        let on_select = on_select.clone();
-                                        // While the list is open the highlight
-                                        // follows the keyboard; the rest of the
-                                        // time it marks what is chosen.
-                                        let highlighted = index == keyboard_at;
-                                        div()
-                                            .id(ElementId::NamedInteger(
-                                                format!("{id}-option").into(),
-                                                index as u64,
-                                            ))
-                                            .h(px(28.0))
-                                            .flex_none()
-                                            .w_full()
-                                            .px(px(9.0))
-                                            .flex()
-                                            .items_center()
-                                            .rounded(px(CONTROL_RADIUS - 1.0))
-                                            .text_size(px(12.5))
-                                            .text_color(if highlighted {
-                                                palette.control_label
-                                            } else {
-                                                palette.text_primary
-                                            })
-                                            .when(highlighted, |elem| {
-                                                elem.bg(lighting::lit(palette.control_fill, 0.08))
-                                            })
-                                            .when(!highlighted, |elem| {
-                                                elem.hover(move |style| style.bg(palette.row_hover))
-                                            })
-                                            .overflow_hidden()
-                                            .child(SharedString::from(option))
-                                            .when(is_open, |elem| {
+                                .id(ElementId::Name(format!("{id}-popup").into()))
+                                .w(button.size.width)
+                                .opacity(reveal)
+                                .rounded(px(CONTROL_RADIUS + 1.0))
+                                .bg(body_fill)
+                                .border_1()
+                                .border_color(lighting::rim(body_fill, dark))
+                                .shadow(lighting::panel(dark))
+                                // Clipped to its own rounding, so the edge fades
+                                // below do not square off the corners.
+                                .overflow_hidden()
+                                .relative()
+                                // A list on its way out takes no clicks and lets
+                                // them through to whatever is beneath it.
+                                .when(is_open, |el| {
+                                    el.occlude().on_mouse_down_out(cx.listener(
+                                        move |this, _event, _window, cx| {
+                                            let state = this.control_state_mut();
+                                            state.close_combo();
+                                            state.combo_dismissed = Some(id);
+                                            state.combo_dismissed_at = Some(Instant::now());
+                                            cx.notify();
+                                        },
+                                    ))
+                                })
+                                .child(
+                                    div()
+                                        .id(ElementId::Name(format!("{id}-popup-list").into()))
+                                        .max_h(px(COMBO_LIST_MAX_HEIGHT))
+                                        .p(px(COMBO_LIST_PADDING))
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(COMBO_ROW_GAP))
+                                        .overflow_y_scroll()
+                                        .restrict_scroll_to_axis()
+                                        .track_scroll(&list_scroll)
+                                        .children(options_owned.into_iter().enumerate().map(
+                                            |(index, option)| {
                                                 let on_select = on_select.clone();
-                                                elem.cursor_pointer().on_click(cx.listener(
-                                                    move |this, _event, window, cx| {
-                                                        this.control_state_mut().close_combo();
-                                                        on_select(this, index, window, cx);
-                                                        cx.notify();
-                                                    },
-                                                ))
-                                            })
-                                    },
+                                                // While the list is open the highlight
+                                                // follows the keyboard; the rest of the
+                                                // time it marks what is chosen.
+                                                let highlighted = index == keyboard_at;
+                                                div()
+                                                    .id(ElementId::NamedInteger(
+                                                        format!("{id}-option").into(),
+                                                        index as u64,
+                                                    ))
+                                                    .h(px(COMBO_ROW_HEIGHT))
+                                                    .flex_none()
+                                                    .w_full()
+                                                    .px(px(9.0))
+                                                    .flex()
+                                                    .items_center()
+                                                    .rounded(px(CONTROL_RADIUS - 1.0))
+                                                    .text_size(px(12.5))
+                                                    .text_color(if highlighted {
+                                                        palette.control_label
+                                                    } else {
+                                                        palette.text_primary
+                                                    })
+                                                    .when(highlighted, |elem| {
+                                                        elem.bg(lighting::lit(
+                                                            palette.control_fill,
+                                                            0.08,
+                                                        ))
+                                                    })
+                                                    .when(!highlighted, |elem| {
+                                                        elem.hover(move |style| {
+                                                            style.bg(palette.row_hover)
+                                                        })
+                                                    })
+                                                    .overflow_hidden()
+                                                    .child(SharedString::from(option))
+                                                    .when(is_open, |elem| {
+                                                        let on_select = on_select.clone();
+                                                        elem.cursor_pointer().on_click(cx.listener(
+                                                            move |this, _event, window, cx| {
+                                                                this.control_state_mut()
+                                                                    .close_combo();
+                                                                on_select(this, index, window, cx);
+                                                                cx.notify();
+                                                            },
+                                                        ))
+                                                    })
+                                            },
+                                        )),
+                                )
+                                // A long list fades at the edge that has more past
+                                // it, rather than slicing a row in half.
+                                .children(crate::scroll::scroll_fades(
+                                    state,
+                                    id,
+                                    &list_scroll,
+                                    crate::scroll::ScrollAxis::Vertical,
+                                    body_fill,
+                                    body_fill,
                                 )),
-                        )
-                        // A long list fades at the edge that has more past
-                        // it, rather than slicing a row in half.
-                        .children(crate::scroll::scroll_fades(
-                            state,
-                            id,
-                            &list_scroll,
-                            crate::scroll::ScrollAxis::Vertical,
-                            body_fill,
-                            body_fill,
-                        )),
+                        ),
                 )
                 .with_priority(100),
             )
@@ -1453,10 +1597,17 @@ fn group_probe<V: ControlHost>(id: ComboId, weak: gpui::WeakEntity<V>) -> impl I
 /// Square button around whatever element the host draws: a glyph, an SVG, a
 /// rendered image. `active` gives it the pressed-in look of a toggle that is
 /// on.
+///
+/// An icon has no words, so the button takes the words it would have had
+/// as `label`, and shows them as its tooltip: `"Undo"`, or
+/// `Hint::new("Favourite").shortcut(display("secondary-d"))` to show the
+/// accelerator after them. That is the button's one tooltip — GPUI allows
+/// one per element.
 #[allow(clippy::too_many_arguments)]
 pub fn icon_button<V: ControlHost>(
     id: impl Into<ElementId>,
     icon: impl IntoElement,
+    label: impl Into<Hint>,
     size: f32,
     active: bool,
     enabled: bool,
@@ -1520,6 +1671,14 @@ pub fn icon_button<V: ControlHost>(
                 )
         })
         .child(icon)
+        .tooltip(label.into().tooltip(palette))
+}
+
+/// A text character as an icon, for [`icon_button`]: "↺", "★", "+". It
+/// takes the button's own colour, so an active toggle's glyph is lit with
+/// the rest of it.
+pub fn glyph(character: &'static str) -> Div {
+    div().text_size(px(13.0)).child(character)
 }
 
 // ---- Progress and rules -----------------------------------------------------
@@ -2052,6 +2211,9 @@ pub fn search_field<V: ControlHost>(
     window: &Window,
     cx: &mut Context<V>,
 ) -> impl IntoElement {
+    input.update(cx, |input, _cx| {
+        input.restyle(palette);
+    });
     let focused = input.read(cx).focus_handle.is_focused(window);
     let has_text = !input.read(cx).content.is_empty();
     let glyph: gpui::Hsla = crate::color::to_hsla(palette.text_secondary);
@@ -2263,7 +2425,7 @@ pub fn badge(text: &str, tone: BadgeTone, palette: Palette) -> impl IntoElement 
 
 #[cfg(test)]
 mod tests {
-    use super::spinner_phase;
+    use super::*;
     use std::time::Duration;
 
     #[test]
@@ -2290,5 +2452,53 @@ mod tests {
         let a = spinner_phase(Duration::from_millis(1_757_000_000_000));
         let b = spinner_phase(Duration::from_millis(1_757_000_000_016));
         assert_ne!(a, b);
+    }
+
+    /// The chosen row's vertical centre relative to the button's top, once
+    /// the list is placed and scrolled as `placement` says.
+    fn chosen_row_centre(placement: ComboPlacement, chosen: usize) -> f32 {
+        placement.top
+            + COMBO_LIST_BORDER
+            + COMBO_LIST_PADDING
+            + chosen as f32 * (COMBO_ROW_HEIGHT + COMBO_ROW_GAP)
+            - placement.scroll
+            + COMBO_ROW_HEIGHT / 2.0
+    }
+
+    #[test]
+    fn the_chosen_row_lands_centred_on_the_button() {
+        for (chosen, count) in [(0, 1), (0, 4), (3, 4), (2, 7), (7, 20), (15, 20), (19, 20)] {
+            let placement = combo_placement(chosen, count);
+            assert_eq!(
+                chosen_row_centre(placement, chosen),
+                CONTROL_HEIGHT / 2.0,
+                "row {chosen} of {count}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_list_that_fits_does_not_start_scrolled() {
+        for chosen in 0..7 {
+            assert_eq!(combo_placement(chosen, 7).scroll, 0.0, "row {chosen}");
+        }
+    }
+
+    #[test]
+    fn a_long_list_scrolls_only_as_far_as_the_chosen_row_needs() {
+        let pitch = COMBO_ROW_HEIGHT + COMBO_ROW_GAP;
+        // Rows that show unscrolled leave the list alone...
+        assert_eq!(combo_placement(6, 20).scroll, 0.0);
+        // ...one past them scrolls just enough to bring it fully into view...
+        let row_bottom = COMBO_LIST_PADDING + 15.0 * pitch + COMBO_ROW_HEIGHT;
+        assert_eq!(
+            combo_placement(15, 20).scroll,
+            row_bottom - COMBO_LIST_MAX_HEIGHT
+        );
+        // ...and never past the end of the list, even for a row it lacks.
+        let content = 2.0 * COMBO_LIST_PADDING + 20.0 * pitch - COMBO_ROW_GAP;
+        let furthest = content - COMBO_LIST_MAX_HEIGHT;
+        assert!(combo_placement(19, 20).scroll <= furthest);
+        assert_eq!(combo_placement(40, 20).scroll, furthest);
     }
 }

@@ -1,14 +1,14 @@
 //! Right-click context menus.
 //!
 //! A menu is opened from wherever the press happened, by putting it in the
-//! host's [`ControlState`], and rendered once near the root of the view.
+//! host's [`ControlState`](crate::ControlState), and rendered once near the root of the view.
 //! Which items it holds is the host's decision each frame, because that
 //! depends on what was clicked, which the state carries as an opaque target
 //! string.
 //!
 //! ```ignore
-//! // On the row, in an on_mouse_down(MouseButton::Right) listener:
-//! this.control_state_mut().open_menu("row", event.position, row_id.to_string());
+//! // Around the row — a right-click opens the menu, aimed at this row:
+//! vampir::menu_target("row", row_id, cx, |host, id, _cx| host.selected = Some(id), row)
 //!
 //! // Once, near the root of render:
 //! .children(vampir::context_menu("row", &items, palette, self, cx,
@@ -23,7 +23,7 @@ use gpui::{
     Window, anchored, canvas, deferred, div, point, prelude::*, px,
 };
 
-use crate::keyboard::{self, Key, Orientation};
+use crate::keyboard::{self, Dismiss, Key, Orientation};
 use crate::lighting;
 use crate::palette::Palette;
 use crate::state::{ComboId, ControlHost};
@@ -37,7 +37,7 @@ const MENU_RADIUS: f32 = 7.0;
 const MENU_MIN_WIDTH: f32 = 168.0;
 /// Kept clear of the window edges, so a menu summoned in a corner still
 /// reads as floating above the content rather than welded to the frame.
-const VIEWPORT_MARGIN: f32 = 8.0;
+pub(crate) const VIEWPORT_MARGIN: f32 = 8.0;
 
 /// One row of a context menu.
 #[derive(Clone, Debug)]
@@ -272,6 +272,13 @@ pub fn context_menu<V: ControlHost>(
                             .absolute()
                             .size_full(),
                         )
+                        // Once `bind_keys` has run, Escape arrives as this
+                        // action and never as a key.
+                        .on_action(cx.listener(move |this, _: &Dismiss, window, cx| {
+                            this.control_state_mut().close_menu();
+                            restore_focus(this, window, cx);
+                            cx.notify();
+                        }))
                         .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                             let Some(key) = keyboard::key(event) else {
                                 return;
@@ -360,9 +367,9 @@ type Activate<V> = Rc<dyn Fn(&mut V, ComboId, &mut Window, &mut Context<V>)>;
 /// in the tree, and the next Tab starts again from the top of the window —
 /// which for someone navigating by keyboard means losing their place.
 fn restore_focus<V: ControlHost>(view: &mut V, window: &mut Window, cx: &mut App) {
-    if let Some(handle) = view.control_state_mut().menu_return_focus.take() {
-        window.focus(&handle, cx);
-    }
+    let state = view.control_state_mut();
+    let previous = state.menu_return_focus.take();
+    state.return_focus_to(previous, window, cx);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -599,6 +606,42 @@ pub fn menu_button<V: ControlHost>(
                 cx.notify();
             }))
         })
+}
+
+/// Wraps `child` so that a right-click on it opens the context menu `menu`,
+/// aimed at `target`, after running `on_open` with the same target.
+///
+/// The listener belongs on the row rather than on the list, because the
+/// menu has to be about what was actually clicked: hung on the container
+/// instead, it only ever knows about the selection, and right-clicking one
+/// row opens a menu aimed at another. `on_open` is where a host selects the
+/// row on the way, which is what every file list does and what keeps the
+/// highlight and the menu saying the same thing.
+///
+/// ```ignore
+/// menu_target("row", file.id.clone(), cx, |this, id, _cx| this.selected = Some(id),
+///     tree_row(..))
+/// ```
+pub fn menu_target<V: ControlHost>(
+    menu: ComboId,
+    target: impl Into<SharedString>,
+    cx: &mut Context<V>,
+    on_open: impl Fn(&mut V, SharedString, &mut Context<V>) + 'static,
+    child: impl IntoElement,
+) -> gpui::Div {
+    let target = target.into();
+    div()
+        .flex_none()
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                on_open(this, target.clone(), cx);
+                this.control_state_mut()
+                    .open_menu(menu, event.position, target.clone());
+                cx.notify();
+            }),
+        )
+        .child(child)
 }
 
 /// The menu a context menu is currently showing, re-exported for hosts that

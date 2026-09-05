@@ -23,6 +23,11 @@ pub struct Palette {
     /// fills, an open pop-up's border.
     pub accent: Rgba,
 
+    /// The window's own ground, behind every panel. Barely tinted toward the
+    /// hue, so a panel reads as sitting on it rather than floating in grey.
+    /// [`crate::lighting::ground`] lights it.
+    pub backdrop: Rgba,
+
     /// Body text, and the text inside fields.
     pub text_primary: Rgba,
     /// Captions, step glyphs, scrollbar thumbs. Quieter than primary.
@@ -88,6 +93,10 @@ impl Palette {
         Self {
             is_dark: dark,
             accent,
+            backdrop: pick(
+                oklch_to_color(0.285, 0.012, hue),
+                oklch_to_color(0.955, 0.012, hue),
+            ),
 
             text_primary,
             text_secondary: pick(pastel(0.86, 0.015, 0.0), pastel(0.36, 0.015, 0.0)),
@@ -126,8 +135,6 @@ impl Palette {
         Self::from_hue(265.0, dark)
     }
 
-    /// A translucent black or white wash to lay over content behind a modal.
-    /// Not used by any control here; handy for the host that hosts them.
     /// The palette part way between two others, for a scheme or a hue that
     /// is changing over rather than cutting. Every colour role is blended;
     /// the light-or-dark flag, which only picks shadow directions, flips
@@ -143,6 +150,7 @@ impl Palette {
         Palette {
             is_dark: if t < 0.5 { from.is_dark } else { to.is_dark },
             accent: m(from.accent, to.accent),
+            backdrop: m(from.backdrop, to.backdrop),
             text_primary: m(from.text_primary, to.text_primary),
             text_secondary: m(from.text_secondary, to.text_secondary),
             field_surface: m(from.field_surface, to.field_surface),
@@ -165,6 +173,7 @@ impl Palette {
         }
     }
 
+    /// A translucent black wash to lay over content behind a modal.
     pub fn scrim(&self) -> Rgba {
         if self.is_dark {
             argb(0x8000_0000)
@@ -197,6 +206,10 @@ mod tests {
         let light = Palette::from_hue(280.0, false);
         assert!(relative_luminance(dark.field_surface) < relative_luminance(dark.text_primary));
         assert!(relative_luminance(light.field_surface) > relative_luminance(light.text_primary));
+        // The ground follows the scheme, and in the light one the panels
+        // sit white on a ground a shade below them.
+        assert!(relative_luminance(dark.backdrop) < relative_luminance(light.backdrop));
+        assert!(relative_luminance(light.backdrop) < relative_luminance(light.area_surface));
     }
 
     #[test]
@@ -206,6 +219,7 @@ mod tests {
                 let palette = Palette::from_hue(hue as f64, dark);
                 for color in [
                     palette.accent,
+                    palette.backdrop,
                     palette.control_fill,
                     palette.primary_fill,
                     palette.soft_fill,

@@ -11,17 +11,18 @@ Every control animates its changes of state — the switch slides, the tick draw
 | | |
 |---|---|
 | `caption` | Quiet section label. |
+| `fading_text` | Text that fades its new words in when it changes: a status line, a count. |
 | `button` | The lit button. `ButtonVariant::{Soft, Primary, Danger}`. |
-| `icon_button` | Square, takes any element as its icon. `active` gives it the pressed-in look of a toggle. |
+| `icon_button` | Square, takes any element as its icon — `glyph` for a text character — and a label, which it shows as its tooltip; a `Hint` carries a shortcut after the label. `active` gives it the pressed-in look of a toggle. |
 | `switch` | Toggle, with an optional label that is part of the hit target. |
 | `checkbox` | With an optional label; the whole row is the hit target. The well fills and the tick draws itself in. |
 | `radio_group` | Vertical exclusive choices, each able to carry a `detail` line. |
 | `segmented` | Recessed track, one raised pill that slides to the chosen option. Two or three short options. |
 | `chip` / `chip_group` | Buttons sized to their own labels, in a wrapping row. For a choice with more options than a segmented control can carry but all worth showing: tags, a filter bar, twenty export formats. |
-| `spinbox` | Steppers around an editable value field. |
-| `text_field` / `text_area` | Recessed wells around a `TextInput`. |
+| `spinbox` | Steppers around an editable value field. Writes each new value into the field, and Enter commits a typed one. |
+| `text_field` / `text_area` | Recessed wells around a `TextInput`. An input styled with `InputStyle::from_palette` is kept in step with the palette by the well around it. |
 | `search_field` | Field with a magnifier and a clear button. |
-| `combo` | Pop-up menu button and its list. `ComboDirection::Up` near a window's bottom. |
+| `combo` | Pop-up menu button and its list. The list opens over the button with the current option on it, and is shifted to stay inside the window, so one near the bottom needs nothing special. |
 | `slider` | `SliderTrack::Continuous` or `Stepped { stops }`, which draws ticks and snaps. |
 | `progress_bar` | Determinate. |
 | `spinner` | Indeterminate. Only animates while the host is asking for frames — see [Hosting](hosting.md#request-frames-for-animations). |
@@ -33,7 +34,11 @@ Every control animates its changes of state — the switch slides, the tick draw
 
 `tab_bar` (drag to reorder — the tab rides under the pointer and the others slide aside — with optional close buttons and a raised pill that slides to the active tab; a `Tab` is identified by its label unless `Tab::id` says otherwise, and everything the bar remembers about a tab follows that identity through a reorder), `split_handle` + `split_area`, `collapsible` (unfolds to its measured height), `dialog` + `DialogButton`.
 
-`split_area` is the invisible probe that turns a pointer position into a fraction. Put it inside the element the two panes share; the divider will not work without it.
+`split_area` is the invisible probe that turns a pointer position into a fraction. Put it inside the element the two panes share; the divider will not work without it. `reorder` is what a host does with a finished tab drag: it moves the item and keeps the selection on the item it was on.
+
+`dialog` is opened with `ControlState::open_dialog` and renders nothing otherwise. It fades in, takes the keyboard, keeps Tab among its buttons, and closes itself — fading out, handing the keyboard back — from a button, Enter, Escape or the scrim, before the host's callback runs.
+
+The page itself is laid out with the same vocabulary: `card` is the lit panel with a caption that everything sits on, `labelled` puts a caption over a control, `row` and `column` space controls the toolkit's way, `scroll_area` is a scrolling region on the window's ground with the edge fades and the overlay scrollbar it needs, and `arriving` fades content in and settles it into place each time what it shows changes.
 
 ## Menus — `vampir::menu`
 
@@ -53,7 +58,7 @@ and render it once, near the root:
     |host, action, window, cx| host.run_menu_action(action, window, cx)))
 ```
 
-The `target` string is yours and comes back unchanged through `ControlState::menu_target()` while the callback runs. Build the item list from it each frame so it reflects what was clicked. `menu_button` opens the same menu beneath a button, and pressing the button again closes it.
+The `target` string is yours and comes back unchanged through `ControlState::menu_target()` while the callback runs. Build the item list from it each frame so it reflects what was clicked. `menu_target` is that right-click listener as a wrapper — `menu_target("row", row.id, cx, select_on_the_way, tree_row(..))` — for a row that should open a menu about itself. `menu_button` opens the same menu beneath a button, and pressing the button again closes it.
 
 These are in-window menus drawn by the toolkit. The macOS menu bar is a different thing entirely and belongs to GPUI — see [Shipping a macOS app](macos-apps.md).
 
@@ -61,17 +66,19 @@ These are in-window menus drawn by the toolkit. The macOS menu bar is a differen
 
 ![The command palette open over the fields page](overlays.png)
 
-`Tooltip::text` / `Tooltip::with_shortcut` plug into GPUI's own `.tooltip(..)`, which already owns the hover delay and the placement.
+`Tooltip::text` / `Tooltip::with_shortcut` plug into GPUI's own `.tooltip(..)`, which already owns the hover delay and the placement; `Hint` is what one says, for a control such as `icon_button` that carries its own.
 
-`command_palette` plus `fuzzy_filter` / `fuzzy_score`: the host owns the query input, the filtered list and the highlighted index, because those are also what the arrow keys move and what Enter commits. `command_list` is the palette's rows on their own, for a search field with its results underneath or anywhere else a query has a list of answers; the gallery's Fields page shows one filtering as you type.
+`command_palette` is opened with `ControlState::open_palette`, or `toggle_palette` from whatever shortcut the host gives it, and renders nothing otherwise. The host owns the query `TextInput` and the `Command`s; the palette filters them with `fuzzy_filter` as the query is typed, moves the highlight with Up and Down, runs the highlighted command on Enter or a clicked one, and closes on Escape or the scrim — handing the keyboard back where it was before the command runs.
+
+`search_list` is the same field-and-rows without the overlay: a search field with the matching rows underneath and the same keys between them, for a filter over a list in the page. The gallery's Fields page shows one filtering as you type. `command_list` is the rows on their own, for a host that filters and moves the highlight itself; `fuzzy_score` is the ranking.
 
 ## Data — `vampir::data`
 
 ![A tab bar, a tree, a table and a split](data.png)
 
-`tree_row` renders one row of an already flattened tree, so it drops straight into a `uniform_list`. `table_header` with `Column` and `SortDirection`.
+`tree_row` renders one row of an already flattened tree, so it drops straight into a `uniform_list`. `table_header` with `Column` and `SortDirection`; `table_row` for a row of plain text on the header's grid, which slides to its new place when the sort changes, and `table_cell` for a row that is more than text.
 
-The flattening is the host's, and it is the step that makes collapsing mean anything: keep a real tree, and walk it into `TreeRow`s each frame, skipping the children of anything closed. Keeping the flattened list *as* the model is the tempting shortcut — it is what gets drawn, after all — but then closing a branch has nothing to hide, because its children were never underneath it. `examples/gallery.rs` shows the walk.
+The tree stays the host's, and `flatten_tree` walks it into `TreeRow`s each frame, skipping the children of anything closed — the step that makes collapsing mean anything. Keeping the flattened list *as* the model is the tempting shortcut — it is what gets drawn, after all — but then closing a branch has nothing to hide, because its children were never underneath it. Sorting is the host's too: it compares keys, not the strings on screen, and only the host knows which is which.
 
 ## Colour — `vampir::swatch`
 
@@ -81,7 +88,11 @@ The flattening is the host's, and it is the step that makes collapsing mean anyt
 
 ## Shortcuts — `vampir::shortcut`
 
-`shortcut_recorder` captures the next chord and hands back a `Chord` with both a `keystroke` for `KeyBinding` and a `display` for a person. Binding it is the host's business.
+`shortcut_recorder` captures the next chord and hands back a `Chord` with both a `keystroke` for `KeyBinding` and a `display` for a person. Binding it is the host's business. `display("secondary-k")` renders a binding the way the platform writes it.
+
+## Theme — `vampir::theme`
+
+Every `ControlState` carries a `Theme` — one hue and a `Scheme` of `System`, `Light` or `Dark` — and `ControlState::palette()` is the palette derived from it, crossing over rather than cutting when either changes. `ControlState::observe_appearance` keeps `System` following the desktop. `scheme_picker` and `hue_picker` are the segmented control and the slider bound to the theme, as the gallery's header shows them; `system_dark` reads the desktop. See [Hosting › Themes](hosting.md#themes).
 
 ## Text — `vampir::text_input`
 
@@ -89,20 +100,26 @@ The flattening is the host's, and it is the step that makes collapsing mean anyt
 
 `TextInput` is a full input: selection, IME composition, undo, clipboard, multi-line wrapping. It is the one thing in the crate that is an entity rather than a function, because a text cursor genuinely is state.
 
+`InputStyle::from_palette(palette, size)` is the style to start from; an input styled that way is kept in step with the palette by whichever field holds it, so a host never re-styles its inputs by hand.
+
 Rich text is a `Highlighter`, a closure from content to `Span`s, re-run on every layout:
 
 ```rust
 input.update(cx, |input, cx| {
     input.set_highlighter(|text| {
-        find_mentions(text).map(|range| Span::new(range).color(accent).bold()).collect()
+        find_mentions(text).map(|range| Span::new(range).accent().bold()).collect()
     }, cx);
 });
 ```
 
-Stale ranges are dropped rather than panicked on, because a highlighter usually runs against text that has since been edited.
+`Span::accent()` reads the accent when the text paints, so a highlighter set once follows the theme; `Span::color` is a fixed colour. Stale ranges are dropped rather than panicked on, because a highlighter usually runs against text that has since been edited.
 
 ## Colour and lighting — `vampir::color`, `vampir::lighting`
 
-`Palette::from_hue(hue, dark)` derives the whole set from one hue. A host with a richer theme of its own writes the twenty-odd fields directly, which is the point of the struct being plain and public.
+`Palette::from_hue(hue, dark)` derives the whole set from one hue. A host with a richer theme of its own writes the twenty-odd fields directly, which is the point of the struct being plain and public. `Palette::backdrop` is the window's own ground, and `ground(palette.backdrop)` lights it for the root.
 
-`lighting` is the vocabulary every control draws itself with — `lit`, `raised`, `recessed`, `panel`, `rim`, `glow`, `shade`. [Design](design.md) explains what each means and when to reach for it.
+`lighting` is the vocabulary every control draws itself with — `lit`, `raised`, `recessed`, `panel`, `rim`, `glow`, `shade`, `ground`. [Design](design.md) explains what each means and when to reach for it.
+
+## Type — `vampir::typography`
+
+`ui_font()` is the system's interface face under the name each platform knows it by, for `.font_family` on the root. `TEXT_SIZE`, `SMALL_TEXT_SIZE` and `TITLE_TEXT_SIZE` are the three sizes the toolkit sets text in.

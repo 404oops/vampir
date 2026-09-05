@@ -13,11 +13,14 @@ use std::time::{Duration, Instant};
 use std::cell::{Cell, RefCell};
 
 use gpui::{
-    App, Bounds, Context, ElementId, FocusHandle, MouseMoveEvent, Pixels, Point, ScrollHandle,
-    SharedString, Window,
+    App, Bounds, Context, ElementId, Entity, FocusHandle, InteractiveElement, MouseButton,
+    MouseMoveEvent, Pixels, Point, ScrollHandle, SharedString, Window,
 };
 
+use crate::palette::Palette;
 pub use crate::scroll::{ScrollAxis, ScrollDrag, apply_scroll_drag};
+use crate::text_input::TextInput;
+use crate::theme::{Theme, system_dark};
 
 /// A pop-up list fades and slides into place over this long, and back out
 /// over the same.
@@ -123,10 +126,47 @@ pub struct OpenMenu {
     pub highlight: Option<usize>,
 }
 
+/// A modal dialog that is open, or on its way out.
+#[derive(Clone, Debug)]
+pub struct OpenDialog {
+    pub id: ComboId,
+    pub opened_at: Instant,
+    /// When it was told to close, if it has been. It keeps rendering, faded
+    /// and without the keyboard, until the exit finishes.
+    pub closing: Option<Instant>,
+}
+
+/// A command palette that is open.
+#[derive(Clone, Debug)]
+pub struct OpenPalette {
+    pub id: ComboId,
+    pub opened_at: Instant,
+    /// Where the keyboard was before the palette took it. Closing puts it
+    /// back: focus left on a field that no longer exists reaches nothing,
+    /// and the shortcut that opens the palette would have to be re-earned
+    /// with a click.
+    pub return_focus: Option<FocusHandle>,
+}
+
+/// Where the keyboard is in a list that filters as its query is typed.
+#[derive(Clone, Copy, Debug)]
+struct ListKeyboard {
+    highlight: usize,
+    /// A hash of the query the highlight belongs to. A new query is a new
+    /// list, and the keyboard goes back to its best match.
+    query: u64,
+}
+
+/// The id the root's focus handle lives under in the registry.
+const ROOT_FOCUS: &str = "vampir-root";
+
 /// Per-view control state. `Default` is the empty state, which is also the
 /// right starting point: nothing open, nothing animating, nothing dragged.
 #[derive(Default)]
 pub struct ControlState {
+    /// The hue and scheme the palette is derived from, for a host with no
+    /// theme of its own. See [`crate::theme`].
+    pub theme: Theme,
     /// The pop-up whose list is open, if any.
     pub open_combo: Option<ComboId>,
     /// When that list started revealing.
@@ -134,6 +174,11 @@ pub struct ControlState {
     /// A list fading back out, and when that began. It keeps rendering,
     /// without taking clicks, until the fade finishes.
     pub combo_closing: Option<(ComboId, Instant)>,
+    /// The option that was current when the open list opened, which is the
+    /// row the list lays over the button. Kept through the fade out: by then
+    /// a pick has changed the value, and the list must not jump to the new
+    /// row on its way out.
+    pub combo_opened_on: Option<usize>,
     /// One focus handle per composite control, keyed by its id.
     ///
     /// A group — radio buttons, a segmented control, a tab bar, a tree — is
@@ -161,6 +206,10 @@ pub struct ControlState {
     pub menu_return_focus: Option<FocusHandle>,
     /// The same, for a modal dialog.
     pub dialog_return_focus: Option<FocusHandle>,
+    /// True while the mouse is in charge and the focus ring is hidden. Any
+    /// mouse press sets it and Tab clears it, and the first Tab after the
+    /// mouse only shows where the keyboard is: see `keyboard::move_focus`.
+    pub ring_hidden: bool,
     /// The focus handles of the open dialog's buttons, refreshed every frame
     /// it renders and cleared when it does not. What Tab stays inside of
     /// while a dialog is up; see [`crate::keyboard::move_focus`].
@@ -235,6 +284,13 @@ pub struct ControlState {
 
     /// The open context menu, if any.
     pub menu: Option<OpenMenu>,
+    /// The open dialog, if any, or one still fading out.
+    pub dialog: Option<OpenDialog>,
+    /// The open command palette, if any.
+    pub palette_overlay: Option<OpenPalette>,
+    /// The keyboard's row in each filtering list, by the list's id. A
+    /// `RefCell` because a list notices its query changing while it renders.
+    lists: RefCell<HashMap<ElementId, ListKeyboard>>,
 
     /// The shortcut recorder waiting for a key chord, if any.
     pub recording: Option<ComboId>,
@@ -260,17 +316,20 @@ impl ControlState {
         }
     }
 
-    /// Opens one pop-up, closing whichever was open.
-    pub fn open_combo(&mut self, combo: ComboId) {
+    /// Opens one pop-up on `chosen`, its current option, closing whichever
+    /// was open. The list lays that row over the button, and the keyboard
+    /// starts on it, so the first arrow press moves from there rather than
+    /// from the top.
+    pub fn open_combo(&mut self, combo: ComboId, chosen: usize) {
         self.close_combo();
         self.open_combo = Some(combo);
         self.combo_opened_at = Some(Instant::now());
+        self.combo_opened_on = Some(chosen);
+        self.combo_highlight = Some(chosen);
         self.combo_closing = None;
     }
 
-    /// Puts the keyboard on one option of the open list. Opening a pop-up
-    /// starts it on whatever is already chosen, so the first arrow press
-    /// moves from there rather than from the top.
+    /// Puts the keyboard on one option of the open list.
     pub fn highlight_combo(&mut self, index: usize) {
         self.combo_highlight = Some(index);
     }
@@ -286,10 +345,242 @@ impl ControlState {
     /// Slows every animation down by `scale` — eight makes a 140ms slide
     /// take over a second. For looking at motion: a screenshot taken during
     /// a slide is the only way to see what the slide actually does, and at
-    /// full speed the shutter is slower than the slide. The gallery reads
-    /// `VAMPIR_SLOW_MOTION` into this.
+    /// full speed the shutter is slower than the slide.
+    /// [`ControlState::slow_motion_from_env`] reads it from the environment.
     pub fn set_time_scale(&mut self, scale: f32) {
         self.time_scale = (scale > 0.0 && scale != 1.0).then_some(scale);
+    }
+
+    /// The time scale every animation is running at, when it is not one.
+    pub fn time_scale(&self) -> Option<f32> {
+        self.time_scale
+    }
+
+    /// Reads `VAMPIR_SLOW_MOTION` into the time scale, so a host can be
+    /// looked at slowed down without a build: `VAMPIR_SLOW_MOTION=8 app`.
+    /// Returns the scale if one was set, for a host that wants to say so on
+    /// screen — a screenshot taken in slow motion should not pass for the
+    /// real thing.
+    pub fn slow_motion_from_env(&mut self) -> Option<f32> {
+        let scale = std::env::var("VAMPIR_SLOW_MOTION")
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())?;
+        self.set_time_scale(scale);
+        self.time_scale
+    }
+
+    // ---- Theme ----
+
+    /// Starts following the desktop's colour scheme: reads it now, and keeps
+    /// [`Theme::system_is_dark`](crate::theme::Theme::system_is_dark) up to
+    /// date as it changes. Call it once, in the view's constructor. A window
+    /// that opens dark on a light desktop looks broken before it looks like
+    /// a choice.
+    pub fn observe_appearance<V: ControlHost>(&mut self, window: &Window, cx: &mut Context<V>) {
+        self.theme.set_system_dark(system_dark(window));
+        let this = cx.weak_entity();
+        let subscription = window.observe_window_appearance(move |window, cx| {
+            let dark = system_dark(window);
+            this.update(cx, |this, cx| {
+                if this.control_state_mut().theme.set_system_dark(dark) {
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
+        self.theme.keep_appearance(subscription);
+    }
+
+    /// The palette to hand every control this frame.
+    ///
+    /// The theme's scheme and hue are the truth; this is what is shown, and
+    /// it follows the truth rather than jumping to it. A scheme crosses over
+    /// through [`Palette::mix`] over [`SCHEME_FADE`], so a change from a menu
+    /// item, a shortcut, a command palette or the desktop switching to dark
+    /// at sunset all arrive the same way: every colour on screen mixed
+    /// between the palette it had and the one it is getting. A hue set from
+    /// anywhere but its own slider glides the short way round; while the
+    /// slider is held the colours sit under the hand.
+    pub fn palette(&self) -> Palette {
+        let theme = &self.theme;
+        let darkness = self.tween(
+            "vampir-scheme-dark",
+            if theme.is_dark() { 1.0 } else { 0.0 },
+            SCHEME_FADE,
+        );
+        let held = theme
+            .hue_track()
+            .is_some_and(|track| self.is_dragging(track));
+        let hue = f64::from(if held {
+            self.snap("vampir-scheme-hue", theme.hue as f32)
+        } else {
+            self.tween_angle("vampir-scheme-hue", theme.hue as f32, MOVE)
+        });
+        if darkness <= 0.0 {
+            Palette::from_hue(hue, false)
+        } else if darkness >= 1.0 {
+            Palette::from_hue(hue, true)
+        } else {
+            Palette::mix(
+                Palette::from_hue(hue, false),
+                Palette::from_hue(hue, true),
+                darkness,
+            )
+        }
+    }
+
+    // ---- Dialogs ----
+
+    /// Opens the modal dialog `id`. It fades in, takes the keyboard when it
+    /// first paints, and keeps Tab among its own buttons until it closes.
+    pub fn open_dialog(&mut self, id: ComboId) {
+        self.dismiss_popups();
+        self.dialog = Some(OpenDialog {
+            id,
+            opened_at: Instant::now(),
+            closing: None,
+        });
+    }
+
+    /// Starts the open dialog on its way out. It keeps rendering, faded,
+    /// until the exit finishes; a dialog closed twice leaves the first exit
+    /// running rather than restarting it.
+    pub fn close_dialog(&mut self) {
+        if let Some(dialog) = self.dialog.as_mut()
+            && dialog.closing.is_none()
+        {
+            dialog.closing = Some(Instant::now());
+        }
+    }
+
+    /// Whether `id` is open — not counting one that is fading out.
+    pub fn is_dialog_open(&self, id: ComboId) -> bool {
+        self.dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.id == id && dialog.closing.is_none())
+    }
+
+    /// `(opacity, still_animating)` for dialog `id` if it is on screen at
+    /// all, open or leaving; `None` once it has gone. An exit that started
+    /// mid-entrance fades from wherever the entrance had got to.
+    pub fn dialog_fade(&self, id: ComboId) -> Option<(f32, bool)> {
+        let dialog = self.dialog.as_ref().filter(|dialog| dialog.id == id)?;
+        let (opacity, running) = match dialog.closing {
+            Some(since) => {
+                let t = crate::easing::progress(since, self.scaled(crate::easing::MODAL_EXIT));
+                (1.0 - crate::easing::ease_in_cubic(t), t < 1.0)
+            }
+            None => {
+                let t = crate::easing::progress(
+                    dialog.opened_at,
+                    self.scaled(crate::easing::MODAL_ENTER),
+                );
+                (crate::easing::ease_out_cubic(t), t < 1.0)
+            }
+        };
+        if dialog.closing.is_some() && !running {
+            return None;
+        }
+        Some((opacity, running))
+    }
+
+    // ---- Command palette ----
+
+    /// Opens the command palette `id`, remembering where the keyboard was
+    /// and putting it in `query`, emptied. A palette that opens without
+    /// focus is a box you have to click before you can type into, which is
+    /// the one thing nobody reaching for its shortcut wants to do.
+    pub fn open_palette(
+        &mut self,
+        id: ComboId,
+        query: &Entity<TextInput>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.dismiss_popups();
+        let return_focus = self
+            .palette_overlay
+            .take()
+            .and_then(|open| open.return_focus)
+            .or_else(|| window.focused(cx));
+        self.palette_overlay = Some(OpenPalette {
+            id,
+            opened_at: Instant::now(),
+            return_focus,
+        });
+        self.highlight_list(id, 0);
+        query.update(cx, |input, cx| input.set_text("", cx));
+        let focus = query.read(cx).focus_handle.clone();
+        window.focus(&focus, cx);
+    }
+
+    /// Closes the open palette and hands the keyboard back where it was, or
+    /// to the root — somewhere real, because the query field is about to
+    /// stop existing and focus left on it goes nowhere.
+    pub fn close_palette(&mut self, window: &mut Window, cx: &mut App) {
+        if let Some(open) = self.palette_overlay.take() {
+            self.return_focus_to(open.return_focus, window, cx);
+        }
+    }
+
+    /// Opens the palette if it is closed and closes it if it is open: what
+    /// its shortcut does.
+    pub fn toggle_palette(
+        &mut self,
+        id: ComboId,
+        query: &Entity<TextInput>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if self.is_palette_open(id) {
+            self.close_palette(window, cx);
+        } else {
+            self.open_palette(id, query, window, cx);
+        }
+    }
+
+    pub fn is_palette_open(&self, id: ComboId) -> bool {
+        self.palette_overlay
+            .as_ref()
+            .is_some_and(|open| open.id == id)
+    }
+
+    // ---- Filtering lists ----
+
+    /// Which row the keyboard is on in list `id`, given the query the list
+    /// is currently filtered by. A changed query puts it back on the first
+    /// row: the rows have been re-ranked, and the best match is the one the
+    /// person most likely means.
+    pub fn list_highlight(&self, id: impl Into<ElementId>, query: &str) -> usize {
+        let hash = hash_of(query);
+        let mut lists = self.lists.borrow_mut();
+        let entry = lists.entry(id.into()).or_insert(ListKeyboard {
+            highlight: 0,
+            query: hash,
+        });
+        if entry.query != hash {
+            entry.query = hash;
+            entry.highlight = 0;
+        }
+        entry.highlight
+    }
+
+    /// The keyboard's row in list `id` as last set, whatever the query.
+    pub fn list_position(&self, id: impl Into<ElementId>) -> usize {
+        self.lists
+            .borrow()
+            .get(&id.into())
+            .map_or(0, |list| list.highlight)
+    }
+
+    /// Puts the keyboard on row `index` of list `id`.
+    pub fn highlight_list(&self, id: impl Into<ElementId>, index: usize) {
+        let mut lists = self.lists.borrow_mut();
+        let entry = lists.entry(id.into()).or_insert(ListKeyboard {
+            highlight: 0,
+            query: hash_of(""),
+        });
+        entry.highlight = index;
     }
 
     /// A duration at the current time scale.
@@ -532,6 +823,20 @@ impl ControlState {
         {
             return true;
         }
+        if self
+            .palette_overlay
+            .as_ref()
+            .is_some_and(|open| open.opened_at.elapsed() < reveal)
+        {
+            return true;
+        }
+        if let Some(dialog) = &self.dialog
+            && self
+                .dialog_fade(dialog.id)
+                .is_some_and(|(_, running)| running)
+        {
+            return true;
+        }
         self.combo_closing
             .is_some_and(|(_, since)| since.elapsed() < reveal)
     }
@@ -704,6 +1009,40 @@ impl ControlState {
             .clone()
     }
 
+    /// The root's focus handle: where the keyboard goes when it has nowhere
+    /// else to be. [`crate::handle_keys`] puts it on the root element. Not a
+    /// tab stop — it is one Tab from the first control, not a control.
+    pub fn root_focus(&self, cx: &App) -> FocusHandle {
+        self.focus_handles
+            .borrow_mut()
+            .entry(ElementId::Name(ROOT_FOCUS.into()))
+            .or_insert_with(|| cx.focus_handle())
+            .clone()
+    }
+
+    /// Puts the keyboard on the root. For a host about to remove whatever
+    /// has focus — switching pages, say: GPUI dispatches nothing from a
+    /// handle that is no longer in the tree, not even the root's own
+    /// shortcuts, so the keyboard has to be re-homed first.
+    pub fn focus_root(&self, window: &mut Window, cx: &mut App) {
+        window.focus(&self.root_focus(cx), cx);
+    }
+
+    /// Hands the keyboard back to `previous`, or to the root if there was
+    /// no previous. Anywhere real: an overlay closing takes its focused
+    /// element with it, and focus left on that goes nowhere.
+    pub fn return_focus_to(
+        &self,
+        previous: Option<FocusHandle>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        match previous {
+            Some(handle) => window.focus(&handle, cx),
+            None => self.focus_root(window, cx),
+        }
+    }
+
     /// Records, or clears, the buttons a modal dialog is keeping the keyboard
     /// among. Called by [`crate::containers::dialog`] each frame.
     pub fn set_dialog_trap(&self, buttons: Option<Vec<FocusHandle>>) {
@@ -738,9 +1077,8 @@ impl ControlState {
     /// say — calls it, or focus is left on a button that no longer exists
     /// and the next shortcut has nowhere to arrive.
     pub fn restore_dialog_focus(&mut self, window: &mut Window, cx: &mut App) {
-        if let Some(handle) = self.dialog_return_focus.take() {
-            window.focus(&handle, cx);
-        }
+        let previous = self.dialog_return_focus.take();
+        self.return_focus_to(previous, window, cx);
     }
 
     /// The focus handle the open menu uses, creating it the first time a
@@ -773,6 +1111,20 @@ impl ControlState {
     pub fn dismiss_popups(&mut self) {
         self.close_combo();
         self.close_menu();
+    }
+
+    /// What Escape does when nothing closer to the keyboard has taken it:
+    /// closes a pop-up list, a menu or the command palette. Returns whether
+    /// there was anything to close, so a host can pass an idle Escape on to
+    /// its own overlays.
+    pub fn dismiss_overlays(&mut self, window: &mut Window, cx: &mut App) -> bool {
+        let had_popup = self.open_combo.is_some() || self.menu.is_some();
+        self.dismiss_popups();
+        if self.palette_overlay.is_some() {
+            self.close_palette(window, cx);
+            return true;
+        }
+        had_popup
     }
 
     pub fn close_menu(&mut self) {
@@ -853,17 +1205,76 @@ pub trait ControlHost: Sized + 'static {
 
     /// Forwarded from a surface that blocks the mouse, such as a scrollbar
     /// track. While the pointer is over one, the host sees neither moves nor
-    /// releases, so the surface passes them through here.
+    /// releases, so the surface passes them through here. The default pumps
+    /// the toolkit's own drags, which is all a host without drags of its
+    /// own needs; a host tracking gestures of its own at the root routes
+    /// these into the same place.
     fn forwarded_mouse_move(
         &mut self,
-        _event: &MouseMoveEvent,
+        event: &MouseMoveEvent,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
+        if mouse_moved(self, event, cx) {
+            cx.notify();
+        }
     }
 
     /// Forwarded from a surface that blocks the mouse.
-    fn forwarded_mouse_up(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+    fn forwarded_mouse_up(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        end_drags(self, cx);
+        cx.notify();
+    }
+}
+
+/// What a pointer move at the root means to the controls' drags: with a
+/// button held it continues them; with none it ends them, because a release
+/// outside the window never arrives and a move with no button held is that
+/// release. Returns whether anything on screen changed.
+///
+/// [`handle_mouse`] calls it from the root. A host with drags of its own at
+/// the root calls it from its own mouse-move handler instead.
+pub fn mouse_moved<V: ControlHost>(
+    host: &mut V,
+    event: &MouseMoveEvent,
+    cx: &mut Context<V>,
+) -> bool {
+    if !event.dragging() {
+        if host.control_state().dragging_anything() {
+            end_drags(host, cx);
+            return true;
+        }
+        return false;
+    }
+    continue_drags(host, event.position, cx)
+}
+
+/// Puts the mouse handlers the toolkit's drags need on the host's root: a
+/// slider handle, a split divider, a tab or a scrollbar thumb is let go of
+/// long after the pointer has left it, so the gesture has to be tracked
+/// from the root. Put it on every `.occlude()`d surface too, because an
+/// occluding panel swallows the move stream a drag underneath it depends
+/// on. [`crate::root`] is this and [`crate::handle_keys`] together.
+pub fn handle_mouse<E: InteractiveElement, V: ControlHost>(root: E, cx: &mut Context<V>) -> E {
+    root.on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+        if mouse_moved(this, event, cx) {
+            cx.notify();
+        }
+    }))
+    .on_mouse_up(
+        MouseButton::Left,
+        cx.listener(|this, _event, _window, cx| {
+            end_drags(this, cx);
+            cx.notify();
+        }),
+    )
+}
+
+fn hash_of(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Pumps every in-flight control drag from one pointer position. Call it
@@ -887,7 +1298,14 @@ pub fn continue_drags<V: ControlHost>(
         moved = true;
     }
     if let Some((id, at)) = host.control_state().track_ratio_at(position) {
-        host.track_dragged(id, at, cx);
+        // The theme's own hue slider is the toolkit's to read; every other
+        // track is the host's.
+        let theme = &mut host.control_state_mut().theme;
+        if theme.hue_track() == Some(id) {
+            theme.hue = Theme::hue_from_track(at.x);
+        } else {
+            host.track_dragged(id, at, cx);
+        }
         moved = true;
     }
     if host.control_state_mut().drag_tab_to(position) {
@@ -906,7 +1324,7 @@ pub fn end_drags<V: ControlHost>(host: &mut V, cx: &mut Context<V>) {
 
 #[cfg(test)]
 mod tests {
-    use super::ControlState;
+    use super::{ControlState, Palette, SCHEME_FADE};
     use gpui::{Point, px};
 
     fn at(x: f32, y: f32) -> Point<gpui::Pixels> {
@@ -1048,6 +1466,65 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
         let t = state.transition(&id, 1, std::time::Duration::from_millis(1));
         assert!(t < 0.2, "{t}");
+    }
+
+    /// A dialog is open from the moment it is asked for, fades out rather
+    /// than vanishing when closed, and is gone once the fade is over.
+    #[test]
+    fn a_dialog_fades_out_before_it_is_gone() {
+        let mut state = ControlState::new();
+        assert_eq!(state.dialog_fade("confirm"), None);
+        state.open_dialog("confirm");
+        assert!(state.is_dialog_open("confirm"));
+        assert!(!state.is_dialog_open("other"));
+        let (opacity, running) = state.dialog_fade("confirm").expect("on screen");
+        assert!(running && opacity < 1.0, "{opacity}");
+        state.close_dialog();
+        assert!(!state.is_dialog_open("confirm"), "closing is not open");
+        assert!(state.dialog_fade("confirm").is_some(), "still fading");
+        assert!(state.animating());
+        // A second close does not restart the exit.
+        let first = state.dialog.as_ref().and_then(|d| d.closing);
+        state.close_dialog();
+        assert_eq!(state.dialog.as_ref().and_then(|d| d.closing), first);
+        std::thread::sleep(crate::easing::MODAL_EXIT + std::time::Duration::from_millis(20));
+        assert_eq!(state.dialog_fade("confirm"), None);
+        assert!(!state.animating());
+    }
+
+    /// A list's keyboard row survives frames while the query is the same,
+    /// and goes back to the top when the query changes.
+    #[test]
+    fn a_new_query_puts_the_keyboard_back_on_the_best_match() {
+        let state = ControlState::new();
+        assert_eq!(state.list_highlight("results", "re"), 0);
+        state.highlight_list("results", 2);
+        assert_eq!(state.list_highlight("results", "re"), 2);
+        assert_eq!(state.list_position("results"), 2);
+        assert_eq!(state.list_highlight("results", "rep"), 0);
+        // Another list is another keyboard.
+        state.highlight_list("commands", 4);
+        assert_eq!(state.list_highlight("results", "rep"), 0);
+        assert_eq!(state.list_position("commands"), 4);
+    }
+
+    /// The theme's palette follows the truth rather than jumping to it,
+    /// and stands still once it has arrived.
+    #[test]
+    fn the_palette_crosses_over_rather_than_cutting() {
+        let mut state = ControlState::new();
+        let light = state.palette();
+        assert!(!light.is_dark);
+        state.theme.scheme = crate::theme::Scheme::Dark;
+        let crossing = state.palette();
+        assert!(state.animating(), "the scheme is crossing over");
+        assert_ne!(crossing.backdrop, light.backdrop);
+        assert_ne!(
+            crossing.backdrop,
+            Palette::from_hue(state.theme.hue, true).backdrop
+        );
+        std::thread::sleep(SCHEME_FADE + std::time::Duration::from_millis(20));
+        assert_eq!(state.palette(), Palette::from_hue(state.theme.hue, true));
     }
 
     /// `menu_opened_at` identifies one opening, which is how an item can

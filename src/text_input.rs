@@ -24,6 +24,8 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::palette::Palette;
+
 actions!(
     text_input,
     [
@@ -79,6 +81,9 @@ pub struct Span {
     /// A wavy underline in `underline`'s colour, for errors.
     pub wavy: bool,
     pub strikethrough: bool,
+    /// Set in the input's accent colour, whatever that is when it paints,
+    /// so a highlighter written once follows the theme.
+    pub accent: bool,
 }
 
 impl Span {
@@ -92,11 +97,21 @@ impl Span {
             underline: None,
             wavy: false,
             strikethrough: false,
+            accent: false,
         }
     }
 
     pub fn color(mut self, color: Rgba) -> Self {
         self.color = Some(color);
+        self
+    }
+
+    /// The input's accent colour — [`InputStyle::accent_color`] — read when
+    /// the text paints rather than when the span is made. A highlighter is
+    /// usually set once and the theme changes under it; a colour captured in
+    /// the closure would stay behind.
+    pub fn accent(mut self) -> Self {
+        self.accent = true;
         self
     }
 
@@ -142,13 +157,41 @@ pub type ContentCallback = Box<dyn Fn(&str, &mut App) + 'static>;
 pub type Highlighter = Box<dyn Fn(&str) -> Vec<Span> + 'static>;
 
 /// Colors for the input text; the parent owns the container chrome.
-#[derive(Clone, Copy)]
+///
+/// [`InputStyle::from_palette`] derives one from a [`Palette`], and an input
+/// styled that way is re-styled by the field that holds it whenever the
+/// palette changes, so a theme crossing over carries the text with it. A
+/// style written out by hand is left alone.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct InputStyle {
     pub text_color: Rgba,
     pub placeholder_color: Rgba,
     pub selection_color: Rgba,
     pub cursor_color: Rgba,
+    /// What a [`Span::accent`] paints in.
+    pub accent_color: Rgba,
     pub font_size: f32,
+    /// Whether the colours came from a palette and should follow it. Set by
+    /// [`InputStyle::from_palette`]; a style built by hand keeps its colours
+    /// whatever palette the field around it is handed.
+    pub follows_palette: bool,
+}
+
+impl InputStyle {
+    /// The palette's text, placeholder, selection and caret colours, at
+    /// `font_size`. The input then follows the palette; see
+    /// [`TextInput::restyle`].
+    pub fn from_palette(palette: Palette, font_size: f32) -> Self {
+        Self {
+            text_color: palette.text_primary,
+            placeholder_color: palette.text_secondary,
+            selection_color: palette.accent,
+            cursor_color: palette.accent,
+            accent_color: palette.accent,
+            font_size,
+            follows_palette: true,
+        }
+    }
 }
 
 pub struct TextInput {
@@ -225,6 +268,23 @@ impl TextInput {
     pub fn clear_highlighter(&mut self, cx: &mut Context<Self>) {
         self.highlighter = None;
         cx.notify();
+    }
+
+    /// Brings a palette-derived style up to date with `palette`, keeping
+    /// the font size. The fields that hold an input call this as they
+    /// render, so a host never re-styles its inputs by hand; a style that
+    /// did not come from a palette is left alone. Returns whether anything
+    /// changed.
+    pub fn restyle(&mut self, palette: Palette) -> bool {
+        if !self.style.follows_palette {
+            return false;
+        }
+        let fresh = InputStyle::from_palette(palette, self.style.font_size);
+        if self.style == fresh {
+            return false;
+        }
+        self.style = fresh;
+        true
     }
 
     pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
@@ -1032,7 +1092,9 @@ impl TextElement {
                     .iter()
                     .find(|span| span.range.start <= start && end <= span.range.end)
                 {
-                    if let Some(color) = span.color {
+                    if span.accent {
+                        run.color = crate::color::to_hsla(input_style.accent_color);
+                    } else if let Some(color) = span.color {
                         run.color = crate::color::to_hsla(color);
                     }
                     if let Some(background) = span.background {

@@ -44,12 +44,11 @@ Controls are functions of the data they receive. They take their value, a `Palet
 Small pieces of UI state that must survive between frames, such as an open pop-up or an active drag, live in a `ControlState` on your view.
 
 ```rust
-use gpui::{Context, Window, prelude::*};
-use vampir::{ButtonVariant, ControlHost, ControlState, Palette, button};
+use gpui::{Context, Window, div, prelude::*};
+use vampir::{ButtonVariant, ControlHost, ControlState, button};
 
 struct Editor {
     controls: ControlState,
-    palette: Palette,
 }
 
 impl ControlHost for Editor {
@@ -59,13 +58,17 @@ impl ControlHost for Editor {
 
 impl Render for Editor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        button("save", "Save", ButtonVariant::Primary, true, self.palette, cx,
-            |editor, _window, cx| editor.save(cx))
+        let palette = self.controls.palette();
+        vampir::root(div().id("root"), self, cx).child(
+            button("save", "Save", ButtonVariant::Primary, true, palette, cx,
+                |editor, _window, cx| editor.save(cx)))
     }
 }
 ```
 
-A host with no theme of its own gets the whole palette from a single number:
+Two calls make the keyboard and the mouse work everywhere: `vampir::bind_keys(cx)` once when the application starts binds Tab, Shift-Tab, Escape and the text-editing keys, and `vampir::root(element, self, cx)` on the view's root gives those keys somewhere to land, tracks the drags that outlive their control, and gives the keyboard somewhere to fall back to. Every control handles its own keys — Space on a button, arrows in a group — with no setup at all; see [Keyboard and focus](docs/keyboard.md).
+
+Every `ControlState` carries a theme: one hue, and a colour scheme that follows the desktop until someone picks one. `self.controls.palette()` is the palette it derives, crossing over rather than cutting when either changes. A host with a theme of its own builds a `Palette` from it instead:
 
 ```rust
 let palette = Palette::from_hue(268.0, /* dark */ true);
@@ -102,19 +105,23 @@ The gallery supports both colour schemes:
 
 ## Features
 
-**Controls** — `button`, `icon_button`, `switch`, `checkbox`, `radio_group`, `segmented`, `chip` / `chip_group`, `spinbox`, `text_field`, `text_area`, `search_field`, `combo`, `slider`, `progress_bar`, `spinner`, `badge`, `separator`, `scrollbar`, `caption`.
+**Controls** — `button`, `icon_button` (with `glyph`), `switch`, `checkbox`, `radio_group`, `segmented`, `chip` / `chip_group`, `spinbox`, `text_field`, `text_area`, `search_field`, `combo`, `slider`, `progress_bar`, `spinner`, `badge`, `separator`, `scrollbar`, `caption`, `fading_text`.
 
-**Containers** — `tab_bar` (drag to reorder, optional close buttons), `split_handle` + `split_area`, `collapsible`, `dialog`.
+**Containers** — `tab_bar` (drag to reorder, optional close buttons) with `reorder`, `split_handle` + `split_area`, `collapsible`, `dialog`, `card`, `labelled`, `row` / `column`, `scroll_area`, `arriving`.
 
-**Menus and overlays** — `context_menu`, `menu_button`, `Tooltip`, `command_palette` with `fuzzy_filter` / `fuzzy_score`.
+**Menus and overlays** — `context_menu`, `menu_button`, `menu_target`, `Tooltip`, `command_palette` and `search_list` with `fuzzy_filter` / `fuzzy_score`.
 
-**Data** — `tree_row` for an already flattened tree, `table_header` with `Column` and `SortDirection`.
+**Data** — `tree_row` with `flatten_tree`, `table_header` and `table_row` with `Column` and `SortDirection`.
+
+**Theme** — `Theme`, `Scheme`, `scheme_picker`, `hue_picker`: one hue and a scheme that follows the desktop, and the palette derived from them.
 
 **Colour** — `Palette`, `hue_slider`, `color_pad`, `swatch_grid`, `hue_wheel`, and the `Oklch` type they all speak.
 
 **Text** — `TextInput`, `InputStyle`, `Span` and `Highlighter`.
 
-**Lighting** — `lit`, `raised`, `recessed`, `panel`, `rim`, `glow`, `shade`. These helpers keep gradients and shadows consistent across controls.
+**Lighting** — `lit`, `raised`, `recessed`, `panel`, `rim`, `glow`, `shade`, `ground`. These helpers keep gradients and shadows consistent across controls.
+
+**The host's root** — `root`, `handle_keys`, `handle_mouse`, `bind_keys`, `edit_menu`, `ui_font`.
 
 ## The app icon
 

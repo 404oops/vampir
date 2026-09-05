@@ -5780,7 +5780,7 @@ dependencies = [
 
 [[package]]
 name = "vampir"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "gpui-ce",
  "gpui_ce_platform",

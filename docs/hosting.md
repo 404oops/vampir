@@ -1,18 +1,17 @@
 # Hosting the toolkit
 
-This page covers the responsibilities of the view that renders Vampir controls. Most controls are simple functions, but the host must provide shared state, route drag events and request frames for animations.
+This page covers the responsibilities of the view that renders Vampir controls. Most controls are simple functions. The host provides one `ControlState`, puts the toolkit's handlers on its root, and asks for frames while something animates.
 
 ## Set up a host
 
-Four things, once:
+Three things, once:
 
 ```rust
-use gpui::{Context, Point, Window, prelude::*};
-use vampir::{ControlHost, ControlState, Palette};
+use gpui::{Context, Point, Window, div, prelude::*};
+use vampir::{ControlHost, ControlState};
 
 struct Editor {
     controls: ControlState,
-    palette: Palette,
     // ... the rest of the app
 }
 
@@ -30,55 +29,46 @@ impl ControlHost for Editor {
     }
 
     // Only if you use the tab bar.
-    fn tabs_reordered(&mut self, _bar: vampir::ComboId, from: usize, to: usize, cx: &mut Context<Self>) {
-        let tab = self.tabs.remove(from);
-        self.tabs.insert(to, tab);
-        cx.notify();
-    }
-
-    // Only if you track drags of your own at the root. Scrollbar tracks
-    // block the mouse, so they forward through these.
-    fn forwarded_mouse_move(&mut self, event: &gpui::MouseMoveEvent, _w: &mut Window, cx: &mut Context<Self>) {
-        self.root_mouse_move(event, cx);
-    }
-    fn forwarded_mouse_up(&mut self, _w: &mut Window, cx: &mut Context<Self>) {
-        self.root_mouse_up(cx);
-    }
-}
-```
-
-Only the first two methods are required. The rest have empty defaults, and you add them when you add the widget that needs them.
-
-## Forward drag events
-
-The pointer can leave a small control as soon as a drag begins. The host therefore continues tracking the gesture from the root:
-
-```rust
-fn root_mouse_move(&mut self, event: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
-    // A release outside the window never arrives. A move with no button
-    // held is that release, so end everything exactly as it would have.
-    if !event.dragging() {
-        if self.controls.dragging_anything() { self.root_mouse_up(cx); }
-        return;
-    }
-    if vampir::continue_drags(self, event.position, cx) {
+    fn tabs_reordered(&mut self, bar: vampir::ComboId, from: usize, to: usize, cx: &mut Context<Self>) {
+        match bar {
+            "documents" => vampir::reorder(&mut self.documents, &mut self.current, from, to),
+            _ => return,
+        }
         cx.notify();
     }
 }
 
-fn root_mouse_up(&mut self, cx: &mut Context<Self>) {
-    vampir::end_drags(self, cx);   // applies a finished tab reorder too
-    cx.notify();
+impl Render for Editor {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = self.controls.palette();
+        let body = self.body(palette, window, cx);
+        if self.controls.animating() {
+            window.request_animation_frame();
+        }
+        vampir::root(div().id("root"), self, cx)
+            .size_full()
+            .font_family(vampir::ui_font())
+            .bg(vampir::ground(palette.backdrop))
+            .child(body)
+    }
 }
 ```
 
-Attach that mouse-move handler to the root **and to every `.occlude()`d surface**. An occluding panel swallows the move stream a drag underneath it depends on.
+Only the first two methods of `ControlHost` are required. `track_dragged` and `tabs_reordered` have empty defaults, and you add them when you add the widget that needs them. `vampir::reorder` moves the item and keeps the selection on the item it was on.
+
+`vampir::root` is `handle_keys` and `handle_mouse` together. It puts the toolkit's key handlers on the root (see [Keyboard and focus](keyboard.md#what-the-host-has-to-do)), the mouse handlers its drags need, and the root focus handle the keyboard falls back to when whatever had it has gone. Put `vampir::handle_mouse` on every `.occlude()`d surface of your own as well: an occluding panel swallows the move stream a drag underneath it depends on.
+
+## Drags
+
+A slider handle, a split divider, a tab or a scrollbar thumb is let go of long after the pointer has left it, so the toolkit tracks the gesture from the root, and `handle_mouse` is all that takes. It also handles the release that never comes: a pointer released outside the window sends nothing, and a move with no button held is taken as that release.
+
+A host that tracks drags of its own at the root has two things to do. Call `vampir::mouse_moved(self, event, cx)` from its own mouse-move handler and `vampir::end_drags(self, cx)` from its mouse-up, instead of using `handle_mouse`. And override `forwarded_mouse_move` and `forwarded_mouse_up` on `ControlHost` to route into the same place: a surface that blocks the mouse, such as a scrollbar track, forwards its moves and releases through those, and the defaults only know about the toolkit's drags.
 
 ## Request frames for animations
 
 Ask `ControlState::animating()` **after** your page has been built, not before. A switch or a disclosure notices its own state change while it renders — that is what lets a change made by a menu item or a shortcut slide exactly as a click does — so a check made before the controls run cannot see the slide one of them is about to start, and the frame that starts it never asks for the frame that would continue it.
 
-Fades and slides are `Instant`-driven, so they finish on their own and stop asking for frames. Fold `ControlState::animating()` into whatever decides:
+Fades and slides are `Instant`-driven, so they finish on their own and stop asking for frames. The theme crossing over, a dialog arriving or leaving, a menu or a palette revealing are all counted. Fold `ControlState::animating()` into whatever decides:
 
 ```rust
 if self.controls.animating() || self.my_own_transitions_running() {
@@ -89,7 +79,7 @@ if self.controls.animating() || self.my_own_transitions_running() {
 `spinner` is the exception: it is indeterminate, so it never finishes and never stops needing frames. Ask for them only while one is actually on screen — `request_animation_frame` holds the display link open, and a spinner nobody can see should not be costing 60Hz. The gallery scopes it to the one page that has a spinner on it:
 
 ```rust
-if self.controls.animating() || dialog_animating || page == Page::Controls {
+if self.controls.animating() || page == Page::Controls {
     window.request_animation_frame();
 }
 ```
@@ -100,12 +90,13 @@ Do not drive hover from an `Instant`. Scrolling a list re-fires hover on every r
 
 ## Animating your own state
 
-The same machinery the controls use is there for the host, and the gallery leans on it for the things only a host can know about:
+The same machinery the controls use is there for the host:
 
-- **A two-state look:** `self.controls.blend(&id, on, SWITCH_SLIDE)` is 0 to 1, eased, from wherever it was when `on` last changed. The footer's "last action" fades its new text in with it.
-- **A value going somewhere:** `self.controls.tween("key", target, MOVE)` glides from its current value to the target and is at the target the first time it is asked. The gallery's table renders each row `.relative().top(px(tween(row) - place))`, so a re-sort slides rows rather than redealing them; `tween_angle` does the same for degrees, the short way round.
-- **A scheme crossing over:** the gallery keeps `dark: bool` and `hue: f64` as the truth, tweens a darkness and a shown hue from them, and builds the palette from those — `Palette::mix(light, dark, darkness)` when the darkness is between 0 and 1. Every control is a function of the palette it is handed, so one cross-fade at the root is every colour on screen crossing over, and the text inputs are re-styled whenever the shown pair changes rather than when the truth does.
-- **A page arriving:** `transition(&id, page as u64, MOVE)` gives progress since the page changed; the gallery wraps the body in `.opacity(t).relative().top(px(8.0 * (1.0 - t)))`.
+- **A two-state look:** `self.controls.blend(&id, on, SWITCH_SLIDE)` is 0 to 1, eased, from wherever it was when `on` last changed.
+- **A value going somewhere:** `self.controls.tween("key", target, MOVE)` glides from its current value to the target and is at the target the first time it is asked. `table_row` uses it to slide a row to its sorted place rather than redealing the table; `tween_angle` does the same for degrees, the short way round.
+- **Content arriving:** `vampir::arriving("page", page as u64, &self.controls, body)` fades the body in and settles it up into place each time the key changes. The gallery wraps each page in one.
+- **Text changing:** `vampir::fading_text("status", text, &self.controls)` fades new words in over the old ones, because words cannot be interpolated. The gallery's footer is one.
+- **A scheme crossing over** is the theme's job; see below.
 
 Key everything by what it *is* rather than where it is — a row by its id, not its index — or a row shifting down one place inherits the animation of whatever was there before.
 
@@ -117,47 +108,44 @@ The same string is what comes back to `track_dragged` and `tabs_reordered`, so t
 
 ## Themes
 
-A host with no theme of its own gets the whole palette from one number:
+Every `ControlState` carries a `Theme`: one hue, and a `Scheme` that is `System`, `Light` or `Dark`. `self.controls.palette()` is the palette to hand every control this frame, and it follows the theme rather than jumping to it. A scheme change crosses over through `Palette::mix` over `SCHEME_FADE`; a hue change glides the short way round; a hue under the hand on its own slider sits under the hand. Every control is a function of the palette it is handed, so one cross-fade at the root is every colour on screen crossing over, whoever made the change.
+
+Start from the system rather than from a guess. `self.controls.observe_appearance(window, cx)` in the view's constructor reads whether the desktop is light or dark and keeps following it. A window that opens dark on a light desktop looks broken before it looks like a choice. `Scheme::System` means the desktop's choice, `Light` and `Dark` are the user's, and picking `System` again hands control back.
 
 ```rust
-let palette = Palette::from_hue(268.0, /* dark */ true);
+// In the constructor:
+self.controls.observe_appearance(window, cx);
+
+// Anywhere:
+self.controls.theme.scheme = Scheme::Dark;
+self.controls.theme.hue = 200.0;
+
+// In render, the toolkit's own pickers, bound to the theme:
+vampir::scheme_picker("scheme", palette, self, cx)   // System | Light | Dark
+vampir::hue_picker("hue", palette, self, cx)         // a slider the toolkit reads itself
 ```
 
-Start from the system rather than from a guess. The window knows whether the OS is in light or dark mode, and it says when that changes:
+The window's own ground is `palette.backdrop`, lit with `vampir::ground(palette.backdrop)` on the root; `scroll_area` fades scrolling content into it at the right height. `vampir::ui_font()` is the system's interface face, for `.font_family` on the root.
 
-```rust
-fn system_dark(window: &Window) -> bool {
-    matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark)
-}
+A host with a richer theme of its own ignores all of this. `Palette` is a plain public struct of `Copy` colour roles: build one with `Palette::from_hue` or field by field and pass it, **by value**, into every control. See [Design](design.md#colour) for what the roles mean and when adding one is justified.
 
-// In the view's constructor. Keep the Subscription in a field, or it stops.
-let dark = system_dark(window);
-let appearance = window.observe_window_appearance({
-    let this = cx.weak_entity();
-    move |window, cx| {
-        let dark = system_dark(window);
-        this.update(cx, |this, cx| if this.follow_system { this.dark = dark; cx.notify(); }).ok();
-    }
-});
-```
+Text inputs hold their own colours, because they are GPUI entities rather than functions. Style them with `InputStyle::from_palette(palette, size)`, and the field that holds one — `text_field`, `text_area`, `search_field`, `spinbox` — keeps it in step with whatever palette it is handed, so a theme crossing over carries the text with it. A style written out by hand is left alone. A highlighter that wants the accent uses `Span::accent()`, which reads the colour when the text paints rather than when the closure was written.
 
-The gallery does exactly this: it opens in the scheme the desktop is using, follows the desktop until someone picks Light or Dark by hand, and offers "System" to hand control back. A window that opens dark on a light desktop looks broken before it looks like a choice.
+## Overlays
 
-`Palette` is a plain public struct of `Copy` colour roles, so a host with a richer theme writes the fields directly instead. Either way it is passed **by value** into every control; see [Design](design.md#colour) for what the roles mean and when adding one is justified.
+Which pop-up is open lives in `ControlState`, and so do the two overlays a host opens itself:
 
-Text inputs are the one thing that holds its own colours, because they are GPUI entities rather than functions. Re-style them when the theme changes rather than on every frame:
+- `self.controls.open_dialog("confirm")` opens the `dialog` with that id. It takes the keyboard, and its buttons, Enter, Escape and the scrim hand the keyboard back and close it before the host's callback runs.
+- `self.controls.toggle_palette("commands", &self.query, window, cx)` is what the shortcut for the `command_palette` does; `open_palette` and `close_palette` are the two halves. The palette puts the keyboard in the query, and gives it back where it was when it closes.
 
-```rust
-if self.styled_for != (self.hue.to_bits(), self.dark) {
-    self.styled_for = (self.hue.to_bits(), self.dark);
-    self.restyle_inputs(palette, cx);
-}
-```
+A host that removes whatever has focus — switching pages, say — calls `self.controls.focus_root(window, cx)` first. GPUI dispatches nothing from a handle that is no longer in the tree, not even the root's own shortcuts, so a shortcut that "stopped working" is almost always focus left on something that has gone.
 
 ## Key bindings and menus
 
-The toolkit ships actions but binds nothing: which key opens your command palette is your application's business, not a widget's. `TextInput` exports its actions (`Backspace`, `SelectAll`, `Copy`, …) for you to bind in the `"TextInput"` context, and `shortcut_recorder` hands back a `Chord` with a `keystroke` ready for `KeyBinding`.
+The keys that are the same in every application are the toolkit's. `vampir::bind_keys(cx)`, once at start-up, binds Tab, Shift-Tab and Escape to the toolkit's `FocusNext`, `FocusPrevious` and `Dismiss` actions, and the text-editing keymap (`Backspace`, `SelectAll`, `Copy`, …) in the `"TextInput"` context, in the dialect the platform expects. `vampir::root` puts the handlers on the root; see [Keyboard and focus](keyboard.md#what-the-host-has-to-do). `standard_bindings()` is the list on its own, for a host that wants to leave some out.
 
-Write bindings with `secondary` for the platform's primary modifier — it is ⌘ on macOS and Ctrl everywhere else, so `"secondary-k"` is one binding that is right on all three. The text-editing keymap is the one place the platforms genuinely disagree (⌥ moves by word on a Mac, Ctrl does elsewhere), and `examples/gallery.rs` shows the two lists. Label shortcuts with `vampir::display("secondary-k")`, which renders `⌘K` or `Ctrl+K` as the platform writes it; a `⌘` shown on a Windows machine is a symbol with no key behind it.
+Which key opens your command palette is your application's business, not a widget's, so everything else the toolkit leaves to you: it ships the actions and binds none of them. `shortcut_recorder` hands back a `Chord` with a `keystroke` ready for `KeyBinding`. Bind your own after `bind_keys`; a later binding for the same key wins.
 
-On macOS the menu bar is not optional — see [Shipping a macOS app](macos-apps.md).
+Write bindings with `secondary` for the platform's primary modifier — it is ⌘ on macOS and Ctrl everywhere else, so `"secondary-k"` is one binding that is right on all three. Label shortcuts with `vampir::display("secondary-k")`, which renders `⌘K` or `Ctrl+K` as the platform writes it; a `⌘` shown on a Windows machine is a symbol with no key behind it.
+
+On macOS the menu bar is not optional. `vampir::edit_menu()` is the Edit menu, wired to the text input's actions with the OS actions macOS needs to route them to the focused text; the rest of the bar is yours. See [Shipping a macOS app](macos-apps.md).

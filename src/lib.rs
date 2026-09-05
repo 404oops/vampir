@@ -7,13 +7,14 @@
 //! both.
 //!
 //! Nothing here knows about any particular application. A host stores a
-//! [`ControlState`], implements [`ControlHost`] for its view, and hands
-//! controls a [`Palette`]; every control is generic over that view.
+//! [`ControlState`], implements [`ControlHost`] for its view, puts the
+//! toolkit's handlers on its root with [`root`], and hands controls a
+//! [`Palette`]; every control is generic over that view.
 //!
 //! ```ignore
-//! use vampir::{ControlHost, ControlState, Palette, controls, ButtonVariant};
+//! use vampir::{ControlHost, ControlState, controls, ButtonVariant};
 //!
-//! struct Editor { controls: ControlState, palette: Palette }
+//! struct Editor { controls: ControlState }
 //!
 //! impl ControlHost for Editor {
 //!     fn control_state(&self) -> &ControlState { &self.controls }
@@ -21,13 +22,17 @@
 //! }
 //!
 //! // ...inside Editor::render:
-//! controls::button("save", "Save", ButtonVariant::Primary, true, self.palette, cx,
-//!     |editor, _window, cx| editor.save(cx))
+//! let palette = self.controls.palette();
+//! vampir::root(div().id("root"), self, cx)
+//!     .child(controls::button("save", "Save", ButtonVariant::Primary, true, palette, cx,
+//!         |editor, _window, cx| editor.save(cx)))
 //! ```
 //!
-//! A host with no theme of its own can start from
-//! [`Palette::from_hue`], which derives the whole set from one hue in
-//! degrees plus a light/dark flag.
+//! [`ControlState::palette`] is the palette of the [`theme`] every host
+//! has by default — one hue, and the desktop's colour scheme — crossing
+//! over rather than cutting when either changes. A host with a theme of
+//! its own builds a [`Palette`] from it instead, with
+//! [`Palette::from_hue`] or field by field.
 
 pub mod color;
 pub mod containers;
@@ -46,31 +51,46 @@ pub mod shortcut;
 pub mod state;
 pub mod swatch;
 pub mod text_input;
+pub mod theme;
+pub mod typography;
 
-pub use containers::{DialogButton, Tab, collapsible, dialog, split_area, split_handle, tab_bar};
+pub use containers::{
+    DialogButton, Tab, arriving, card, collapsible, column, dialog, labelled, reorder, row,
+    scroll_area, split_area, split_handle, tab_bar,
+};
 pub use controls::{
     BadgeTone, ButtonVariant, CHIP_HEIGHT, CONTROL_HEIGHT, CONTROL_RADIUS, ChipSelection, Choice,
-    ComboDirection, SliderTrack, badge, button, caption, checkbox, chip, chip_group, combo,
+    SliderTrack, badge, button, caption, checkbox, chip, chip_group, combo, fading_text, glyph,
     icon_button, progress_bar, radio_group, scrollbar, search_field, segmented, separator, slider,
     spinbox, spinner, switch, text_area, text_field,
 };
 pub use data::{
-    Column, SortDirection, TABLE_ROW_HEIGHT, TreeMove, TreeRow, table_cell, table_header, tree_row,
-    tree_step,
+    Column, SortDirection, TABLE_ROW_HEIGHT, TreeMove, TreeRow, flatten_tree, table_cell,
+    table_header, table_row, tree_row, tree_step,
 };
 pub use easing::{ease_in_cubic, ease_out_cubic, modal_opacity};
 #[cfg(feature = "app-icon")]
 pub use icon::AppIcon;
-pub use keyboard::{Key, Orientation, key, move_focus, nudge, nudge_stepped, ring, ring_for, step};
-pub use lighting::{glow, lit, lit_at, lit_mix, lit_stops, panel, raised, recessed, rim, shade};
-pub use menu::{ContextMenu, MenuAction, MenuItem, context_menu, menu_button};
-pub use overlay::{Command, Tooltip, command_list, command_palette, fuzzy_filter, fuzzy_score};
+pub use keyboard::{
+    Dismiss, FocusNext, FocusPrevious, Key, Orientation, bind_keys, edit_menu, handle_keys, key,
+    move_focus, nudge, nudge_stepped, ring, ring_for, root, standard_bindings, step,
+};
+pub use lighting::{
+    glow, ground, ground_at, lit, lit_at, lit_mix, lit_stops, panel, raised, recessed, rim, shade,
+};
+pub use menu::{ContextMenu, MenuAction, MenuItem, context_menu, menu_button, menu_target};
+pub use overlay::{
+    Command, Hint, Tooltip, command_list, command_palette, fuzzy_filter, fuzzy_score, search_list,
+};
 pub use palette::Palette;
 pub use scroll::{SCROLL_FADE, ScrollAxis, ScrollDrag, apply_scroll_drag, scroll_fades};
 pub use shortcut::{Chord, display, display_keystroke, shortcut_recorder};
 pub use state::{
-    COMBO_REVEAL, ComboId, ControlHost, ControlState, MOVE, OpenMenu, SCHEME_FADE, SWITCH_SLIDE,
-    TabDrag, TrackAxis, continue_drags, end_drags,
+    COMBO_REVEAL, ComboId, ControlHost, ControlState, MOVE, OpenDialog, OpenMenu, OpenPalette,
+    SCHEME_FADE, SWITCH_SLIDE, TabDrag, TrackAxis, continue_drags, end_drags, handle_mouse,
+    mouse_moved,
 };
 pub use swatch::{MAX_CHROMA, Oklch, color_pad, hue_slider, hue_wheel, swatch_grid};
 pub use text_input::{Highlighter, InputStyle, Span, TextInput};
+pub use theme::{DEFAULT_HUE, Scheme, Theme, hue_picker, scheme_picker, system_dark};
+pub use typography::{SMALL_TEXT_SIZE, TEXT_SIZE, TITLE_TEXT_SIZE, ui_font};
