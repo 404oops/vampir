@@ -134,7 +134,13 @@ fn install_macos(png: &[u8]) {
         return;
     };
 
-    const CANVAS: f64 = 1024.0;
+    // 512 points: the largest size macOS ever draws a runtime icon at is
+    // 256 points on a 2x display, and it is the placeholder's native size,
+    // so nothing is resampled on the way. Not larger, because `lockFocus`
+    // below backs the canvas with bitmaps at 8 bytes a pixel that the
+    // application keeps for as long as it runs: at 1024 points that was
+    // 16 MB of the process for an icon shown at 128 points.
+    const CANVAS: f64 = 512.0;
     let body = CANVAS * MACOS_BODY_FRACTION;
     let inset = (CANVAS - body) / 2.0;
 
