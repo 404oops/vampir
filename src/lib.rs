@@ -60,9 +60,9 @@ pub use containers::{
 };
 pub use controls::{
     BadgeTone, ButtonVariant, CHIP_HEIGHT, CONTROL_HEIGHT, CONTROL_RADIUS, ChipSelection, Choice,
-    SliderTrack, badge, button, caption, checkbox, chip, chip_group, combo, fading_text, glyph,
-    icon_button, progress_bar, radio_group, scrollbar, search_field, segmented, separator, slider,
-    spinbox, spinner, switch, text_area, text_field,
+    SliderTrack, WidgetContext, badge, button, caption, checkbox, chip, chip_group, combo,
+    fading_text, glyph, icon_button, progress_bar, radio_group, scrollbar, search_field, segmented,
+    separator, slider, spinbox, spinner, switch, text_area, text_field,
 };
 pub use data::{
     Column, SortDirection, TABLE_ROW_HEIGHT, TreeMove, TreeRow, flatten_tree, table_cell,

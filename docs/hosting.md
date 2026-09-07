@@ -123,8 +123,8 @@ self.controls.theme.scheme = Scheme::Dark;
 self.controls.theme.hue = 200.0;
 
 // In render, the toolkit's own pickers, bound to the theme:
-vampir::scheme_picker("scheme", palette, self, cx)   // System | Light | Dark
-vampir::hue_picker("hue", palette, self, cx)         // a slider the toolkit reads itself
+vampir::scheme_picker("scheme", WidgetContext::new(palette, self, cx))   // System | Light | Dark
+vampir::hue_picker("hue", WidgetContext::new(palette, self, cx))         // a slider the toolkit reads itself
 ```
 
 The window's own ground is `palette.backdrop`, lit with `vampir::ground(palette.backdrop)` on the root; `scroll_area` fades scrolling content into it at the right height. `vampir::ui_font()` is the system's interface face, for `.font_family` on the root.

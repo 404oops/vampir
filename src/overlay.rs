@@ -8,7 +8,7 @@ use gpui::{
     MouseButton, MouseDownEvent, Render, SharedString, Window, deferred, div, prelude::*, px,
 };
 
-use crate::controls::search_field;
+use crate::controls::{WidgetContext, search_field};
 use crate::easing::{ease_out_cubic, progress};
 use crate::keyboard::{self, Dismiss, Key, Orientation};
 use crate::lighting;
@@ -252,11 +252,10 @@ pub fn command_list<V: ControlHost>(
     id: &'static str,
     matches: &[Command],
     highlighted: usize,
-    palette: Palette,
-    view: &V,
-    cx: &mut Context<V>,
+    ctx: WidgetContext<'_, '_, '_, V>,
     on_activate: impl Fn(&mut V, SharedString, &mut Window, &mut Context<V>) + 'static,
 ) -> Div {
+    let WidgetContext { palette, view, cx } = ctx;
     // A concrete `Div` rather than `impl IntoElement`: in the 2024 edition an
     // opaque return captures every input lifetime, which would keep `cx`
     // borrowed for as long as the list lived and stop the caller building
@@ -369,14 +368,14 @@ pub fn search_list<V: ControlHost>(
     id: &'static str,
     query: &Entity<TextInput>,
     items: &[Command],
-    palette: Palette,
-    view: &V,
+    mut ctx: WidgetContext<'_, '_, '_, V>,
     window: &Window,
-    cx: &mut Context<V>,
     on_activate: impl Fn(&mut V, SharedString, &mut Window, &mut Context<V>) + 'static,
 ) -> Div {
+    let palette = ctx.palette;
+    let view = ctx.view;
     let on_activate: Activate<V> = Rc::new(on_activate);
-    let text = query.read(cx).text();
+    let text = query.read(ctx.cx).text();
     let matches = fuzzy_filter(&text, items);
     let highlighted = view
         .control_state()
@@ -388,12 +387,11 @@ pub fn search_list<V: ControlHost>(
             id,
             &matches,
             highlighted,
-            palette,
-            view,
-            cx,
+            ctx.reborrow(),
             move |view, id, window, cx| on_activate(view, id, window, cx),
         )
     };
+    let cx: &mut Context<V> = &mut *ctx.cx;
     let ids = matches.iter().map(|command| command.id.clone()).collect();
     let list = div()
         .flex()
@@ -459,12 +457,12 @@ pub fn command_palette<V: ControlHost>(
     id: ComboId,
     query: &Entity<TextInput>,
     commands: &[Command],
-    palette: Palette,
-    view: &V,
+    mut ctx: WidgetContext<'_, '_, '_, V>,
     window: &Window,
-    cx: &mut Context<V>,
     on_activate: impl Fn(&mut V, SharedString, &mut Window, &mut Context<V>) + 'static,
 ) -> Option<impl IntoElement> {
+    let palette = ctx.palette;
+    let view = ctx.view;
     let state = view.control_state();
     let opened_at = state
         .palette_overlay
@@ -486,7 +484,7 @@ pub fn command_palette<V: ControlHost>(
         palette.field_surface
     };
 
-    let text = query.read(cx).text();
+    let text = query.read(ctx.cx).text();
     let matches = fuzzy_filter(&text, commands);
     let highlighted = state
         .list_highlight(id, &text)
@@ -498,12 +496,11 @@ pub fn command_palette<V: ControlHost>(
             id,
             &matches,
             highlighted,
-            palette,
-            view,
-            cx,
+            ctx.reborrow(),
             move |view, id, window, cx| on_activate(view, id, window, cx),
         )
     };
+    let cx: &mut Context<V> = &mut *ctx.cx;
     let ids = matches.iter().map(|command| command.id.clone()).collect();
 
     let panel = div()

@@ -235,7 +235,7 @@ impl TextInput {
             // happily could not be reached from the keyboard at all.
             focus_handle: cx.focus_handle().tab_stop(true),
             content: "".into(),
-            placeholder: placeholder.to_string().into(),
+            placeholder: SharedString::from(placeholder),
             multi_line,
             style,
             disabled: false,
@@ -288,7 +288,7 @@ impl TextInput {
     }
 
     pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
-        self.content = text.to_string().into();
+        self.content = SharedString::from(text);
         let len = self.content.len();
         self.selected_range = len..len;
         self.selection_reversed = false;
@@ -331,8 +331,7 @@ impl TextInput {
 
     fn emit_change(&mut self, cx: &mut Context<Self>) {
         if let Some(on_change) = self.on_change.take() {
-            let text = self.content.to_string();
-            on_change(&text, cx);
+            on_change(&self.content, cx);
             self.on_change = Some(on_change);
         }
     }
@@ -590,8 +589,7 @@ impl TextInput {
         if self.multi_line {
             self.replace_text_in_range(None, "\n", window, cx);
         } else if let Some(on_submit) = self.on_submit.take() {
-            let text = self.content.to_string();
-            on_submit(&text, cx);
+            on_submit(&self.content, cx);
             self.on_submit = Some(on_submit);
         } else {
             // Nothing to submit to: the Enter belongs to whatever holds the

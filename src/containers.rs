@@ -15,7 +15,9 @@ use gpui::{
     prelude::*, px,
 };
 
-use crate::controls::{ButtonVariant, CONTROL_RADIUS, button_focused, caption, scrollbar};
+use crate::controls::{
+    ButtonVariant, CONTROL_RADIUS, WidgetContext, button_focused, caption, scrollbar,
+};
 use crate::keyboard::{self, Dismiss, Key, Orientation};
 use crate::lighting;
 use crate::palette::Palette;
@@ -83,12 +85,11 @@ pub fn tab_bar<V: ControlHost>(
     id: ComboId,
     tabs: &[Tab],
     selected: usize,
-    palette: Palette,
-    view: &V,
-    cx: &mut Context<V>,
+    ctx: WidgetContext<'_, '_, '_, V>,
     on_select: impl Fn(&mut V, usize, &mut Window, &mut Context<V>) + 'static,
     on_close: impl Fn(&mut V, usize, &mut Window, &mut Context<V>) + 'static,
 ) -> impl IntoElement {
+    let WidgetContext { palette, view, cx } = ctx;
     let dark = palette.is_dark;
     let on_select = Rc::new(on_select);
     let on_close = Rc::new(on_close);
@@ -513,10 +514,9 @@ pub fn split_handle<V: ControlHost>(
     id: ComboId,
     fraction: f32,
     vertical: bool,
-    palette: Palette,
-    view: &V,
-    cx: &mut Context<V>,
+    ctx: WidgetContext<'_, '_, '_, V>,
 ) -> impl IntoElement {
+    let WidgetContext { palette, view, cx } = ctx;
     const GRAB: f32 = 9.0;
     let dragging = view.control_state().is_dragging(id);
     let axis = if vertical {
@@ -604,12 +604,11 @@ pub fn collapsible<V: ControlHost>(
     id: &'static str,
     title: &str,
     expanded: bool,
-    palette: Palette,
-    view: &V,
-    cx: &mut Context<V>,
+    ctx: WidgetContext<'_, '_, '_, V>,
     body: impl IntoElement,
     on_toggle: impl Fn(&mut V, bool, &mut Window, &mut Context<V>) + 'static,
 ) -> impl IntoElement {
+    let WidgetContext { palette, view, cx } = ctx;
     // Noticed from the value rather than announced by the click, so a
     // section opened by a shortcut or by the host's own code turns its
     // chevron exactly as a click does. The chevron turns from where it was,
@@ -660,14 +659,14 @@ pub fn collapsible<V: ControlHost>(
                                 // Drawn rather than rotated: gpui has no
                                 // transform, so the chevron is rebuilt each
                                 // frame at the angle it has reached.
-                                let o = bounds.origin;
+                                let origin = bounds.origin;
                                 let angle = turned * std::f32::consts::FRAC_PI_2;
                                 let (sin, cos) = angle.sin_cos();
                                 let centre = (6.0f32, 6.0f32);
                                 let rotate = |x: f32, y: f32| {
                                     point(
-                                        o.x + px(centre.0 + x * cos - y * sin),
-                                        o.y + px(centre.1 + x * sin + y * cos),
+                                        origin.x + px(centre.0 + x * cos - y * sin),
+                                        origin.y + px(centre.1 + x * sin + y * cos),
                                     )
                                 };
                                 let mut builder = PathBuilder::stroke(px(1.5));
@@ -785,13 +784,12 @@ pub fn dialog<V: ControlHost>(
     id: ComboId,
     title: &str,
     width: f32,
-    palette: Palette,
-    view: &V,
-    cx: &mut Context<V>,
+    ctx: WidgetContext<'_, '_, '_, V>,
     body: impl IntoElement,
     buttons: Vec<DialogButton<V>>,
     on_dismiss: impl Fn(&mut V, &mut Window, &mut Context<V>) + 'static,
 ) -> Option<impl IntoElement> {
+    let WidgetContext { palette, view, cx } = ctx;
     let state = view.control_state();
     let Some((opacity, _)) = state.dialog_fade(id) else {
         state.set_dialog_trap(None);
@@ -1088,7 +1086,7 @@ pub fn arriving(
 /// and `content` scrolls inside that.
 ///
 /// ```ignore
-/// scroll_area("page", &self.scroll, ScrollAxis::Vertical, palette, self, window, cx, body)
+/// scroll_area("page", &self.scroll, ScrollAxis::Vertical, WidgetContext::new(palette, self, cx), window, body)
 ///     .flex_1()
 /// ```
 #[allow(clippy::too_many_arguments)]
@@ -1096,12 +1094,11 @@ pub fn scroll_area<V: ControlHost>(
     id: &'static str,
     handle: &ScrollHandle,
     axis: ScrollAxis,
-    palette: Palette,
-    view: &V,
+    ctx: WidgetContext<'_, '_, '_, V>,
     window: &Window,
-    cx: &mut Context<V>,
     content: impl IntoElement,
 ) -> Div {
+    let palette = ctx.palette;
     let window_height = f32::from(window.viewport_size().height).max(1.0);
     let bounds = handle.bounds();
     let ground_at =
@@ -1133,15 +1130,8 @@ pub fn scroll_area<V: ControlHost>(
                 .track_scroll(handle)
                 .child(content),
         )
-        .children(scroll_fades(
-            view.control_state(),
-            id,
-            handle,
-            axis,
-            start,
-            end,
-        ))
-        .child(scrollbar(id, handle, axis, palette, view, cx))
+        .children(scroll_fades(ctx.state(), id, handle, axis, start, end))
+        .child(scrollbar(id, handle, axis, ctx))
 }
 
 /// Moves `items[from]` to `to`, and moves `selected` with the item it was

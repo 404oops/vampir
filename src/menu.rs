@@ -23,6 +23,7 @@ use gpui::{
     Window, anchored, canvas, deferred, div, point, prelude::*, px,
 };
 
+use crate::controls::WidgetContext;
 use crate::keyboard::{self, Dismiss, Key, Orientation};
 use crate::lighting;
 use crate::palette::Palette;
@@ -482,11 +483,11 @@ fn render_item<V: ControlHost>(
                             canvas(
                                 |_bounds, _window, _cx| {},
                                 move |bounds, _state, window, _cx| {
-                                    let o = bounds.origin;
+                                    let origin = bounds.origin;
                                     let mut builder = gpui::PathBuilder::stroke(px(1.5));
-                                    builder.move_to(point(o.x + px(1.5), o.y + px(6.0)));
-                                    builder.line_to(point(o.x + px(4.5), o.y + px(9.0)));
-                                    builder.line_to(point(o.x + px(10.5), o.y + px(2.5)));
+                                    builder.move_to(point(origin.x + px(1.5), origin.y + px(6.0)));
+                                    builder.line_to(point(origin.x + px(4.5), origin.y + px(9.0)));
+                                    builder.line_to(point(origin.x + px(10.5), origin.y + px(2.5)));
                                     if let Ok(path) = builder.build() {
                                         window.paint_path(path, tick);
                                     }
@@ -518,10 +519,9 @@ pub fn menu_button<V: ControlHost>(
     id: ComboId,
     label: &str,
     enabled: bool,
-    palette: Palette,
-    view: &V,
-    cx: &mut Context<V>,
+    ctx: WidgetContext<'_, '_, '_, V>,
 ) -> impl IntoElement {
+    let WidgetContext { palette, view, cx } = ctx;
     let dark = palette.is_dark;
     let open = view.control_state().is_menu_open(id);
     let fill = if dark {
@@ -578,11 +578,11 @@ pub fn menu_button<V: ControlHost>(
                 canvas(
                     |_bounds, _window, _cx| {},
                     move |bounds, _state, window, _cx| {
-                        let o = bounds.origin;
+                        let origin = bounds.origin;
                         let mut builder = gpui::PathBuilder::stroke(px(1.4));
-                        builder.move_to(point(o.x + px(0.5), o.y + px(3.0)));
-                        builder.line_to(point(o.x + px(4.5), o.y + px(7.0)));
-                        builder.line_to(point(o.x + px(8.5), o.y + px(3.0)));
+                        builder.move_to(point(origin.x + px(0.5), origin.y + px(3.0)));
+                        builder.line_to(point(origin.x + px(4.5), origin.y + px(7.0)));
+                        builder.line_to(point(origin.x + px(8.5), origin.y + px(3.0)));
                         if let Ok(path) = builder.build() {
                             let color: gpui::Hsla = crate::color::to_hsla(palette.text_secondary);
                             window.paint_path(path, color);

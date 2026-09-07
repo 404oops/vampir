@@ -12,7 +12,7 @@ use gpui::{
 };
 
 use crate::color::oklch_to_color;
-use crate::controls::{SliderTrack, slider, track_probe};
+use crate::controls::{SliderTrack, WidgetContext, slider, track_probe};
 use crate::keyboard::{self, Key, Orientation};
 use crate::lighting;
 use crate::palette::Palette;
@@ -55,17 +55,13 @@ impl Oklch {
 pub fn hue_slider<V: ControlHost>(
     id: ComboId,
     hue: f64,
-    palette: Palette,
-    view: &V,
-    cx: &mut Context<V>,
+    ctx: WidgetContext<'_, '_, '_, V>,
 ) -> impl IntoElement {
     slider(
         id,
         (hue.rem_euclid(360.0) / 360.0) as f32,
         SliderTrack::Continuous,
-        palette,
-        view,
-        cx,
+        ctx,
     )
 }
 
@@ -79,10 +75,9 @@ pub fn color_pad<V: ControlHost>(
     id: ComboId,
     color: Oklch,
     height: f32,
-    palette: Palette,
-    view: &V,
-    cx: &mut Context<V>,
+    ctx: WidgetContext<'_, '_, '_, V>,
 ) -> impl IntoElement {
+    let WidgetContext { palette, view, cx } = ctx;
     const COLUMNS: usize = 40;
     const ROWS: usize = 12;
 

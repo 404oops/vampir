@@ -21,13 +21,13 @@ use vampir::{
     AppIcon, BadgeTone, ButtonVariant, CONTROL_HEIGHT, ChipSelection, Choice, Chord, Column,
     ComboId, Command, ControlHost, ControlState, DialogButton, Hint, InputStyle, MAX_CHROMA,
     MenuItem, Oklch, Palette, Scheme, ScrollAxis, SliderTrack, SortDirection, Span, TEXT_SIZE,
-    TITLE_TEXT_SIZE, Tab, TextInput, Theme, TreeRow, arriving, badge, bind_keys, button, caption,
-    card, checkbox, chip_group, collapsible, color_pad, column, combo, command_palette,
-    context_menu, dialog, edit_menu, fading_text, flatten_tree, glyph, ground, hue_picker,
-    hue_slider, hue_wheel, icon_button, labelled, lit, menu_button, menu_target, progress_bar,
-    radio_group, reorder, row, scheme_picker, scroll_area, search_list, segmented, separator,
-    shortcut_recorder, slider, spinbox, spinner, split_area, split_handle, swatch_grid, switch,
-    tab_bar, table_header, table_row, text_area, text_field, tree_row, ui_font,
+    TITLE_TEXT_SIZE, Tab, TextInput, Theme, TreeRow, WidgetContext, arriving, badge, bind_keys,
+    button, caption, card, checkbox, chip_group, collapsible, color_pad, column, combo,
+    command_palette, context_menu, dialog, edit_menu, fading_text, flatten_tree, glyph, ground,
+    hue_picker, hue_slider, hue_wheel, icon_button, labelled, lit, menu_button, menu_target,
+    progress_bar, radio_group, reorder, row, scheme_picker, scroll_area, search_list, segmented,
+    separator, shortcut_recorder, slider, spinbox, spinner, split_area, split_handle, swatch_grid,
+    switch, tab_bar, table_header, table_row, text_area, text_field, tree_row, ui_font,
 };
 
 // The gallery is also the smallest complete *macOS* host, so it carries the
@@ -590,10 +590,8 @@ impl Render for Gallery {
                     "page",
                     &self.scroll,
                     ScrollAxis::Vertical,
-                    palette,
-                    self,
+                    WidgetContext::new(palette, self, cx),
                     window,
-                    cx,
                     div().p(px(20.0)).child(body),
                 )
                 .flex_1(),
@@ -604,10 +602,8 @@ impl Render for Gallery {
                 "commands",
                 &self.palette_query,
                 &self.commands,
-                palette,
-                self,
+                WidgetContext::new(palette, self, cx),
                 window,
-                cx,
                 |this, id, _window, cx| this.run_command(id, cx),
             ))
             .children(context_menu(
@@ -669,9 +665,7 @@ impl Gallery {
                 "pages",
                 &tabs,
                 self.page,
-                palette,
-                self,
-                cx,
+                WidgetContext::new(palette, self, cx),
                 |this, index, _window, cx| {
                     this.page = index;
                     cx.notify();
@@ -679,17 +673,20 @@ impl Gallery {
                 |_this, _index, _window, _cx| {},
             ))
             .child(div().flex_1())
-            .child(
-                div()
-                    .w(px(150.0))
-                    .child(hue_picker("theme-hue", palette, self, cx)),
-            )
-            .child(
-                div()
-                    .w(px(216.0))
-                    .child(scheme_picker("scheme", palette, self, cx)),
-            )
-            .child(menu_button("view-menu", "View", true, palette, self, cx))
+            .child(div().w(px(150.0)).child(hue_picker(
+                "theme-hue",
+                WidgetContext::new(palette, self, cx),
+            )))
+            .child(div().w(px(216.0)).child(scheme_picker(
+                "scheme",
+                WidgetContext::new(palette, self, cx),
+            )))
+            .child(menu_button(
+                "view-menu",
+                "View",
+                true,
+                WidgetContext::new(palette, self, cx),
+            ))
     }
 
     fn footer(&self, palette: Palette) -> impl IntoElement {
@@ -834,9 +831,7 @@ impl Gallery {
                         self.switched,
                         Some("Sync while you work"),
                         true,
-                        palette,
-                        self,
-                        cx,
+                        WidgetContext::new(palette, self, cx),
                         |this, on, _window, cx| {
                             this.switched = on;
                             cx.notify();
@@ -847,9 +842,7 @@ impl Gallery {
                         self.checks[0],
                         Some("Email me about changes"),
                         true,
-                        palette,
-                        self,
-                        cx,
+                        WidgetContext::new(palette, self, cx),
                         |this, on, _window, cx| {
                             this.checks[0] = on;
                             cx.notify();
@@ -860,9 +853,7 @@ impl Gallery {
                         self.checks[1],
                         Some("Show hidden files"),
                         true,
-                        palette,
-                        self,
-                        cx,
+                        WidgetContext::new(palette, self, cx),
                         |this, on, _window, cx| {
                             this.checks[1] = on;
                             cx.notify();
@@ -873,9 +864,7 @@ impl Gallery {
                         true,
                         Some("Locked"),
                         false,
-                        palette,
-                        self,
-                        cx,
+                        WidgetContext::new(palette, self, cx),
                         |_this, _on, _window, _cx| {},
                     )),
             ))
@@ -890,9 +879,7 @@ impl Gallery {
                             &choices,
                             self.routine,
                             true,
-                            palette,
-                            self,
-                            cx,
+                            WidgetContext::new(palette, self, cx),
                             |this, index, _window, cx| {
                                 this.routine = index;
                                 cx.notify();
@@ -912,9 +899,7 @@ impl Gallery {
                                         &sync,
                                         self.sync,
                                         true,
-                                        palette,
-                                        self,
-                                        cx,
+                                        WidgetContext::new(palette, self, cx),
                                         |this, index, _window, cx| {
                                             this.sync = index;
                                             cx.notify();
@@ -929,9 +914,7 @@ impl Gallery {
                                         self.sort_by,
                                         &sorts,
                                         None,
-                                        palette,
-                                        self,
-                                        cx,
+                                        WidgetContext::new(palette, self, cx),
                                         |this, index, _window, cx| {
                                             this.sort_by = index;
                                             cx.notify();
@@ -967,9 +950,7 @@ impl Gallery {
                     &tags,
                     ChipSelection::Many(&self.tags),
                     true,
-                    palette,
-                    self,
-                    cx,
+                    WidgetContext::new(palette, self, cx),
                     |this, index, _window, cx| {
                         if let Some(flag) = this.tags.get_mut(index) {
                             *flag = !*flag;
@@ -989,9 +970,7 @@ impl Gallery {
                             "volume",
                             self.volume,
                             SliderTrack::Continuous,
-                            palette,
-                            self,
-                            cx,
+                            WidgetContext::new(palette, self, cx),
                         ),
                     ))
                     .child(labelled(
@@ -1001,9 +980,7 @@ impl Gallery {
                             "steps",
                             self.steps,
                             SliderTrack::Stepped { stops: 5 },
-                            palette,
-                            self,
-                            cx,
+                            WidgetContext::new(palette, self, cx),
                         ),
                     ))
                     .child(labelled(
@@ -1043,10 +1020,8 @@ impl Gallery {
                             "search",
                             &self.query,
                             &self.search_items,
-                            palette,
-                            self,
+                            WidgetContext::new(palette, self, cx),
                             window,
-                            cx,
                             |this, id, _window, cx| this.open_result(id, cx),
                         ),
                     )),
@@ -1061,9 +1036,7 @@ impl Gallery {
                         shortcut_recorder(
                             "chord",
                             self.chord.as_ref(),
-                            palette,
-                            self,
-                            cx,
+                            WidgetContext::new(palette, self, cx),
                             |this, chord, _window, cx| {
                                 this.chord = Some(chord);
                                 cx.notify();
@@ -1151,9 +1124,7 @@ impl Gallery {
                 &tree,
                 index,
                 selected,
-                palette,
-                self,
-                cx,
+                WidgetContext::new(palette, self, cx),
                 |this, id, _window, cx| {
                     this.picked = Some(id);
                     cx.notify();
@@ -1218,9 +1189,7 @@ impl Gallery {
                     "files",
                     &self.files,
                     self.file,
-                    palette,
-                    self,
-                    cx,
+                    WidgetContext::new(palette, self, cx),
                     |this, index, _window, cx| {
                         this.file = index;
                         cx.notify();
@@ -1251,16 +1220,19 @@ impl Gallery {
                             .overflow_hidden()
                             .children(tree_rows),
                     )
-                    .child(split_handle("split", self.split, true, palette, self, cx))
+                    .child(split_handle(
+                        "split",
+                        self.split,
+                        true,
+                        WidgetContext::new(palette, self, cx),
+                    ))
                     .child(table),
             ))
             .child(collapsible(
                 "details",
                 "Details",
                 self.details_open,
-                palette,
-                self,
-                cx,
+                WidgetContext::new(palette, self, cx),
                 div()
                     .flex()
                     .flex_col()
@@ -1303,12 +1275,21 @@ impl Gallery {
                                 .child(labelled(
                                     palette,
                                     "Hue",
-                                    hue_slider("swatch-hue", self.colour.hue, palette, self, cx),
+                                    hue_slider(
+                                        "swatch-hue",
+                                        self.colour.hue,
+                                        WidgetContext::new(palette, self, cx),
+                                    ),
                                 ))
                                 .child(labelled(
                                     palette,
                                     "Chroma and lightness",
-                                    color_pad("colour-pad", self.colour, 140.0, palette, self, cx),
+                                    color_pad(
+                                        "colour-pad",
+                                        self.colour,
+                                        140.0,
+                                        WidgetContext::new(palette, self, cx),
+                                    ),
                                 )),
                         )),
                     )
@@ -1413,9 +1394,7 @@ impl Gallery {
             "confirm",
             "Delete this file?",
             420.0,
-            palette,
-            self,
-            cx,
+            WidgetContext::new(palette, self, cx),
             div()
                 .text_color(palette.text_secondary)
                 .child("It goes to the Trash, and you can put it back later."),
