@@ -157,13 +157,13 @@ pub fn color_pad<V: ControlHost>(
     // slider — and sits under the pointer while the pointer has it.
     let (marker_x, marker_y) = if state.is_dragging(id) {
         (
-            state.snap(format!("{id}-marker-x"), marker_x_key),
-            state.snap(format!("{id}-marker-y"), marker_y_key),
+            state.snap((id, "marker-x"), marker_x_key),
+            state.snap((id, "marker-y"), marker_y_key),
         )
     } else {
         (
-            state.tween(format!("{id}-marker-x"), marker_x_key, MOVE),
-            state.tween(format!("{id}-marker-y"), marker_y_key, MOVE),
+            state.tween((id, "marker-x"), marker_x_key, MOVE),
+            state.tween((id, "marker-y"), marker_y_key, MOVE),
         )
     };
 

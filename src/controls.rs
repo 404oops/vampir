@@ -7,25 +7,21 @@
 //! nothing here holds state between frames beyond what [`ControlState`]
 //! already holds.
 
-use std::rc::Rc;
-use std::time::Instant;
-
 use gpui::{
     Anchor, Context, Div, ElementId, Entity, FocusHandle, FontWeight, KeyDownEvent, MouseButton,
     MouseDownEvent, PathBuilder, ScrollHandle, SharedString, Window, anchored, canvas, deferred,
     div, point, prelude::*, px,
 };
+use std::rc::Rc;
 
-use crate::easing::{ease_in_cubic, ease_out_cubic, lerp_f32, progress};
+use crate::easing::{ease_out_cubic, lerp_f32};
 use crate::keyboard::{self, Dismiss, Key, Orientation};
 use crate::lighting;
 use crate::menu::VIEWPORT_MARGIN;
 use crate::overlay::Hint;
 use crate::palette::Palette;
 use crate::scroll::{SCROLLBAR_THICKNESS, ScrollAxis, ScrollDrag, THUMB_THICKNESS};
-use crate::state::{
-    COMBO_REVEAL, ComboId, ControlHost, ControlState, MOVE, SWITCH_SLIDE, TrackAxis,
-};
+use crate::state::{ComboId, ControlHost, ControlState, MOVE, SWITCH_SLIDE, Tag, TrackAxis};
 use crate::text_input::TextInput;
 
 /// Shared metrics: every field, pop-up and button is this tall and this
@@ -56,11 +52,7 @@ pub fn fading_text(id: &'static str, text: impl Into<SharedString>, state: &Cont
     let text = text.into();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut hasher);
-    let arrived = ease_out_cubic(state.transition(
-        &ElementId::Name(id.into()),
-        hasher.finish(),
-        SWITCH_SLIDE,
-    ));
+    let arrived = ease_out_cubic(state.transition(id, hasher.finish(), SWITCH_SLIDE));
     div().opacity(arrived).child(text)
 }
 
@@ -702,23 +694,12 @@ pub fn combo<V: ControlHost>(
     let is_open = state.is_combo_open(id);
     let list_scroll = state.scroll(id);
     // The list keeps rendering while it fades back out after a close.
-    let closing_since = state.combo_closing.and_then(|(closing, since)| {
-        (closing == id && since.elapsed() < state.scaled(COMBO_REVEAL)).then_some(since)
-    });
-    let showing = is_open || closing_since.is_some();
     // Reveal progress: opacity, plus the short drift down into place a menu
     // makes, so the two things that drop out of a click arrive the same
-    // way. Opening eases out and closing eases in.
-    let reveal = if is_open {
-        state
-            .combo_opened_at
-            .map(|since| ease_out_cubic(progress(since, state.scaled(COMBO_REVEAL))))
-            .unwrap_or(1.0)
-    } else if let Some(since) = closing_since {
-        1.0 - ease_in_cubic(progress(since, state.scaled(COMBO_REVEAL)))
-    } else {
-        1.0
-    };
+    // way.
+    let fade = state.combo_fade(id);
+    let showing = fade.is_some();
+    let reveal = fade.map_or(1.0, |(reveal, _)| reveal);
     let drift = -4.0 * (1.0 - reveal);
 
     let display: SharedString = options
@@ -731,10 +712,10 @@ pub fn combo<V: ControlHost>(
     // The list lies over the row that was current when it opened — that
     // rather than `current_index`, which a pick changes under a list still
     // fading out.
-    let placement = combo_placement(state.combo_opened_on.unwrap_or(current_index), count);
+    let placement = combo_placement(state.combo_opened_on(id).unwrap_or(current_index), count);
     // Where the button was last frame, in window coordinates: what the list
     // is laid over, whatever the button is nested inside.
-    let button = state.track_bounds.get(id).copied();
+    let button = state.track(id);
     let weak = cx.entity().downgrade();
     let keyboard_at = if is_open {
         state.combo_highlight_or(current_index)
@@ -763,7 +744,7 @@ pub fn combo<V: ControlHost>(
                 move |bounds, _window, cx| {
                     if let Some(host) = weak.upgrade() {
                         host.update(cx, |host, _cx| {
-                            host.control_state_mut().track_bounds.insert(id, bounds);
+                            host.control_state_mut().record_track(id, bounds);
                         });
                     }
                 },
@@ -867,12 +848,7 @@ pub fn combo<V: ControlHost>(
                     // the list. Don't reopen it. The marker expires by
                     // itself, because the release that would clear it may
                     // land on an occluding surface and never arrive.
-                    let dismissed_recently = state
-                        .combo_dismissed_at
-                        .is_some_and(|since| since.elapsed() < COMBO_REVEAL);
-                    let dismissed = state.combo_dismissed.take();
-                    state.combo_dismissed_at = None;
-                    if dismissed_recently && dismissed == Some(id) {
+                    if state.take_combo_dismissal() == Some(id) {
                         cx.notify();
                         return;
                     }
@@ -915,9 +891,7 @@ pub fn combo<V: ControlHost>(
                                     el.occlude().on_mouse_down_out(cx.listener(
                                         move |this, _event, _window, cx| {
                                             let state = this.control_state_mut();
-                                            state.close_combo();
-                                            state.combo_dismissed = Some(id);
-                                            state.combo_dismissed_at = Some(Instant::now());
+                                            state.combo_pressed_outside(id);
                                             cx.notify();
                                         },
                                     ))
@@ -1087,9 +1061,9 @@ pub fn slider<V: ControlHost>(
     // motion, and a thumb trailing the pointer reads as lag.
     let state = view.control_state();
     let shown = if state.is_dragging(id) {
-        state.snap(format!("{id}-ratio"), ratio)
+        state.snap((id, "ratio"), ratio)
     } else {
-        state.tween(format!("{id}-ratio"), ratio, MOVE)
+        state.tween((id, "ratio"), ratio, MOVE)
     };
 
     // The keyboard lives on the thumb, not on the box around it. The thumb
@@ -1191,7 +1165,7 @@ pub(crate) fn track_probe<V: ControlHost>(
         move |bounds, _window, cx| {
             if let Some(host) = weak.upgrade() {
                 host.update(cx, |host, _cx| {
-                    host.control_state_mut().track_bounds.insert(id, bounds);
+                    host.control_state_mut().record_track(id, bounds);
                 });
             }
         },
@@ -1248,11 +1222,9 @@ pub fn checkbox<V: ControlHost>(
     // Noticed from the value, so a box ticked by a shortcut or by the host's
     // own code crosses over exactly as a click does. The well fills and
     // rises while the tick draws itself in; unticking runs it backwards.
-    let on = view.control_state().blend(
-        &ElementId::Name(format!("{box_id}-state").into()),
-        checked,
-        SWITCH_SLIDE,
-    );
+    let on = view
+        .control_state()
+        .blend((&box_id, "state"), checked, SWITCH_SLIDE);
     let fill = lighting::lit_mix(palette.field_surface, palette.control_fill, 0.1, on);
     let border = crate::color::lerp(
         palette.field_border_strong,
@@ -1397,21 +1369,16 @@ pub fn segmented<V: ControlHost>(
     // frame there is nothing to slide and the selected option draws its own
     // fill instead — which looks the same, and is what the pill takes over.
     let pill = state
-        .group_bounds
-        .get(id)
-        .zip(state.slot_bounds.get(id))
-        .and_then(|(group, slots)| {
-            let slot = slots.get(selected)?;
+        .group(id)
+        .zip(state.slot(id, selected))
+        .map(|(group, slot)| {
             // Both probes report padding boxes, and an absolute child is
             // positioned against its parent's, so the difference is the
             // pill's `left` exactly.
             let x = f32::from(slot.origin.x) - f32::from(group.origin.x);
-            Some((x, f32::from(slot.size.width)))
-        })
-        .map(|(x, width)| {
             (
-                state.tween(format!("{id}-pill-x"), x, MOVE),
-                state.tween(format!("{id}-pill-w"), width, MOVE),
+                state.tween((id, "pill-x"), x, MOVE),
+                state.tween((id, "pill-w"), f32::from(slot.size.width), MOVE),
             )
         });
 
@@ -1427,11 +1394,7 @@ pub fn segmented<V: ControlHost>(
         let active = index == selected;
         let click_focus = focus.clone();
         // The label crosses over at the same time as the pill arrives.
-        let on = state.blend(
-            &ElementId::NamedInteger(format!("{id}-segment-on").into(), index as u64),
-            active,
-            SWITCH_SLIDE,
-        );
+        let on = state.blend((id, "segment-on", index), active, SWITCH_SLIDE);
         // The selected segment is the one with a fill, so it is the one the
         // ring can sit on — and it is the option the arrows are pointing at.
         let segment_arrows = if active { arrows.take() } else { None };
@@ -1530,11 +1493,7 @@ fn slot_probe<V: ControlHost>(
         move |bounds, _window, cx| {
             if let Some(host) = weak.upgrade() {
                 host.update(cx, |host, _cx| {
-                    let slots = host.control_state_mut().slot_bounds.entry(id).or_default();
-                    if slots.len() <= slot {
-                        slots.resize(slot + 1, bounds);
-                    }
-                    slots[slot] = bounds;
+                    host.control_state_mut().record_slot(id, slot, bounds);
                 });
             }
         },
@@ -1547,19 +1506,17 @@ fn slot_probe<V: ControlHost>(
     .bottom_0()
 }
 
-/// Records an element's bounds into `ControlState::measured` under `key`, for
-/// anything that has to know a size before it can be laid out to it.
+/// Remembers an element's bounds in [`ControlState::measured`] under `tag`,
+/// for anything that has to know a size before it can be laid out to it.
 pub(crate) fn measure_probe<V: ControlHost>(
-    key: ElementId,
+    tag: Tag,
     weak: gpui::WeakEntity<V>,
 ) -> impl IntoElement {
     canvas(
         move |bounds, _window, cx| {
             if let Some(host) = weak.upgrade() {
                 host.update(cx, |host, _cx| {
-                    host.control_state_mut()
-                        .measured
-                        .insert(key.clone(), bounds);
+                    host.control_state_mut().measure(tag, bounds);
                 });
             }
         },
@@ -1579,7 +1536,7 @@ fn group_probe<V: ControlHost>(id: ComboId, weak: gpui::WeakEntity<V>) -> impl I
         move |bounds, _window, cx| {
             if let Some(host) = weak.upgrade() {
                 host.update(cx, |host, _cx| {
-                    host.control_state_mut().group_bounds.insert(id, bounds);
+                    host.control_state_mut().record_group(id, bounds);
                 });
             }
         },
@@ -1738,9 +1695,9 @@ pub fn scrollbar<V: ControlHost>(
     };
     // A bar that appears because the content just grew fades in rather than
     // switching on beside it.
-    let shown =
-        view.control_state()
-            .tween_from(format!("scrollbar-{id}-shown"), 0.0, 1.0, SWITCH_SLIDE);
+    let shown = view
+        .control_state()
+        .tween_from(("scrollbar", id, "shown"), 0.0, 1.0, SWITCH_SLIDE);
     let mut thumb_color: gpui::Hsla = crate::color::to_hsla(palette.text_secondary);
     thumb_color.alpha = 0.24;
 
@@ -1775,7 +1732,7 @@ pub fn scrollbar<V: ControlHost>(
                     grab,
                 };
                 apply_scroll_drag(&drag, position);
-                this.control_state_mut().scroll_drag = Some(drag);
+                this.control_state_mut().begin_scroll_drag(drag);
                 cx.notify();
             }),
         )
@@ -1892,11 +1849,9 @@ pub fn chip<V: ControlHost>(
     // Selected takes the accent; the rest stay quiet, so one chip reads out
     // of a field of them at a glance. The accent washes in rather than
     // switching on, whoever toggled the chip.
-    let on = view.control_state().blend(
-        &ElementId::Name(format!("{chip_id}-state").into()),
-        selected,
-        SWITCH_SLIDE,
-    );
+    let on = view
+        .control_state()
+        .blend((&chip_id, "state"), selected, SWITCH_SLIDE);
     let mix = |a, b| crate::color::lerp(a, b, on);
     let fill = mix(palette.soft_fill, palette.control_fill);
     let fill_hover = mix(palette.soft_fill_hover, palette.control_fill);
@@ -2097,11 +2052,9 @@ pub fn radio_group<V: ControlHost>(
         let click_focus = focus.clone();
         // The core grows into the chosen dot and shrinks out of the one it
         // left, so the choice is seen to move rather than to reappear.
-        let on = view.control_state().blend(
-            &ElementId::NamedInteger(format!("{id}-choice-on").into(), index as u64),
-            active,
-            SWITCH_SLIDE,
-        );
+        let on = view
+            .control_state()
+            .blend((id, "choice-on", index), active, SWITCH_SLIDE);
         // Only the current choice carries the handle and the arrow keys.
         let dot_arrows = if active { arrows.take() } else { None };
         rows.push(

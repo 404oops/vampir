@@ -5,6 +5,7 @@
 //! the model to the host. That is what lets either sit above a
 //! `uniform_list` and stay cheap with thousands of rows.
 
+use std::hash::Hash;
 use std::rc::Rc;
 
 use gpui::{
@@ -15,7 +16,7 @@ use gpui::{
 use crate::keyboard::{self, Key};
 use crate::lighting;
 use crate::palette::Palette;
-use crate::state::{ControlHost, ControlState, MOVE, SWITCH_SLIDE};
+use crate::state::{ControlHost, ControlState, MOVE, SWITCH_SLIDE, Tag};
 
 // ---- Tree -------------------------------------------------------------------
 
@@ -201,12 +202,12 @@ pub fn tree_row<V: ControlHost>(
     // Everything a row does to itself is keyed by the row's own id rather
     // than its index: opening a branch above it shifts every index below,
     // and a selection that jumped rows because of that would be a lie.
-    let key = |what: &str| ElementId::Name(format!("{id}-{what}-{}", row.id).into());
+    let key = |what: &'static str| Tag::new((id, what, &row.id));
     // The selection washes from row to row, the chevron turns rather than
     // flips, and rows a branch reveals fade in beneath it — unless the whole
     // tree has just appeared, in which case it arrives as one thing.
-    let on = state.blend(&key("selected"), selected, SWITCH_SLIDE);
-    let turned = expanded.map(|open| state.blend(&key("open"), open, SWITCH_SLIDE));
+    let on = state.blend(key("selected"), selected, SWITCH_SLIDE);
+    let turned = expanded.map(|open| state.blend(key("open"), open, SWITCH_SLIDE));
     let shown = if state.present(id) {
         state.tween_from(key("shown"), 0.0, 1.0, SWITCH_SLIDE)
     } else {
@@ -537,7 +538,7 @@ pub fn table_cell(column: &Column, content: impl IntoElement) -> impl IntoElemen
 /// in it — lay it out with [`table_cell`] instead.
 pub fn table_row(
     table: &'static str,
-    key: impl Into<SharedString>,
+    key: impl Hash,
     slot: usize,
     columns: &[Column],
     values: impl IntoIterator<Item = impl Into<SharedString>>,
@@ -545,11 +546,7 @@ pub fn table_row(
     state: &ControlState,
 ) -> gpui::Div {
     let place = slot as f32 * TABLE_ROW_HEIGHT;
-    let offset = state.tween(
-        ElementId::Name(format!("{table}-row-{}", key.into()).into()),
-        place,
-        MOVE,
-    ) - place;
+    let offset = state.tween((table, "row", key), place, MOVE) - place;
     div()
         .relative()
         .top(px(offset))

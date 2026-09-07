@@ -2,15 +2,21 @@
 //!
 //! Most of a control is a pure function of the data it is handed. What is
 //! left over is small and always the same shape: which pop-up is open and
-//! how far into its fade it is, when each animated control last changed, and
-//! whatever is being dragged. A host keeps one [`ControlState`], implements
-//! [`ControlHost`] for its view, and every control is generic over that
-//! host, so nothing here knows the host's type.
-
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
+//! how far into its fade it is, what each animated control showed last
+//! frame, where things painted, and whatever is being dragged. A host keeps
+//! one [`ControlState`], implements [`ControlHost`] for its view, and every
+//! control is generic over that host, so nothing here knows the host's type.
+//!
+//! Everything a control remembers about itself from one frame to the next
+//! is one record in one table, filed under a [`Tag`] — a hash, so building
+//! one allocates nothing — and retired as soon as the control stops
+//! rendering. The table is bounded by what is on screen, not by what has
+//! ever been.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, DefaultHasher, Hash, Hasher};
+use std::time::{Duration, Instant};
 
 use gpui::{
     App, Bounds, Context, ElementId, Entity, FocusHandle, InteractiveElement, MouseButton,
@@ -39,35 +45,210 @@ pub const MOVE: Duration = Duration::from_millis(180);
 /// fast cut of that reads as a flash.
 pub const SCHEME_FADE: Duration = Duration::from_millis(240);
 
-/// A value on its way from where it was to where it has been asked to be.
-#[derive(Clone, Copy, Debug)]
-struct Tween {
-    from: f32,
-    to: f32,
-    since: Instant,
-    duration: Duration,
-    /// The frame it was last asked about; see [`ControlState::animating`].
-    touched: u64,
-}
-
-impl Tween {
-    fn value(&self) -> f32 {
-        if !self.running() {
-            return self.to;
-        }
-        let t = crate::easing::ease_out_cubic(crate::easing::progress(self.since, self.duration));
-        self.from + (self.to - self.from) * t
-    }
-
-    fn running(&self) -> bool {
-        self.since.elapsed() < self.duration
-    }
-}
-
 /// Identifies one pop-up, menu, track or tab bar. An element id doubles as
 /// its identity, so a host needs no enum of its own. Two of the same kind of
 /// widget in one view must not share one.
 pub type ComboId = &'static str;
+
+// ---- Tags -------------------------------------------------------------------
+
+/// What a control's record is filed under: its id, the name of the moving
+/// part, and — for a row, a tab, a command — which one.
+///
+/// A tag is the hash of whatever it was built from, so a control can name
+/// its parts every frame without allocating: `(id, "pill-x")` is a tuple on
+/// the stack, where a formatted string would be two heap allocations per
+/// part per frame, freed a moment later because the record already existed.
+/// Anything that hashes will do — a `&str`, a `SharedString`, an
+/// `ElementId`, a tuple of them — and text hashes as text whichever type
+/// it comes in, so `"row"` and `SharedString::from("row")` are one tag.
+///
+/// Two different names hashing to one tag would make two parts share a
+/// record; with sixty-four bits and a screen's worth of parts that is not
+/// going to happen, and the worst it could do is a wrong slide.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Tag(u64);
+
+impl Tag {
+    /// The tag of anything that hashes. Note that a `Tag` hashes too, so
+    /// `Tag::new(tag)` is a different tag — use [`Tag::with`] to extend one.
+    pub fn new(of: impl Hash) -> Self {
+        let mut hasher = DefaultHasher::new();
+        of.hash(&mut hasher);
+        Tag(hasher.finish())
+    }
+
+    /// A tag under this one: `Tag::new(id).with("shown")` names the same
+    /// part as `Tag::new((id, "shown"))` does not — pick one form and keep
+    /// to it.
+    pub fn with(self, and: impl Hash) -> Self {
+        Tag::new((self.0, and))
+    }
+}
+
+impl From<&str> for Tag {
+    fn from(text: &str) -> Self {
+        Tag::new(text)
+    }
+}
+
+impl From<String> for Tag {
+    fn from(text: String) -> Self {
+        Tag::new(text.as_str())
+    }
+}
+
+impl From<SharedString> for Tag {
+    fn from(text: SharedString) -> Self {
+        Tag::new(text.as_ref())
+    }
+}
+
+impl From<&SharedString> for Tag {
+    fn from(text: &SharedString) -> Self {
+        Tag::new(text.as_ref())
+    }
+}
+
+impl From<ElementId> for Tag {
+    fn from(id: ElementId) -> Self {
+        Tag::new(id)
+    }
+}
+
+impl From<&ElementId> for Tag {
+    fn from(id: &ElementId) -> Self {
+        Tag::new(id)
+    }
+}
+
+impl<A: Hash, B: Hash> From<(A, B)> for Tag {
+    fn from(parts: (A, B)) -> Self {
+        Tag::new(parts)
+    }
+}
+
+impl<A: Hash, B: Hash, C: Hash> From<(A, B, C)> for Tag {
+    fn from(parts: (A, B, C)) -> Self {
+        Tag::new(parts)
+    }
+}
+
+/// Tags are hashes already, so the tables keyed by them pass the bits
+/// straight through instead of hashing them a second time.
+#[derive(Default)]
+struct TagHasher(u64);
+
+impl Hasher for TagHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write_u64(&mut self, tag: u64) {
+        self.0 = tag;
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // Never reached for a `Tag`, whose `Hash` is one `write_u64`; kept
+        // sound for anything else by folding the bytes in.
+        for byte in bytes {
+            self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+}
+
+type TagMap<T> = HashMap<Tag, T, BuildHasherDefault<TagHasher>>;
+
+// ---- Records ----------------------------------------------------------------
+
+/// The kinds of record one tag can hold, one of each at once: a list is
+/// `present` as a whole and has a keyboard row, a track has bounds and a
+/// tween. The kind is folded into the tag, so the kinds never collide and
+/// still share one table.
+#[derive(Clone, Copy)]
+enum Kind {
+    Flip,
+    Tween,
+    Streak,
+    List,
+    Bounds,
+}
+
+impl Kind {
+    fn slot(self, tag: Tag) -> Tag {
+        // XOR with a constant is a bijection, so a well-mixed tag stays
+        // well-mixed for the table's sake.
+        const SALT: [u64; 5] = [
+            0x9E37_79B9_7F4A_7C15,
+            0xD1B5_4A32_D192_ED03,
+            0x8CB9_2BA7_2F3D_8DD7,
+            0x5851_F42D_4C95_7F2D,
+            0x2545_F491_4F6C_DD1D,
+        ];
+        Tag(tag.0 ^ SALT[self as usize])
+    }
+}
+
+/// What one part of one control remembers between frames. Times are
+/// microseconds on the state's own clock — see [`ControlState::now`] — and
+/// durations microseconds too, which is three words where two `Instant`s
+/// and a `Duration` were six.
+#[derive(Clone, Copy, Debug)]
+enum Record {
+    /// A two-state element: the value it showed, and the change under way
+    /// since `since` if it has one.
+    Flip {
+        value: u64,
+        since: u64,
+        duration: u32,
+    },
+    /// A continuous value on its way from `from` to `to`.
+    Tween {
+        from: f32,
+        to: f32,
+        since: u64,
+        duration: u32,
+    },
+    /// A group of rows: the frame its current run of frames began in.
+    Streak { started: u32 },
+    /// The keyboard's row in a filtering list, and a hash of the query the
+    /// row belongs to.
+    List { highlight: usize, query: u64 },
+    /// Where something painted last frame.
+    Bounds(Bounds<Pixels>),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Entry {
+    /// The frame it was last asked about; see [`ControlState::animating`].
+    touched: u32,
+    record: Record,
+}
+
+/// Progress 0..=1 of something that started at `since` and runs for
+/// `duration`, both in microseconds. A zero-length change is finished, not
+/// undefined: zero over zero would be a NaN, and a NaN offset makes an
+/// element vanish for as long as the value is kept.
+fn progress_of(now: u64, since: u64, duration: u32) -> f32 {
+    if duration == 0 {
+        return 1.0;
+    }
+    (now.saturating_sub(since) as f32 / duration as f32).clamp(0.0, 1.0)
+}
+
+fn tween_value(now: u64, from: f32, to: f32, since: u64, duration: u32) -> f32 {
+    let t = progress_of(now, since, duration);
+    if t >= 1.0 {
+        return to;
+    }
+    from + (to - from) * crate::easing::ease_out_cubic(t)
+}
+
+fn micros(duration: Duration) -> u32 {
+    u32::try_from(duration.as_micros()).unwrap_or(u32::MAX)
+}
+
+// ---- Overlays and gestures --------------------------------------------------
 
 /// Which way a drag reads its position out of a track.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -81,7 +262,7 @@ pub enum TrackAxis {
 /// A drag along some widget's track: a slider handle, a split divider, a
 /// colour pad. All of them are the same gesture over different geometry, so
 /// they share one mechanism.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct TrackDrag {
     pub id: ComboId,
     pub axis: TrackAxis,
@@ -90,7 +271,7 @@ pub struct TrackDrag {
 }
 
 /// A tab being dragged along its bar.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct TabDrag {
     pub bar: ComboId,
     /// Where the tab started.
@@ -105,6 +286,35 @@ pub struct TabDrag {
     pub grab: f32,
     /// Where the pointer is now, in window x.
     pub pointer: f32,
+}
+
+/// The one gesture the controls can have in flight. One pointer, one
+/// gesture: a thumb, a track and a tab cannot be held at once, so they
+/// share one slot rather than three that have to be kept exclusive by hand.
+enum Drag {
+    Scroll(ScrollDrag),
+    Track(TrackDrag),
+    Tab(TabDrag),
+}
+
+/// A pop-up list that is open, or on its way out.
+#[derive(Clone, Copy, Debug)]
+pub struct OpenCombo {
+    pub id: ComboId,
+    pub opened_at: Instant,
+    /// The option that was current when the list opened, which is the row
+    /// the list lays over the button. Kept through the fade out: by then a
+    /// pick has changed the value, and the list must not jump to the new
+    /// row on its way out.
+    pub opened_on: usize,
+    /// Which option the keyboard is on. Not the selection: a list you are
+    /// arrowing through has not chosen anything yet, and closing it with
+    /// Escape has to leave the old value alone. It commits on Enter and is
+    /// dropped when the list closes.
+    pub highlight: Option<usize>,
+    /// When it was told to close, if it has been. It keeps rendering,
+    /// without taking clicks, until the fade finishes.
+    pub closing: Option<Instant>,
 }
 
 /// A context menu that is open: which menu, where it was summoned, and what
@@ -127,7 +337,7 @@ pub struct OpenMenu {
 }
 
 /// A modal dialog that is open, or on its way out.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct OpenDialog {
     pub id: ComboId,
     pub opened_at: Instant,
@@ -148,38 +358,47 @@ pub struct OpenPalette {
     pub return_focus: Option<FocusHandle>,
 }
 
-/// Where the keyboard is in a list that filters as its query is typed.
-#[derive(Clone, Copy, Debug)]
-struct ListKeyboard {
-    highlight: usize,
-    /// A hash of the query the highlight belongs to. A new query is a new
-    /// list, and the keyboard goes back to its best match.
-    query: u64,
-}
-
-/// The id the root's focus handle lives under in the registry.
+/// The tag the root's focus handle lives under.
 const ROOT_FOCUS: &str = "vampir-root";
 
 /// Per-view control state. `Default` is the empty state, which is also the
 /// right starting point: nothing open, nothing animating, nothing dragged.
-#[derive(Default)]
 pub struct ControlState {
     /// The hue and scheme the palette is derived from, for a host with no
     /// theme of its own. See [`crate::theme`].
     pub theme: Theme,
-    /// The pop-up whose list is open, if any.
-    pub open_combo: Option<ComboId>,
-    /// When that list started revealing.
-    pub combo_opened_at: Option<Instant>,
-    /// A list fading back out, and when that began. It keeps rendering,
-    /// without taking clicks, until the fade finishes.
-    pub combo_closing: Option<(ComboId, Instant)>,
-    /// The option that was current when the open list opened, which is the
-    /// row the list lays over the button. Kept through the fade out: by then
-    /// a pick has changed the value, and the list must not jump to the new
-    /// row on its way out.
-    pub combo_opened_on: Option<usize>,
-    /// One focus handle per composite control, keyed by its id.
+
+    /// When the state was made. Every time in a record is measured from
+    /// here, in microseconds, so a record carries a word rather than an
+    /// `Instant`.
+    epoch: Instant,
+    /// Frames counted by [`ControlState::animating`], which is called once
+    /// per render. Wraps, and is only ever compared by difference.
+    frame: Cell<u32>,
+    /// Every duration is multiplied by this; see
+    /// [`ControlState::set_time_scale`]. `None` is one.
+    time_scale: Option<f32>,
+
+    /// Everything the controls remember about themselves from frame to
+    /// frame: what each two-state element showed, where each continuous
+    /// value is on its way to its target, which groups of rows were up last
+    /// frame, the keyboard's row in each filtering list, and where each
+    /// track, group and slot painted. One table, and every record in it is
+    /// retired by [`ControlState::animating`] a frame or two after the thing
+    /// it belongs to stops rendering, so the table is the size of the
+    /// screen rather than of the session.
+    ///
+    /// Behind a `RefCell` because the records are read and written during
+    /// render, from `&ControlState`: a control notices its own change while
+    /// it renders. See [`ControlState::transition`].
+    records: RefCell<TagMap<Entry>>,
+    /// Sizes to remember after the thing measured has gone: a disclosure's
+    /// body, so it can be shown growing to the height it will have rather
+    /// than appearing at it. Written from paint, kept until overwritten,
+    /// and bounded by the widgets that ask.
+    measured: TagMap<Bounds<Pixels>>,
+
+    /// One focus handle per composite control.
     ///
     /// A group — radio buttons, a segmented control, a tab bar, a tree — is
     /// one stop in the tab order, and the ring belongs on whichever option
@@ -187,14 +406,30 @@ pub struct ControlState {
     /// the handle has to move from option to option as the selection moves,
     /// which it can only do if it outlives all of them: a handle owned by an
     /// option dies the moment that option stops being the current one, and
-    /// takes the keyboard with it after a single arrow press.
+    /// takes the keyboard with it after a single arrow press. Never retired,
+    /// for the same reason: a handle the keyboard is on, or is coming back
+    /// to, has to stay the same handle.
     ///
     /// A `RefCell` because this is a cache, not state. A control asks for
     /// its handle while it renders, holding only `&ControlState`, and the
     /// answer is the same handle every frame.
-    focus_handles: RefCell<HashMap<ElementId, FocusHandle>>,
-    /// The handle the open context menu holds focus with, and where focus
-    /// was before it opened.
+    focus_handles: RefCell<TagMap<FocusHandle>>,
+    /// One scroll handle per pop-up list, so a list can read its own offset
+    /// and fade its edges. Same reasoning as `focus_handles`.
+    scroll_handles: RefCell<TagMap<ScrollHandle>>,
+
+    /// The pop-up list that is open, or still fading out.
+    combo: Option<OpenCombo>,
+    /// A pop-up just closed by a press outside it, and when. The same
+    /// press's click must not reopen it when it landed on that pop-up's own
+    /// button. The release that should clear it can land on an occluding
+    /// surface and never reach the host, so the marker expires on its own
+    /// too.
+    combo_dismissed: Option<(ComboId, Instant)>,
+
+    /// The open context menu, if any.
+    pub menu: Option<OpenMenu>,
+    /// The handle the open context menu holds focus with.
     ///
     /// A menu has to hold focus to hear the arrows, and the handle has to be
     /// the same one every frame — a fresh handle per render would lose focus
@@ -204,140 +439,162 @@ pub struct ControlState {
     /// Where the keyboard was before the menu took it, so closing puts it
     /// back rather than dropping the reader at the top of the window.
     pub menu_return_focus: Option<FocusHandle>,
-    /// The same, for a modal dialog.
+
+    /// The open dialog, if any, or one still fading out.
+    pub dialog: Option<OpenDialog>,
+    /// The same as `menu_return_focus`, for a modal dialog.
     pub dialog_return_focus: Option<FocusHandle>,
+    /// The dialog whose buttons Tab stays among while it is up, and how many
+    /// it has; the handles themselves are in `focus_handles` under
+    /// [`ControlState::dialog_button_focus`]. Set every frame the dialog
+    /// renders and cleared when it does not. See
+    /// [`crate::keyboard::move_focus`].
+    dialog_trap: Cell<Option<(ComboId, usize)>>,
+
+    /// The open command palette, if any.
+    pub palette_overlay: Option<OpenPalette>,
+    /// The shortcut recorder waiting for a key chord, if any.
+    pub recording: Option<ComboId>,
     /// True while the mouse is in charge and the focus ring is hidden. Any
     /// mouse press sets it and Tab clears it, and the first Tab after the
     /// mouse only shows where the keyboard is: see `keyboard::move_focus`.
     pub ring_hidden: bool,
-    /// The focus handles of the open dialog's buttons, refreshed every frame
-    /// it renders and cleared when it does not. What Tab stays inside of
-    /// while a dialog is up; see [`crate::keyboard::move_focus`].
-    dialog_trap: RefCell<Option<Vec<FocusHandle>>>,
-    /// Which option the keyboard is on while a pop-up list is open.
-    ///
-    /// Not the selection: a list you are arrowing through has not chosen
-    /// anything yet, and closing it with Escape has to leave the old value
-    /// alone. It commits on Enter and is dropped when the list closes.
-    pub combo_highlight: Option<usize>,
-    /// A pop-up just closed by a press outside it. The same press's click
-    /// must not reopen it when it landed on that pop-up's own button.
-    pub combo_dismissed: Option<ComboId>,
-    /// When `combo_dismissed` was set. The release that should clear it can
-    /// land on an occluding surface and never reach the host, so the marker
-    /// expires on its own too.
-    pub combo_dismissed_at: Option<Instant>,
 
-    /// When each two-state element last changed, and how long its change
-    /// takes. Absent means "never changed", which is what keeps a first
-    /// paint or a remount from animating. Behind a `RefCell` because the
-    /// change is noticed during render, from `&ControlState`: see
-    /// [`ControlState::transition`].
-    pub anim: RefCell<HashMap<ElementId, (Instant, Duration)>>,
-    /// The value each two-state element showed last frame, so a change can
-    /// be noticed whoever made it, and the frame it was last rendered in.
-    seen: RefCell<HashMap<ElementId, (u64, u64)>>,
-    /// Continuous values in flight: a pill's x, a row's y, a scheme's
-    /// darkness. See [`ControlState::tween`].
-    tweens: RefCell<HashMap<ElementId, Tween>>,
-    /// Which frame each group of rows first appeared in, for the lists that
-    /// fade new rows in: see [`ControlState::present`].
-    streaks: RefCell<HashMap<ElementId, (u64, u64)>>,
-    /// Frames counted by [`ControlState::animating`], which is called once
-    /// per render. Everything above that stops being rendered is retired a
-    /// frame or two later, so a row that leaves and comes back is new again.
-    frame: Cell<u64>,
-    /// Every duration is multiplied by this; see
-    /// [`ControlState::set_time_scale`]. `None` is one.
-    time_scale: Option<f32>,
-    /// One scroll handle per pop-up list, so a list can read its own offset
-    /// and fade its edges. Same reasoning as `focus_handles`.
-    scroll_handles: RefCell<HashMap<ElementId, ScrollHandle>>,
+    /// The gesture in flight, if any.
+    drag: Option<Drag>,
+}
 
-    /// Scrollbar thumb drag in flight.
-    pub scroll_drag: Option<ScrollDrag>,
-
-    /// Slider, split or colour-pad drag in flight.
-    pub track_drag: Option<TrackDrag>,
-    /// Each track's bounds, recorded as it paints. A drag needs them long
-    /// after the pointer has left the track.
-    pub track_bounds: HashMap<ComboId, Bounds<Pixels>>,
-
-    /// Tab reorder in flight.
-    pub tab_drag: Option<TabDrag>,
-    /// Each tab bar's per-tab bounds, in bar order, recorded as they paint.
-    pub tab_bounds: HashMap<ComboId, Vec<Bounds<Pixels>>>,
-    /// Each tab's width by the tab's own id rather than by slot or index, so
-    /// a bar can work out where every tab will land in a new order before it
-    /// has been laid out there, and slide it over — and so a reorder, which
-    /// renumbers every index, changes nobody's record.
-    pub tab_widths: HashMap<ComboId, HashMap<SharedString, f32>>,
-    /// Bounds of each option of a segmented control, in option order, and
-    /// of the group around them, recorded as they paint. The selection pill
-    /// slides between these.
-    pub slot_bounds: HashMap<ComboId, Vec<Bounds<Pixels>>>,
-    pub group_bounds: HashMap<ComboId, Bounds<Pixels>>,
-    /// Bounds of anything that asked to be measured as it painted, by key:
-    /// a disclosure's body, so it can be shown growing to the height it will
-    /// have rather than appearing at it.
-    pub measured: HashMap<ElementId, Bounds<Pixels>>,
-
-    /// The open context menu, if any.
-    pub menu: Option<OpenMenu>,
-    /// The open dialog, if any, or one still fading out.
-    pub dialog: Option<OpenDialog>,
-    /// The open command palette, if any.
-    pub palette_overlay: Option<OpenPalette>,
-    /// The keyboard's row in each filtering list, by the list's id. A
-    /// `RefCell` because a list notices its query changing while it renders.
-    lists: RefCell<HashMap<ElementId, ListKeyboard>>,
-
-    /// The shortcut recorder waiting for a key chord, if any.
-    pub recording: Option<ComboId>,
+impl Default for ControlState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ControlState {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            theme: Theme::default(),
+            epoch: Instant::now(),
+            frame: Cell::new(0),
+            time_scale: None,
+            records: RefCell::default(),
+            measured: TagMap::default(),
+            focus_handles: RefCell::default(),
+            scroll_handles: RefCell::default(),
+            combo: None,
+            combo_dismissed: None,
+            menu: None,
+            menu_focus: None,
+            menu_return_focus: None,
+            dialog: None,
+            dialog_return_focus: None,
+            dialog_trap: Cell::new(None),
+            palette_overlay: None,
+            recording: None,
+            ring_hidden: false,
+            drag: None,
+        }
+    }
+
+    /// Microseconds since the state was made: the clock every record keeps
+    /// time by.
+    fn now(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_micros()).unwrap_or(u64::MAX)
     }
 
     // ---- Pop-ups ----
 
+    /// Whether `combo` is open — not counting one that is fading out.
     pub fn is_combo_open(&self, combo: ComboId) -> bool {
-        self.open_combo == Some(combo)
+        self.combo
+            .as_ref()
+            .is_some_and(|open| open.id == combo && open.closing.is_none())
     }
 
     /// Closes the open pop-up, letting its list fade back out the way it
-    /// faded in.
+    /// faded in. A list closed twice leaves the first fade running.
     pub fn close_combo(&mut self) {
-        self.combo_highlight = None;
-        if let Some(combo) = self.open_combo.take() {
-            self.combo_closing = Some((combo, Instant::now()));
+        if let Some(open) = self.combo.as_mut()
+            && open.closing.is_none()
+        {
+            open.closing = Some(Instant::now());
+            open.highlight = None;
         }
     }
 
-    /// Opens one pop-up on `chosen`, its current option, closing whichever
-    /// was open. The list lays that row over the button, and the keyboard
-    /// starts on it, so the first arrow press moves from there rather than
-    /// from the top.
+    /// Opens one pop-up on `chosen`, its current option, in place of
+    /// whichever was open or fading. The list lays that row over the button,
+    /// and the keyboard starts on it, so the first arrow press moves from
+    /// there rather than from the top.
     pub fn open_combo(&mut self, combo: ComboId, chosen: usize) {
-        self.close_combo();
-        self.open_combo = Some(combo);
-        self.combo_opened_at = Some(Instant::now());
-        self.combo_opened_on = Some(chosen);
-        self.combo_highlight = Some(chosen);
-        self.combo_closing = None;
+        self.combo = Some(OpenCombo {
+            id: combo,
+            opened_at: Instant::now(),
+            opened_on: chosen,
+            highlight: Some(chosen),
+            closing: None,
+        });
     }
 
     /// Puts the keyboard on one option of the open list.
     pub fn highlight_combo(&mut self, index: usize) {
-        self.combo_highlight = Some(index);
+        if let Some(open) = self.combo.as_mut()
+            && open.closing.is_none()
+        {
+            open.highlight = Some(index);
+        }
     }
 
     /// Which option the keyboard is on, falling back to `selected` for a
     /// list opened with the mouse and never arrowed through.
     pub fn combo_highlight_or(&self, selected: usize) -> usize {
-        self.combo_highlight.unwrap_or(selected)
+        self.combo
+            .as_ref()
+            .filter(|open| open.closing.is_none())
+            .and_then(|open| open.highlight)
+            .unwrap_or(selected)
+    }
+
+    /// The option `combo`'s list opened on, while the list is on screen at
+    /// all — open or fading out.
+    pub fn combo_opened_on(&self, combo: ComboId) -> Option<usize> {
+        self.combo_fade(combo)?;
+        self.combo.as_ref().map(|open| open.opened_on)
+    }
+
+    /// `(reveal, still_animating)` for `combo`'s list if it is on screen at
+    /// all, open or leaving; `None` once it has gone. Reveal runs 0 to 1,
+    /// eased: opening eases out and closing eases in, so both ends of the
+    /// motion sit against the button rather than drifting from it.
+    pub fn combo_fade(&self, combo: ComboId) -> Option<(f32, bool)> {
+        let open = self.combo.as_ref().filter(|open| open.id == combo)?;
+        let reveal = self.scaled(COMBO_REVEAL);
+        match open.closing {
+            Some(since) => {
+                let t = crate::easing::progress(since, reveal);
+                (t < 1.0).then(|| (1.0 - crate::easing::ease_in_cubic(t), true))
+            }
+            None => {
+                let t = crate::easing::progress(open.opened_at, reveal);
+                Some((crate::easing::ease_out_cubic(t), t < 1.0))
+            }
+        }
+    }
+
+    /// A press landed outside the open list of `combo`: closes it, and
+    /// marks it so the same press's click, if it lands on the list's own
+    /// button, does not reopen it.
+    pub fn combo_pressed_outside(&mut self, combo: ComboId) {
+        self.close_combo();
+        self.combo_dismissed = Some((combo, Instant::now()));
+    }
+
+    /// The pop-up a press outside it closed a moment ago, if any, clearing
+    /// the marker either way: one no toggle consumed, because the click
+    /// landed elsewhere, must not eat some later toggle click.
+    pub fn take_combo_dismissal(&mut self) -> Option<ComboId> {
+        let (combo, at) = self.combo_dismissed.take()?;
+        (at.elapsed() < COMBO_REVEAL).then_some(combo)
     }
 
     // ---- Animation ----
@@ -367,6 +624,14 @@ impl ControlState {
             .and_then(|value| value.parse::<f32>().ok())?;
         self.set_time_scale(scale);
         self.time_scale
+    }
+
+    /// A duration at the current time scale.
+    pub fn scaled(&self, duration: Duration) -> Duration {
+        match self.time_scale {
+            Some(scale) => duration.mul_f32(scale),
+            None => duration,
+        }
     }
 
     // ---- Theme ----
@@ -465,23 +730,19 @@ impl ControlState {
     /// mid-entrance fades from wherever the entrance had got to.
     pub fn dialog_fade(&self, id: ComboId) -> Option<(f32, bool)> {
         let dialog = self.dialog.as_ref().filter(|dialog| dialog.id == id)?;
-        let (opacity, running) = match dialog.closing {
+        match dialog.closing {
             Some(since) => {
                 let t = crate::easing::progress(since, self.scaled(crate::easing::MODAL_EXIT));
-                (1.0 - crate::easing::ease_in_cubic(t), t < 1.0)
+                (t < 1.0).then(|| (1.0 - crate::easing::ease_in_cubic(t), true))
             }
             None => {
                 let t = crate::easing::progress(
                     dialog.opened_at,
                     self.scaled(crate::easing::MODAL_ENTER),
                 );
-                (crate::easing::ease_out_cubic(t), t < 1.0)
+                Some((crate::easing::ease_out_cubic(t), t < 1.0))
             }
-        };
-        if dialog.closing.is_some() && !running {
-            return None;
         }
-        Some((opacity, running))
     }
 
     // ---- Command palette ----
@@ -547,70 +808,67 @@ impl ControlState {
 
     // ---- Filtering lists ----
 
-    /// Which row the keyboard is on in list `id`, given the query the list
-    /// is currently filtered by. A changed query puts it back on the first
-    /// row: the rows have been re-ranked, and the best match is the one the
-    /// person most likely means.
-    pub fn list_highlight(&self, id: impl Into<ElementId>, query: &str) -> usize {
-        let hash = hash_of(query);
-        let mut lists = self.lists.borrow_mut();
-        let entry = lists.entry(id.into()).or_insert(ListKeyboard {
-            highlight: 0,
-            query: hash,
-        });
-        if entry.query != hash {
-            entry.query = hash;
-            entry.highlight = 0;
+    /// Which row the keyboard is on in list `list`, given the query the
+    /// list is currently filtered by. A changed query puts it back on the
+    /// first row: the rows have been re-ranked, and the best match is the
+    /// one the person most likely means.
+    pub fn list_highlight(&self, list: impl Into<Tag>, query: &str) -> usize {
+        let hash = Tag::new(query).0;
+        let frame = self.frame.get();
+        let mut records = self.records.borrow_mut();
+        let entry = records
+            .entry(Kind::List.slot(list.into()))
+            .or_insert(Entry {
+                touched: frame,
+                record: Record::List {
+                    highlight: 0,
+                    query: hash,
+                },
+            });
+        entry.touched = frame;
+        let Record::List { highlight, query } = &mut entry.record else {
+            return 0;
+        };
+        if *query != hash {
+            *query = hash;
+            *highlight = 0;
         }
-        entry.highlight
+        *highlight
     }
 
-    /// The keyboard's row in list `id` as last set, whatever the query.
-    pub fn list_position(&self, id: impl Into<ElementId>) -> usize {
-        self.lists
-            .borrow()
-            .get(&id.into())
-            .map_or(0, |list| list.highlight)
-    }
-
-    /// Puts the keyboard on row `index` of list `id`.
-    pub fn highlight_list(&self, id: impl Into<ElementId>, index: usize) {
-        let mut lists = self.lists.borrow_mut();
-        let entry = lists.entry(id.into()).or_insert(ListKeyboard {
-            highlight: 0,
-            query: hash_of(""),
-        });
-        entry.highlight = index;
-    }
-
-    /// A duration at the current time scale.
-    pub fn scaled(&self, duration: Duration) -> Duration {
-        match self.time_scale {
-            Some(scale) => duration.mul_f32(scale),
-            None => duration,
+    /// The keyboard's row in list `list` as last set, whatever the query.
+    pub fn list_position(&self, list: impl Into<Tag>) -> usize {
+        match self.records.borrow().get(&Kind::List.slot(list.into())) {
+            Some(Entry {
+                record: Record::List { highlight, .. },
+                ..
+            }) => *highlight,
+            _ => 0,
         }
     }
 
-    /// Marks an element as having just changed state, starting its
-    /// animation. For a control that renders a value, prefer
-    /// [`ControlState::transition`], which notices the change itself.
-    pub fn mark_changed(&self, id: impl Into<ElementId>) {
-        self.anim
-            .borrow_mut()
-            .insert(id.into(), (Instant::now(), self.scaled(SWITCH_SLIDE)));
+    /// Puts the keyboard on row `index` of list `list`.
+    pub fn highlight_list(&self, list: impl Into<Tag>, index: usize) {
+        let frame = self.frame.get();
+        let mut records = self.records.borrow_mut();
+        let entry = records
+            .entry(Kind::List.slot(list.into()))
+            .or_insert(Entry {
+                touched: frame,
+                record: Record::List {
+                    highlight: index,
+                    query: Tag::new("").0,
+                },
+            });
+        entry.touched = frame;
+        if let Record::List { highlight, .. } = &mut entry.record {
+            *highlight = index;
+        }
     }
 
-    /// How far through its animation an element is, 0..=1. An element that
-    /// never changed reads as finished, so it paints its end state.
-    pub fn anim_progress(&self, id: &ElementId, duration: Duration) -> f32 {
-        self.anim
-            .borrow()
-            .get(id)
-            .map(|(since, _)| crate::easing::progress(*since, self.scaled(duration)))
-            .unwrap_or(1.0)
-    }
+    // ---- Records ----
 
-    /// Progress of `id`'s transition to `value`, 0..=1, starting one when
+    /// Progress of `tag`'s transition to `value`, 0..=1, starting one when
     /// the value is not what it showed last frame.
     ///
     /// Called from render rather than from the click handler, so a switch
@@ -626,15 +884,33 @@ impl ControlState {
     /// frame that would continue it, and the control sits at the start of
     /// its slide until something else repaints. GPUI ignores a `notify` from
     /// inside render, so the control cannot ask on the host's behalf.
-    pub fn transition(&self, id: &ElementId, value: u64, duration: Duration) -> f32 {
+    pub fn transition(&self, tag: impl Into<Tag>, value: u64, duration: Duration) -> f32 {
+        let now = self.now();
         let frame = self.frame.get();
-        let previous = self.seen.borrow_mut().insert(id.clone(), (value, frame));
-        if previous.is_some_and(|(previous, _)| previous != value) {
-            self.anim
-                .borrow_mut()
-                .insert(id.clone(), (Instant::now(), self.scaled(duration)));
+        let mut records = self.records.borrow_mut();
+        let entry = records.entry(Kind::Flip.slot(tag.into())).or_insert(Entry {
+            touched: frame,
+            record: Record::Flip {
+                value,
+                since: now,
+                duration: 0,
+            },
+        });
+        entry.touched = frame;
+        let Record::Flip {
+            value: shown,
+            since,
+            duration: running,
+        } = &mut entry.record
+        else {
+            return 1.0;
+        };
+        if *shown != value {
+            *shown = value;
+            *since = now;
+            *running = micros(self.scaled(duration));
         }
-        self.anim_progress(id, duration)
+        progress_of(now, *since, *running)
     }
 
     /// Where a two-state element is between its off (0) and on (1) looks,
@@ -642,8 +918,11 @@ impl ControlState {
     /// [`ControlState::transition`] for the common case: a control mixes its
     /// two looks by this number and gets its slide in either direction, from
     /// wherever it was when the state flipped back.
-    pub fn blend(&self, id: &ElementId, on: bool, duration: Duration) -> f32 {
-        let t = crate::easing::ease_out_cubic(self.transition(id, u64::from(on), duration));
+    ///
+    /// Notice it during render, so the host asks [`ControlState::animating`]
+    /// after its controls have been built.
+    pub fn blend(&self, tag: impl Into<Tag>, on: bool, duration: Duration) -> f32 {
+        let t = crate::easing::ease_out_cubic(self.transition(tag, u64::from(on), duration));
         if on { t } else { 1.0 - t }
     }
 
@@ -653,123 +932,143 @@ impl ControlState {
     ///
     /// Asked for a new target it sets off from wherever it is now, so a
     /// change of mind mid-slide bends the motion rather than restarting it.
-    /// The first time an id is seen it is already at its target: nothing
-    /// slides in from nowhere on the first frame. Like `transition`, this is
+    /// The first time a tag is seen it is already at its target: nothing
+    /// slides in from nowhere on the first frame; [`ControlState::tween_from`]
+    /// is for the one that should. Like [`ControlState::blend`], this is
     /// noticed during render, so the host asks [`ControlState::animating`]
     /// after its controls have been built.
-    pub fn tween(&self, id: impl Into<ElementId>, target: f32, duration: Duration) -> f32 {
-        self.tween_inner(id.into(), None, target, duration)
+    pub fn tween(&self, tag: impl Into<Tag>, target: f32, duration: Duration) -> f32 {
+        self.tween_inner(tag.into(), None, target, duration)
     }
 
-    /// [`ControlState::tween`], but an id seen for the first time starts at
+    /// [`ControlState::tween`], but a tag seen for the first time starts at
     /// `initial` and slides to `target` — for a row fading in when it joins
     /// a list. Pair it with [`ControlState::present`] so the first frame of
     /// the whole list is not a hundred rows fading in at once.
     pub fn tween_from(
         &self,
-        id: impl Into<ElementId>,
+        tag: impl Into<Tag>,
         initial: f32,
         target: f32,
         duration: Duration,
     ) -> f32 {
-        self.tween_inner(id.into(), Some(initial), target, duration)
+        self.tween_inner(tag.into(), Some(initial), target, duration)
     }
 
     /// A tween for an angle in degrees, which goes the short way round: from
     /// 350 to 10 is twenty degrees, not three hundred and forty.
-    pub fn tween_angle(&self, id: impl Into<ElementId>, degrees: f32, duration: Duration) -> f32 {
-        let id = id.into();
-        let target = match self.tweens.borrow().get(&id) {
-            Some(tween) => {
-                let here = tween.to;
+    pub fn tween_angle(&self, tag: impl Into<Tag>, degrees: f32, duration: Duration) -> f32 {
+        let tag = tag.into();
+        let target = match self.records.borrow().get(&Kind::Tween.slot(tag)) {
+            Some(Entry {
+                record: Record::Tween { to, .. },
+                ..
+            }) => {
+                let here = *to;
                 let delta = (degrees - here).rem_euclid(360.0);
                 here + if delta > 180.0 { delta - 360.0 } else { delta }
             }
-            None => degrees,
+            _ => degrees,
         };
-        self.tween_inner(id, None, target, duration)
+        self.tween_inner(tag, None, target, duration)
     }
 
     /// Puts a tween at `value` at once, with no slide. For a value the hand
     /// is dragging: the pointer is the animation, and a control that trails
     /// it reads as lag.
-    pub fn snap(&self, id: impl Into<ElementId>, value: f32) -> f32 {
-        let id = id.into();
-        self.tweens.borrow_mut().insert(
-            id,
-            Tween {
-                from: value,
-                to: value,
-                since: Instant::now(),
-                duration: Duration::ZERO,
+    pub fn snap(&self, tag: impl Into<Tag>, value: f32) -> f32 {
+        self.records.borrow_mut().insert(
+            Kind::Tween.slot(tag.into()),
+            Entry {
                 touched: self.frame.get(),
+                record: Record::Tween {
+                    from: value,
+                    to: value,
+                    since: self.now(),
+                    duration: 0,
+                },
             },
         );
         value
     }
 
-    fn tween_inner(
-        &self,
-        id: ElementId,
-        initial: Option<f32>,
-        target: f32,
-        duration: Duration,
-    ) -> f32 {
-        let duration = self.scaled(duration);
+    fn tween_inner(&self, tag: Tag, initial: Option<f32>, target: f32, duration: Duration) -> f32 {
+        let now = self.now();
         let frame = self.frame.get();
-        let mut tweens = self.tweens.borrow_mut();
-        let tween = tweens.entry(id).or_insert_with(|| match initial {
-            Some(from) => Tween {
-                from,
-                to: target,
-                since: Instant::now(),
-                duration,
+        let duration = micros(self.scaled(duration));
+        let mut records = self.records.borrow_mut();
+        let entry = records
+            .entry(Kind::Tween.slot(tag))
+            .or_insert_with(|| Entry {
                 touched: frame,
-            },
-            None => Tween {
-                from: target,
-                to: target,
-                since: Instant::now(),
-                duration: Duration::ZERO,
-                touched: frame,
-            },
-        });
-        tween.touched = frame;
-        if tween.to != target {
-            tween.from = tween.value();
-            tween.to = target;
-            tween.since = Instant::now();
-            tween.duration = duration;
+                record: match initial {
+                    Some(from) => Record::Tween {
+                        from,
+                        to: target,
+                        since: now,
+                        duration,
+                    },
+                    None => Record::Tween {
+                        from: target,
+                        to: target,
+                        since: now,
+                        duration: 0,
+                    },
+                },
+            });
+        entry.touched = frame;
+        let Record::Tween {
+            from,
+            to,
+            since,
+            duration: running,
+        } = &mut entry.record
+        else {
+            return target;
+        };
+        if *to != target {
+            *from = tween_value(now, *from, *to, *since, *running);
+            *to = target;
+            *since = now;
+            *running = duration;
         }
-        tween.value()
+        tween_value(now, *from, *to, *since, *running)
     }
 
     /// Whether a group of rows — a list, a tree, a menu — was already on
-    /// screen last frame. Call it once per row with the *group's* id.
+    /// screen last frame. Call it once per row with the *group's* tag.
     ///
     /// A row joining a list that is already up should fade in; a list that
     /// has just appeared as a whole should not fade in row by row, it is
     /// arriving with whatever brought it. This tells the two apart, and it
     /// answers the same for every row in a frame however many ask.
-    pub fn present(&self, group: impl Into<ElementId>) -> bool {
+    pub fn present(&self, group: impl Into<Tag>) -> bool {
         let frame = self.frame.get();
-        let mut streaks = self.streaks.borrow_mut();
-        let entry = streaks.entry(group.into()).or_insert((frame, frame));
-        // (started, touched): a gap of more than a frame ends the streak.
-        if entry.1 + 1 < frame {
-            entry.0 = frame;
+        let mut records = self.records.borrow_mut();
+        let entry = records
+            .entry(Kind::Streak.slot(group.into()))
+            .or_insert(Entry {
+                touched: frame,
+                record: Record::Streak { started: frame },
+            });
+        let Record::Streak { started } = &mut entry.record else {
+            return false;
+        };
+        // A gap of more than a frame ends the streak.
+        if frame.wrapping_sub(entry.touched) > 1 {
+            *started = frame;
         }
-        entry.1 = frame;
-        entry.0 < frame
+        entry.touched = frame;
+        *started != frame
     }
 
     /// The scroll handle for a pop-up list, made the first time it is asked
     /// for and the same one thereafter, so the list can read its own offset
     /// and fade the edge that has something past it.
-    pub fn scroll(&self, id: impl Into<ElementId>) -> ScrollHandle {
+    pub fn scroll(&self, list: impl Into<Tag>) -> ScrollHandle {
         self.scroll_handles
             .borrow_mut()
-            .entry(id.into())
+            .entry(list.into())
             .or_default()
             .clone()
     }
@@ -780,42 +1079,38 @@ impl ControlState {
     /// Also the end of a frame's bookkeeping: it is called once per render,
     /// after everything has been built, so it counts frames, and retires the
     /// records of anything that has not been rendered for two of them. That
-    /// is what lets a row that leaves a list and comes back be new again, and
-    /// it is why a host that skips calling this leaks nothing worse than a
-    /// few stale entries.
+    /// is what lets a row that leaves a list and comes back be new again,
+    /// what keeps the table the size of the screen, and why a host that
+    /// skips calling this leaks nothing worse than a few stale entries.
     pub fn animating(&self) -> bool {
         let frame = self.frame.get();
-        self.frame.set(frame + 1);
-        let stale = |touched: u64| touched + 1 < frame;
-        self.tweens
-            .borrow_mut()
-            .retain(|_, tween| !stale(tween.touched));
-        self.seen
-            .borrow_mut()
-            .retain(|_, (_, touched)| !stale(*touched));
-        self.streaks
-            .borrow_mut()
-            .retain(|_, (_, touched)| !stale(*touched));
-
-        if self
-            .anim
-            .borrow()
-            .values()
-            .any(|(since, duration)| since.elapsed() < *duration)
-        {
+        self.frame.set(frame.wrapping_add(1));
+        let now = self.now();
+        let mut running = false;
+        self.records.borrow_mut().retain(|_, entry| {
+            if frame.wrapping_sub(entry.touched) > 1 {
+                return false;
+            }
+            running |= match entry.record {
+                Record::Flip {
+                    since, duration, ..
+                }
+                | Record::Tween {
+                    since, duration, ..
+                } => now.saturating_sub(since) < u64::from(duration),
+                _ => false,
+            };
+            true
+        });
+        if running {
             return true;
         }
-        if self.tweens.borrow().values().any(Tween::running) {
+        if let Some(open) = &self.combo
+            && self.combo_fade(open.id).is_some_and(|(_, running)| running)
+        {
             return true;
         }
         let reveal = self.scaled(COMBO_REVEAL);
-        if self.open_combo.is_some()
-            && self
-                .combo_opened_at
-                .is_some_and(|since| since.elapsed() < reveal)
-        {
-            return true;
-        }
         if self
             .menu
             .as_ref()
@@ -830,45 +1125,131 @@ impl ControlState {
         {
             return true;
         }
-        if let Some(dialog) = &self.dialog
-            && self
-                .dialog_fade(dialog.id)
+        self.dialog.as_ref().is_some_and(|dialog| {
+            self.dialog_fade(dialog.id)
                 .is_some_and(|(_, running)| running)
-        {
-            return true;
+        })
+    }
+
+    // ---- Geometry ----
+
+    /// Records where something painted this frame, under `tag`. Called from
+    /// a paint probe; retired with everything else once the probe stops
+    /// painting.
+    pub fn record_bounds(&mut self, tag: impl Into<Tag>, bounds: Bounds<Pixels>) {
+        self.records.borrow_mut().insert(
+            Kind::Bounds.slot(tag.into()),
+            Entry {
+                touched: self.frame.get(),
+                record: Record::Bounds(bounds),
+            },
+        );
+    }
+
+    /// Where `tag` painted last frame, if it did.
+    pub fn bounds(&self, tag: impl Into<Tag>) -> Option<Bounds<Pixels>> {
+        match self.records.borrow().get(&Kind::Bounds.slot(tag.into())) {
+            Some(Entry {
+                record: Record::Bounds(bounds),
+                ..
+            }) => Some(*bounds),
+            _ => None,
         }
-        self.combo_closing
-            .is_some_and(|(_, since)| since.elapsed() < reveal)
     }
 
-    /// Drops animations that have finished. Optional housekeeping: the map
-    /// is keyed by element id and so is bounded by the number of animated
-    /// controls, but a host that builds ids from data can call this to keep
-    /// it from growing.
-    pub fn prune_anims(&mut self) {
-        self.anim
-            .borrow_mut()
-            .retain(|_, (since, duration)| since.elapsed() < *duration);
+    /// Records the bounds of a track — a slider's, a pop-up button's, a menu
+    /// button's — as it paints. A drag needs them long after the pointer has
+    /// left the track, and a list is laid over the button wherever the
+    /// button is nested.
+    pub fn record_track(&mut self, id: ComboId, bounds: Bounds<Pixels>) {
+        self.record_bounds((id, "track"), bounds);
     }
 
-    // ---- Track drags ----
+    /// Where track `id` painted last frame.
+    pub fn track(&self, id: ComboId) -> Option<Bounds<Pixels>> {
+        self.bounds((id, "track"))
+    }
+
+    /// Records the bounds of the group around a set of options — a
+    /// segmented control's well, a tab bar's — as it paints. The options'
+    /// bounds only mean something relative to these.
+    pub fn record_group(&mut self, id: ComboId, bounds: Bounds<Pixels>) {
+        self.record_bounds((id, "group"), bounds);
+    }
+
+    /// Where group `id` painted last frame.
+    pub fn group(&self, id: ComboId) -> Option<Bounds<Pixels>> {
+        self.bounds((id, "group"))
+    }
+
+    /// Records the bounds of option `slot` of group `id` as it paints. The
+    /// selection pill slides between these, and a tab drag compares the
+    /// pointer with them.
+    pub fn record_slot(&mut self, id: ComboId, slot: usize, bounds: Bounds<Pixels>) {
+        self.record_bounds((id, "slot", slot), bounds);
+    }
+
+    /// Where option `slot` of group `id` painted last frame.
+    pub fn slot(&self, id: ComboId, slot: usize) -> Option<Bounds<Pixels>> {
+        self.bounds((id, "slot", slot))
+    }
+
+    /// Remembers a size after the thing measured has gone: a disclosure's
+    /// body, so the next time it opens it can grow to the height it had
+    /// rather than appear at it. Unlike [`ControlState::record_bounds`]
+    /// this is kept, so tag it by the widget, not by its data.
+    pub fn measure(&mut self, tag: impl Into<Tag>, bounds: Bounds<Pixels>) {
+        self.measured.insert(tag.into(), bounds);
+    }
+
+    /// The last size remembered under `tag`.
+    pub fn measured(&self, tag: impl Into<Tag>) -> Option<Bounds<Pixels>> {
+        self.measured.get(&tag.into()).copied()
+    }
+
+    // ---- Drags ----
 
     pub fn scroll_dragging(&self) -> bool {
-        self.scroll_drag.is_some()
+        matches!(self.drag, Some(Drag::Scroll(_)))
     }
 
     pub fn track_dragging(&self) -> bool {
-        self.track_drag.is_some()
+        matches!(self.drag, Some(Drag::Track(_)))
     }
 
     /// Whether a particular track is the one being dragged.
     pub fn is_dragging(&self, id: ComboId) -> bool {
-        self.track_drag.as_ref().is_some_and(|drag| drag.id == id)
+        matches!(&self.drag, Some(Drag::Track(drag)) if drag.id == id)
+    }
+
+    /// The tab reorder in flight, if any.
+    pub fn tab_drag(&self) -> Option<&TabDrag> {
+        match &self.drag {
+            Some(Drag::Tab(drag)) => Some(drag),
+            _ => None,
+        }
+    }
+
+    fn scroll_drag(&self) -> Option<&ScrollDrag> {
+        match &self.drag {
+            Some(Drag::Scroll(drag)) => Some(drag),
+            _ => None,
+        }
+    }
+
+    /// Starts a scrollbar thumb drag, in place of any other gesture.
+    pub fn begin_scroll_drag(&mut self, drag: ScrollDrag) {
+        self.drag = Some(Drag::Scroll(drag));
     }
 
     /// Starts a drag on a track, recording how it should be read.
     pub fn begin_track_drag(&mut self, id: ComboId, axis: TrackAxis, stops: Option<u32>) {
-        self.track_drag = Some(TrackDrag { id, axis, stops });
+        self.drag = Some(Drag::Track(TrackDrag { id, axis, stops }));
+    }
+
+    /// Starts a tab reorder.
+    pub fn begin_tab_drag(&mut self, drag: TabDrag) {
+        self.drag = Some(Drag::Tab(drag));
     }
 
     /// Where along the dragged track a pointer position falls, each
@@ -879,8 +1260,10 @@ impl ControlState {
     /// Both components are always filled in; a horizontal track's `y` is
     /// simply not interesting.
     pub fn track_ratio_at(&self, position: Point<Pixels>) -> Option<(ComboId, Point<f32>)> {
-        let drag = self.track_drag.as_ref()?;
-        let bounds = self.track_bounds.get(drag.id)?;
+        let Some(Drag::Track(drag)) = &self.drag else {
+            return None;
+        };
+        let bounds = self.track(drag.id)?;
         let width = f32::from(bounds.size.width);
         let height = f32::from(bounds.size.height);
         if width <= 0.0 || height <= 0.0 {
@@ -905,13 +1288,10 @@ impl ControlState {
         Some((drag.id, point))
     }
 
-    // ---- Tab drags ----
-
     /// Which tab in a bar sits under a pointer position, if any.
     pub fn tab_at(&self, bar: ComboId, position: Point<Pixels>) -> Option<usize> {
-        self.tab_bounds
-            .get(bar)?
-            .iter()
+        (0..)
+            .map_while(|slot| self.slot(bar, slot))
             .position(|bounds| bounds.contains(&position))
     }
 
@@ -924,36 +1304,59 @@ impl ControlState {
     /// neighbour, so a tab never swaps back and forth under a still hand.
     pub fn drag_tab_to(&mut self, position: Point<Pixels>) -> bool {
         let pointer = f32::from(position.x);
-        let Some(drag) = self.tab_drag.as_mut() else {
+        let Some(Drag::Tab(drag)) = &self.drag else {
             return false;
         };
-        drag.pointer = pointer;
-        drag.moved = true;
         let (bar, to) = (drag.bar, drag.to);
-        let Some(bounds) = self.tab_bounds.get(bar) else {
-            return true;
-        };
-        let Some(current) = bounds.get(to) else {
-            return true;
-        };
         let mut target = None;
-        if pointer < f32::from(current.left())
-            && to > 0
-            && let Some(previous) = bounds.get(to - 1)
-            && pointer < f32::from(previous.center().x)
-        {
-            target = Some(to - 1);
+        if let Some(current) = self.slot(bar, to) {
+            if pointer < f32::from(current.left())
+                && to > 0
+                && let Some(previous) = self.slot(bar, to - 1)
+                && pointer < f32::from(previous.center().x)
+            {
+                target = Some(to - 1);
+            }
+            if pointer > f32::from(current.right())
+                && let Some(next) = self.slot(bar, to + 1)
+                && pointer > f32::from(next.center().x)
+            {
+                target = Some(to + 1);
+            }
         }
-        if pointer > f32::from(current.right())
-            && let Some(next) = bounds.get(to + 1)
-            && pointer > f32::from(next.center().x)
-        {
-            target = Some(to + 1);
-        }
-        if let Some(to) = target {
-            self.tab_drag.as_mut().expect("checked above").to = to;
+        if let Some(Drag::Tab(drag)) = &mut self.drag {
+            drag.pointer = pointer;
+            drag.moved = true;
+            if let Some(to) = target {
+                drag.to = to;
+            }
         }
         true
+    }
+
+    /// Whether any gesture owned by the controls is in flight. A host with
+    /// drags of its own ORs this with them.
+    pub fn dragging_anything(&self) -> bool {
+        self.drag.is_some()
+    }
+
+    /// Ends the drag and clears the dismissal marker. Call it from the
+    /// host's mouse-up, and from a mouse-move with no button held: a release
+    /// outside the window never arrives, so without that a drag would still
+    /// be running when the pointer comes back.
+    ///
+    /// Returns the finished tab reorder, if the gesture was one and it
+    /// actually moved, so the host can apply it.
+    pub fn end_drag(&mut self) -> Option<(ComboId, usize, usize)> {
+        // A marker no toggle consumed (the click landed elsewhere) must not
+        // eat some later toggle click.
+        self.combo_dismissed = None;
+        match self.drag.take()? {
+            Drag::Tab(drag) if drag.moved && drag.from != drag.to => {
+                Some((drag.bar, drag.from, drag.to))
+            }
+            _ => None,
+        }
     }
 
     // ---- Context menus ----
@@ -996,15 +1399,17 @@ impl ControlState {
         });
     }
 
+    // ---- Focus ----
+
     /// The focus handle for a composite control, made the first time it is
     /// asked for and the same one thereafter.
     ///
     /// Always a tab stop: a group is exactly one stop however many options
     /// it holds, which is why Tab passes a twenty-tab bar in one press.
-    pub fn focus(&self, id: impl Into<ElementId>, cx: &App) -> FocusHandle {
+    pub fn focus(&self, tag: impl Into<Tag>, cx: &App) -> FocusHandle {
         self.focus_handles
             .borrow_mut()
-            .entry(id.into())
+            .entry(tag.into())
             .or_insert_with(|| cx.focus_handle().tab_stop(true))
             .clone()
     }
@@ -1015,7 +1420,7 @@ impl ControlState {
     pub fn root_focus(&self, cx: &App) -> FocusHandle {
         self.focus_handles
             .borrow_mut()
-            .entry(ElementId::Name(ROOT_FOCUS.into()))
+            .entry(Tag::from(ROOT_FOCUS))
             .or_insert_with(|| cx.focus_handle())
             .clone()
     }
@@ -1043,10 +1448,19 @@ impl ControlState {
         }
     }
 
-    /// Records, or clears, the buttons a modal dialog is keeping the keyboard
-    /// among. Called by [`crate::containers::dialog`] each frame.
-    pub fn set_dialog_trap(&self, buttons: Option<Vec<FocusHandle>>) {
-        *self.dialog_trap.borrow_mut() = buttons;
+    /// The focus handle of button `index` of dialog `id`. One handle per
+    /// button, owned here rather than by the buttons, so the dialog can put
+    /// the keyboard on its default action when it opens and Tab can find
+    /// its way round them while it is up.
+    pub fn dialog_button_focus(&self, id: ComboId, index: usize, cx: &App) -> FocusHandle {
+        self.focus((id, "button", index), cx)
+    }
+
+    /// Records, or clears, the dialog a modal is keeping the keyboard inside
+    /// of, and how many buttons it has. Called by
+    /// [`crate::containers::dialog`] each frame.
+    pub fn set_dialog_trap(&self, trap: Option<(ComboId, usize)>) {
+        self.dialog_trap.set(trap);
     }
 
     /// Where Tab goes next while a modal dialog holds the keyboard, or `None`
@@ -1056,18 +1470,20 @@ impl ControlState {
     /// buttons. If it is anywhere else the dialog has either not taken it
     /// yet or has already gone, and in neither case is the press ours.
     pub fn trap_next(&self, window: &Window, backward: bool) -> Option<FocusHandle> {
-        let trap = self.dialog_trap.borrow();
-        let buttons = trap.as_ref()?;
-        let here = buttons
-            .iter()
-            .position(|handle| handle.is_focused(window))?;
-        let count = buttons.len();
+        let (id, count) = self.dialog_trap.get()?;
+        if count == 0 {
+            return None;
+        }
+        let handles = self.focus_handles.borrow();
+        let button = |index: usize| handles.get(&Tag::new((id, "button", index)));
+        let here = (0..count)
+            .position(|index| button(index).is_some_and(|handle| handle.is_focused(window)))?;
         let next = if backward {
             (here + count - 1) % count
         } else {
             (here + 1) % count
         };
-        Some(buttons[next].clone())
+        button(next).cloned()
     }
 
     /// Hands the keyboard back to whatever had it before a dialog opened.
@@ -1118,7 +1534,11 @@ impl ControlState {
     /// there was anything to close, so a host can pass an idle Escape on to
     /// its own overlays.
     pub fn dismiss_overlays(&mut self, window: &mut Window, cx: &mut App) -> bool {
-        let had_popup = self.open_combo.is_some() || self.menu.is_some();
+        let had_popup = self
+            .combo
+            .as_ref()
+            .is_some_and(|open| open.closing.is_none())
+            || self.menu.is_some();
         self.dismiss_popups();
         if self.palette_overlay.is_some() {
             self.close_palette(window, cx);
@@ -1147,34 +1567,6 @@ impl ControlState {
     /// I just ran opened another one".
     pub fn menu_opened_at(&self) -> Option<Instant> {
         self.menu.as_ref().map(|menu| menu.opened_at)
-    }
-
-    // ---- Drag lifecycle ----
-
-    /// Whether any gesture owned by the controls is in flight. A host with
-    /// drags of its own ORs this with them.
-    pub fn dragging_anything(&self) -> bool {
-        self.scroll_drag.is_some() || self.track_drag.is_some() || self.tab_drag.is_some()
-    }
-
-    /// Ends every drag and clears the dismissal marker. Call it from the
-    /// host's mouse-up, and from a mouse-move with no button held: a release
-    /// outside the window never arrives, so without that a drag would still
-    /// be running when the pointer comes back.
-    ///
-    /// Returns the finished tab reorder, if the gesture was one and it
-    /// actually moved, so the host can apply it.
-    pub fn end_drag(&mut self) -> Option<(ComboId, usize, usize)> {
-        self.scroll_drag = None;
-        self.track_drag = None;
-        // A marker no toggle consumed (the click landed elsewhere) must not
-        // eat some later toggle click.
-        self.combo_dismissed = None;
-        self.combo_dismissed_at = None;
-        self.tab_drag
-            .take()
-            .filter(|drag| drag.moved && drag.from != drag.to)
-            .map(|drag| (drag.bar, drag.from, drag.to))
     }
 }
 
@@ -1270,14 +1662,7 @@ pub fn handle_mouse<E: InteractiveElement, V: ControlHost>(root: E, cx: &mut Con
     )
 }
 
-fn hash_of(text: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut hasher);
-    hasher.finish()
-}
-
-/// Pumps every in-flight control drag from one pointer position. Call it
+/// Pumps the in-flight control drag from one pointer position. Call it
 /// from the host's mouse-move tracking; it does nothing when nothing is
 /// being dragged, so it is safe to call unconditionally.
 ///
@@ -1287,15 +1672,13 @@ pub fn continue_drags<V: ControlHost>(
     position: Point<Pixels>,
     cx: &mut Context<V>,
 ) -> bool {
-    let mut moved = false;
-
-    if let Some(drag) = &host.control_state().scroll_drag {
+    if let Some(drag) = host.control_state().scroll_drag() {
         let along = match drag.axis {
             ScrollAxis::Vertical => f32::from(position.y),
             ScrollAxis::Horizontal => f32::from(position.x),
         };
         apply_scroll_drag(drag, along);
-        moved = true;
+        return true;
     }
     if let Some((id, at)) = host.control_state().track_ratio_at(position) {
         // The theme's own hue slider is the toolkit's to read; every other
@@ -1306,15 +1689,12 @@ pub fn continue_drags<V: ControlHost>(
         } else {
             host.track_dragged(id, at, cx);
         }
-        moved = true;
+        return true;
     }
-    if host.control_state_mut().drag_tab_to(position) {
-        moved = true;
-    }
-    moved
+    host.control_state_mut().drag_tab_to(position)
 }
 
-/// Ends every in-flight control drag, applying a finished tab reorder. Call
+/// Ends the in-flight control drag, applying a finished tab reorder. Call
 /// it from the host's mouse-up, and from a mouse-move with no button held.
 pub fn end_drags<V: ControlHost>(host: &mut V, cx: &mut Context<V>) {
     if let Some((bar, from, to)) = host.control_state_mut().end_drag() {
@@ -1324,11 +1704,71 @@ pub fn end_drags<V: ControlHost>(host: &mut V, cx: &mut Context<V>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlState, Palette, SCHEME_FADE};
-    use gpui::{Point, px};
+    use super::{ControlState, Entry, Palette, SCHEME_FADE, TabDrag, Tag, TrackAxis};
+    use gpui::{Bounds, ElementId, Point, SharedString, px, size};
 
     fn at(x: f32, y: f32) -> Point<gpui::Pixels> {
         gpui::point(px(x), px(y))
+    }
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> Bounds<gpui::Pixels> {
+        Bounds::new(at(x, y), size(px(w), px(h)))
+    }
+
+    /// The whole point: a record is a few words, not a string and two
+    /// timestamps. Sizes are what the refactor bought, so they are pinned.
+    #[test]
+    fn a_record_is_small() {
+        assert_eq!(std::mem::size_of::<Tag>(), 8);
+        assert!(
+            std::mem::size_of::<Entry>() <= 40,
+            "{}",
+            std::mem::size_of::<Entry>()
+        );
+    }
+
+    /// Tags are built from parts without allocating, and the parts matter
+    /// in order and in kind.
+    #[test]
+    fn tags_are_hashes_of_their_parts() {
+        assert_eq!(Tag::new(("tabs", "pill-x")), Tag::from(("tabs", "pill-x")));
+        assert_ne!(Tag::new(("tabs", "pill-x")), Tag::new(("pill-x", "tabs")));
+        assert_ne!(Tag::new(("ab", "c")), Tag::new(("a", "bc")));
+        assert_ne!(
+            Tag::new(("rows", "shown", 1usize)),
+            Tag::new(("rows", "shown", 2usize))
+        );
+        // Text is text whichever type carries it: a row keyed by a
+        // `SharedString` matches the same row keyed by a `&str`.
+        let owned: SharedString = String::from("budget.csv").into();
+        assert_eq!(
+            Tag::new(("tree", "selected", &owned)),
+            Tag::new(("tree", "selected", "budget.csv"))
+        );
+        assert_eq!(Tag::from(&owned), Tag::from("budget.csv"));
+        assert_eq!(
+            Tag::from(ElementId::Name("x".into())),
+            Tag::from(&ElementId::Name("x".into()))
+        );
+        // Extending a tag is not the same as hashing it again.
+        assert_ne!(Tag::new("a").with("b"), Tag::new(Tag::new("a")));
+    }
+
+    /// One tag can hold one record of every kind at once, because the kinds
+    /// share a table but not a slot: a list is present, has a keyboard row
+    /// and painted somewhere, all under its own id.
+    #[test]
+    fn kinds_do_not_clobber_each_other() {
+        let mut state = ControlState::new();
+        state.present("list");
+        state.highlight_list("list", 3);
+        state.record_bounds("list", rect(1.0, 2.0, 3.0, 4.0));
+        state.tween("list", 5.0, super::MOVE);
+        state.transition("list", 7, super::SWITCH_SLIDE);
+        assert_eq!(state.list_position("list"), 3);
+        assert_eq!(state.bounds("list"), Some(rect(1.0, 2.0, 3.0, 4.0)));
+        assert_eq!(state.tween("list", 5.0, super::MOVE), 5.0);
+        assert_eq!(state.transition("list", 7, super::SWITCH_SLIDE), 1.0);
     }
 
     /// The target is the whole reason a host opens a menu with one, and it
@@ -1394,10 +1834,7 @@ mod tests {
     /// zero elapsed over a zero duration must not be a division.
     #[test]
     fn a_zero_length_tween_is_finished() {
-        assert_eq!(
-            crate::easing::progress(std::time::Instant::now(), std::time::Duration::ZERO),
-            1.0
-        );
+        assert_eq!(super::progress_of(0, 0, 0), 1.0);
         let state = ControlState::new();
         for _ in 0..1000 {
             let v = state.tween("fresh", 3.0, super::MOVE);
@@ -1435,18 +1872,54 @@ mod tests {
 
     /// Records of things no longer rendered are retired, so a checkbox that
     /// leaves the screen and returns paints its state rather than sliding
-    /// from whatever it last showed.
+    /// from whatever it last showed — and the table does not grow with
+    /// everything that was ever on screen.
     #[test]
     fn stale_records_are_retired() {
         let state = ControlState::new();
-        let id = gpui::ElementId::Name("check".into());
-        state.transition(&id, 1, super::SWITCH_SLIDE);
+        state.transition("check", 1, super::SWITCH_SLIDE);
+        state.transition("check", 0, super::SWITCH_SLIDE);
+        assert!(state.animating(), "a change started a slide");
+        assert_eq!(state.records.borrow().len(), 1);
         state.animating();
         state.animating();
-        state.animating();
+        assert_eq!(
+            state.records.borrow().len(),
+            0,
+            "two frames unseen, and it is gone"
+        );
         // First sight again: a different value starts no animation.
-        let t = state.transition(&id, 0, super::SWITCH_SLIDE);
+        let t = state.transition("check", 1, super::SWITCH_SLIDE);
         assert_eq!(t, 1.0);
+    }
+
+    /// Where things painted is a per-frame record like any other: a tab
+    /// closed and gone from the bar takes its width with it, rather than
+    /// leaving one behind for every tab the bar ever had.
+    #[test]
+    fn geometry_is_retired_but_measurements_are_kept() {
+        let mut state = ControlState::new();
+        state.record_slot("tabs", 0, rect(0.0, 0.0, 80.0, 26.0));
+        state.record_bounds(("tabs", "tab", "notes.md"), rect(0.0, 0.0, 80.0, 26.0));
+        state.measure(("section", "body"), rect(0.0, 0.0, 300.0, 120.0));
+        assert_eq!(
+            state.slot("tabs", 0).map(|b| f32::from(b.size.width)),
+            Some(80.0)
+        );
+        assert_eq!(state.tab_at("tabs", at(10.0, 10.0)), Some(0));
+        state.animating();
+        state.animating();
+        state.animating();
+        assert_eq!(state.slot("tabs", 0), None);
+        assert_eq!(state.bounds(("tabs", "tab", "notes.md")), None);
+        assert_eq!(state.tab_at("tabs", at(10.0, 10.0)), None);
+        assert_eq!(
+            state
+                .measured(("section", "body"))
+                .map(|b| f32::from(b.size.height)),
+            Some(120.0),
+            "a disclosure grows to the height it had, however long it was shut"
+        );
     }
 
     /// Slow motion stretches every duration, so a slide that would be over
@@ -1460,11 +1933,10 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
         let v = state.tween("x", 1.0, std::time::Duration::from_millis(1));
         assert!(v < 0.2, "{v}");
-        let id = gpui::ElementId::Name("flip".into());
-        state.transition(&id, 0, std::time::Duration::from_millis(1));
-        state.transition(&id, 1, std::time::Duration::from_millis(1));
+        state.transition("flip", 0, std::time::Duration::from_millis(1));
+        state.transition("flip", 1, std::time::Duration::from_millis(1));
         std::thread::sleep(std::time::Duration::from_millis(10));
-        let t = state.transition(&id, 1, std::time::Duration::from_millis(1));
+        let t = state.transition("flip", 1, std::time::Duration::from_millis(1));
         assert!(t < 0.2, "{t}");
     }
 
@@ -1492,6 +1964,108 @@ mod tests {
         assert!(!state.animating());
     }
 
+    /// A pop-up list is the same shape as a dialog: open at once, fading
+    /// out when closed, gone after the fade — and it keeps the row it opened
+    /// on all the way out, because a pick has changed the value by then.
+    #[test]
+    fn a_combo_fades_out_on_the_row_it_opened_on() {
+        let mut state = ControlState::new();
+        assert_eq!(state.combo_fade("sort"), None);
+        state.open_combo("sort", 2);
+        assert!(state.is_combo_open("sort"));
+        assert_eq!(
+            state.combo_highlight_or(0),
+            2,
+            "the keyboard starts on the current option"
+        );
+        let (reveal, running) = state.combo_fade("sort").expect("on screen");
+        assert!(running && reveal < 1.0, "{reveal}");
+        assert!(state.animating());
+        state.highlight_combo(4);
+        assert_eq!(state.combo_highlight_or(0), 4);
+        state.close_combo();
+        assert!(!state.is_combo_open("sort"));
+        assert_eq!(
+            state.combo_opened_on("sort"),
+            Some(2),
+            "kept through the fade"
+        );
+        assert_eq!(
+            state.combo_highlight_or(0),
+            0,
+            "the highlight went with the list"
+        );
+        assert!(state.combo_fade("sort").is_some(), "still fading");
+        std::thread::sleep(super::COMBO_REVEAL + std::time::Duration::from_millis(20));
+        assert_eq!(state.combo_fade("sort"), None);
+        assert_eq!(state.combo_opened_on("sort"), None);
+        assert!(!state.animating());
+    }
+
+    /// A press outside a list closes it and marks it, so the same press's
+    /// click on the list's own button does not reopen it; the marker is
+    /// used once and expires on its own.
+    #[test]
+    fn a_dismissal_is_taken_once() {
+        let mut state = ControlState::new();
+        state.open_combo("sort", 0);
+        state.combo_pressed_outside("sort");
+        assert!(!state.is_combo_open("sort"));
+        assert_eq!(state.take_combo_dismissal(), Some("sort"));
+        assert_eq!(state.take_combo_dismissal(), None, "taken");
+        state.combo_pressed_outside("sort");
+        state.end_drag();
+        assert_eq!(state.take_combo_dismissal(), None, "a release clears it");
+    }
+
+    /// One pointer, one gesture: starting one drag ends another, and only a
+    /// tab drag that actually moved comes back as a reorder.
+    #[test]
+    fn one_gesture_at_a_time() {
+        let mut state = ControlState::new();
+        state.begin_track_drag("volume", TrackAxis::Horizontal, None);
+        assert!(state.is_dragging("volume") && state.track_dragging());
+        state.begin_tab_drag(TabDrag {
+            bar: "tabs",
+            from: 0,
+            to: 0,
+            moved: false,
+            grab: 0.0,
+            pointer: 0.0,
+        });
+        assert!(!state.track_dragging(), "the tab took over");
+        assert!(state.dragging_anything());
+        assert_eq!(
+            state.end_drag(),
+            None,
+            "a press that never moved is a click"
+        );
+        assert!(!state.dragging_anything());
+
+        state.record_slot("tabs", 0, rect(0.0, 0.0, 80.0, 26.0));
+        state.record_slot("tabs", 1, rect(82.0, 0.0, 80.0, 26.0));
+        state.begin_tab_drag(TabDrag {
+            bar: "tabs",
+            from: 0,
+            to: 0,
+            moved: false,
+            grab: 10.0,
+            pointer: 10.0,
+        });
+        assert!(
+            state.drag_tab_to(at(40.0, 10.0)),
+            "every move during a drag redraws"
+        );
+        assert_eq!(
+            state.tab_drag().map(|drag| drag.to),
+            Some(0),
+            "not past the neighbour's middle"
+        );
+        state.drag_tab_to(at(130.0, 10.0));
+        assert_eq!(state.tab_drag().map(|drag| drag.to), Some(1));
+        assert_eq!(state.end_drag(), Some(("tabs", 0, 1)));
+    }
+
     /// A list's keyboard row survives frames while the query is the same,
     /// and goes back to the top when the query changes.
     #[test]
@@ -1516,8 +2090,12 @@ mod tests {
         let light = state.palette();
         assert!(!light.is_dark);
         state.theme.scheme = crate::theme::Scheme::Dark;
-        let crossing = state.palette();
+        // The frame that notices the change paints the old scheme: the
+        // crossing has begun, but no time has passed yet.
+        assert_eq!(state.palette(), light);
         assert!(state.animating(), "the scheme is crossing over");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let crossing = state.palette();
         assert_ne!(crossing.backdrop, light.backdrop);
         assert_ne!(
             crossing.backdrop,

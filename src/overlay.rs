@@ -13,7 +13,7 @@ use crate::easing::{ease_out_cubic, progress};
 use crate::keyboard::{self, Dismiss, Key, Orientation};
 use crate::lighting;
 use crate::palette::Palette;
-use crate::state::{COMBO_REVEAL, ComboId, ControlHost, MOVE, SWITCH_SLIDE};
+use crate::state::{COMBO_REVEAL, ComboId, ControlHost, MOVE, SWITCH_SLIDE, Tag};
 use crate::text_input::{self as text, TextInput};
 
 // ---- Tooltip ----------------------------------------------------------------
@@ -274,10 +274,10 @@ pub fn command_list<V: ControlHost>(
         let on_activate = on_activate.clone();
         let command_id = command.id.clone();
         let active = index == highlighted;
-        let key = |what: &str| ElementId::Name(format!("{id}-{what}-{command_id}").into());
+        let key = |what: &'static str| Tag::new((id, what, &command_id));
         // Keyed by the command rather than the row, so the highlight and the
         // fade belong to the command as it moves.
-        let on = state.blend(&key("lit"), active, SWITCH_SLIDE);
+        let on = state.blend(key("lit"), active, SWITCH_SLIDE);
         let shown = if fresh {
             state.tween(key("shown"), 1.0, SWITCH_SLIDE)
         } else {
@@ -479,7 +479,7 @@ pub fn command_palette<V: ControlHost>(
     // The panel arrives the way a menu does: the same reveal, a short drift
     // down into place.
     let reveal = ease_out_cubic(progress(opened_at, state.scaled(COMBO_REVEAL)));
-    let list_scroll = state.scroll(ElementId::Name(format!("{id}-list").into()));
+    let list_scroll = state.scroll((id, "list"));
     let fill = if dark {
         palette.soft_fill
     } else {

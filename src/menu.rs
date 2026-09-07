@@ -199,11 +199,9 @@ pub fn context_menu<V: ControlHost>(
     for (index, item) in items.into_iter().enumerate() {
         let lit = highlight.is_some_and(|at| reachable.get(at) == Some(&index));
         // The keyboard's wash moves from row to row rather than jumping.
-        let lit = view.control_state().blend(
-            &ElementId::NamedInteger(format!("{id}-menu-lit").into(), index as u64),
-            lit,
-            crate::state::SWITCH_SLIDE,
-        );
+        let lit =
+            view.control_state()
+                .blend((id, "menu-lit", index), lit, crate::state::SWITCH_SLIDE);
         rows.push(render_item(
             index,
             item,
@@ -336,8 +334,7 @@ pub fn context_menu<V: ControlHost>(
                                 // open it straight back up.
                                 let on_own_button = this
                                     .control_state()
-                                    .track_bounds
-                                    .get(id)
+                                    .track(id)
                                     .is_some_and(|bounds| bounds.contains(&event.position));
                                 if on_own_button {
                                     return;
@@ -566,7 +563,7 @@ pub fn menu_button<V: ControlHost>(
                 move |bounds, _window, cx| {
                     if let Some(host) = weak.upgrade() {
                         host.update(cx, |host, _cx| {
-                            host.control_state_mut().track_bounds.insert(id, bounds);
+                            host.control_state_mut().record_track(id, bounds);
                         });
                     }
                 },
@@ -600,7 +597,7 @@ pub fn menu_button<V: ControlHost>(
                 let state = this.control_state_mut();
                 if state.is_menu_open(id) {
                     state.close_menu();
-                } else if let Some(bounds) = state.track_bounds.get(id).copied() {
+                } else if let Some(bounds) = state.track(id) {
                     state.open_menu_under(id, bounds, "");
                 }
                 cx.notify();

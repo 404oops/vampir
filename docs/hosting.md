@@ -86,25 +86,27 @@ if self.controls.animating() || page == Page::Controls {
 
 Do not drive hover from an `Instant`. Scrolling a list re-fires hover on every row and will pin the display link at 60Hz. Use GPUI's `.hover()`.
 
-`animating()` is also the end of a frame's bookkeeping: it counts the frame, and retires the records of anything that has not rendered for two of them. That is what lets a row that leaves a list and comes back count as new, and it is why it wants to be called exactly once per render, after everything else.
+`animating()` is also the end of a frame's bookkeeping: it counts the frame, and retires the records of anything that has not rendered for two of them — what each control showed, where each value was on its way to, where each track and tab painted. That is what lets a row that leaves a list and comes back count as new, it is what keeps `ControlState` the size of the screen rather than of the session, and it is why it wants to be called exactly once per render, after everything else.
 
 ## Animating your own state
 
 The same machinery the controls use is there for the host:
 
-- **A two-state look:** `self.controls.blend(&id, on, SWITCH_SLIDE)` is 0 to 1, eased, from wherever it was when `on` last changed.
+- **A two-state look:** `self.controls.blend((id, "on"), on, SWITCH_SLIDE)` is 0 to 1, eased, from wherever it was when `on` last changed.
 - **A value going somewhere:** `self.controls.tween("key", target, MOVE)` glides from its current value to the target and is at the target the first time it is asked. `table_row` uses it to slide a row to its sorted place rather than redealing the table; `tween_angle` does the same for degrees, the short way round.
 - **Content arriving:** `vampir::arriving("page", page as u64, &self.controls, body)` fades the body in and settles it up into place each time the key changes. The gallery wraps each page in one.
 - **Text changing:** `vampir::fading_text("status", text, &self.controls)` fades new words in over the old ones, because words cannot be interpolated. The gallery's footer is one.
 - **A scheme crossing over** is the theme's job; see below.
 
-Key everything by what it *is* rather than where it is — a row by its id, not its index — or a row shifting down one place inherits the animation of whatever was there before.
+Key everything by what it *is* rather than where it is — a row by its id, not its index — or a row shifting down one place inherits the animation of whatever was there before. Build the key as a tuple, `(id, "shown", &row.id)`, not with `format!`: see [Ids](#ids).
 
 ## Ids
 
 `ComboId` is `&'static str`. It is both the element id and the widget's identity in `ControlState`, so **two widgets of the same kind in one view must not share one**. There is no enum to keep in step, which is the point.
 
 The same string is what comes back to `track_dragged` and `tabs_reordered`, so the `match` in those methods is the whole dispatch table for your drags.
+
+Everything a control remembers between frames — `blend`, `tween`, `present`, its focus handle, where it painted — is filed under a `Tag`, which is the hash of whatever it was built from: a `&str`, a `SharedString`, an `ElementId`, or a tuple of them. Name a moving part with a tuple, `(id, "pill-x")` or `(id, "shown", &row.id)`, and building the key costs nothing; a `format!` string costs two allocations per part per frame and buys nothing over it, since text hashes as text whichever type carries it. One tag can hold one record of each kind at once, so a list may be `present`, have a keyboard row and have painted somewhere all under its own id.
 
 ## Themes
 

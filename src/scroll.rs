@@ -180,16 +180,8 @@ pub fn scroll_fades(
     // until it arrives at -max. Content that fits wants neither.
     let scrollable = max > 0.5;
     let wanted = |shown: bool| if scrollable && shown { 1.0 } else { 0.0 };
-    let at_start = state.tween(
-        format!("{id}-fade-start"),
-        wanted(offset < -0.5),
-        SWITCH_SLIDE,
-    );
-    let at_end = state.tween(
-        format!("{id}-fade-end"),
-        wanted(offset > -max + 0.5),
-        SWITCH_SLIDE,
-    );
+    let at_start = state.tween((id, "fade-start"), wanted(offset < -0.5), SWITCH_SLIDE);
+    let at_end = state.tween((id, "fade-end"), wanted(offset > -max + 0.5), SWITCH_SLIDE);
     let mut fades = Vec::new();
     if at_start > 0.01 {
         fades.push(edge_fade(axis, true, start, at_start));

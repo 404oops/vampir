@@ -20,7 +20,9 @@ use crate::keyboard::{self, Dismiss, Key, Orientation};
 use crate::lighting;
 use crate::palette::Palette;
 use crate::scroll::{ScrollAxis, scroll_fades};
-use crate::state::{ComboId, ControlHost, ControlState, MOVE, SWITCH_SLIDE, TabDrag, TrackAxis};
+use crate::state::{
+    ComboId, ControlHost, ControlState, MOVE, SWITCH_SLIDE, TabDrag, Tag, TrackAxis,
+};
 
 // ---- Tab bar ----------------------------------------------------------------
 
@@ -110,8 +112,11 @@ pub fn tab_bar<V: ControlHost>(
             }
         })
     });
-    let drag: Option<TabDrag> = view.control_state().tab_drag.clone();
-    let dragging_here = drag.as_ref().filter(|drag| drag.bar == id).cloned();
+    let dragging_here: Option<TabDrag> = view
+        .control_state()
+        .tab_drag()
+        .filter(|drag| drag.bar == id)
+        .copied();
     let weak = cx.entity().downgrade();
 
     // Reordered for display while a drag is in flight, so the tabs slide
@@ -139,10 +144,14 @@ pub fn tab_bar<V: ControlHost>(
     // rather than a fill that goes out on one tab and comes on on another.
     // Widths by tab id, and only once every tab on the bar has one: a tab
     // that has never painted has no width to plan with.
-    let widths: Option<Vec<f32>> = state
-        .tab_widths
-        .get(id)
-        .and_then(|known| tabs.iter().map(|tab| known.get(&tab.id).copied()).collect());
+    let widths: Option<Vec<f32>> = tabs
+        .iter()
+        .map(|tab| {
+            state
+                .bounds((id, "tab", &tab.id))
+                .map(|bounds| f32::from(bounds.size.width))
+        })
+        .collect();
     let places: Option<Vec<f32>> = widths.as_ref().map(|widths| {
         let mut x = 0.0;
         order
@@ -162,7 +171,7 @@ pub fn tab_bar<V: ControlHost>(
         .as_ref()
         .filter(|drag| drag.moved)
         .map(|drag| drag.to);
-    let well = state.group_bounds.get(id).copied();
+    let well = state.group(id);
     let held_offset = held_slot.and_then(|slot| {
         let drag = dragging_here.as_ref()?;
         let places = places.as_ref()?;
@@ -188,12 +197,12 @@ pub fn tab_bar<V: ControlHost>(
             // there on release.
             match held_offset.filter(|_| held_slot == Some(slot)) {
                 Some(offset) => (
-                    state.snap(format!("{id}-pill-x"), x + offset),
-                    state.snap(format!("{id}-pill-w"), width),
+                    state.snap((id, "pill-x"), x + offset),
+                    state.snap((id, "pill-w"), width),
                 ),
                 None => (
-                    state.tween(format!("{id}-pill-x"), x, MOVE),
-                    state.tween(format!("{id}-pill-w"), width, MOVE),
+                    state.tween((id, "pill-x"), x, MOVE),
+                    state.tween((id, "pill-w"), width, MOVE),
                 ),
             }
         });
@@ -218,9 +227,10 @@ pub fn tab_bar<V: ControlHost>(
         // tab, and a slide that belonged to an index would be inherited by
         // whichever tab landed there — every tab setting off from where some
         // other tab was.
-        let key = |what: &str| ElementId::Name(format!("{id}-{what}-{}", tab.id).into());
+        let key = |what: &'static str| Tag::new((id, what, &tab.id));
+        let element = |what: &str| ElementId::Name(format!("{id}-{what}-{}", tab.id).into());
         // The label crosses over as the pill arrives under it.
-        let on = state.blend(&key("tab-on"), active, SWITCH_SLIDE);
+        let on = state.blend(key("tab-on"), active, SWITCH_SLIDE);
         // Laid out in its slot, drawn on its way there — or, for the tab in
         // hand, wherever the hand is.
         let slide = key("tab-x");
@@ -250,7 +260,7 @@ pub fn tab_bar<V: ControlHost>(
         let tab_id = tab.id.clone();
         rendered.push(
             div()
-                .id(key("tab"))
+                .id(element("tab"))
                 .h(px(TAB_HEIGHT))
                 .flex_none()
                 .px(px(10.0))
@@ -310,16 +320,8 @@ pub fn tab_bar<V: ControlHost>(
                             if let Some(host) = weak.upgrade() {
                                 host.update(cx, |host, _cx| {
                                     let state = host.control_state_mut();
-                                    let slots = state.tab_bounds.entry(id).or_default();
-                                    if slots.len() <= slot {
-                                        slots.resize(slot + 1, laid_out);
-                                    }
-                                    slots[slot] = laid_out;
-                                    state
-                                        .tab_widths
-                                        .entry(id)
-                                        .or_default()
-                                        .insert(tab_id.clone(), f32::from(bounds.size.width));
+                                    state.record_slot(id, slot, laid_out);
+                                    state.record_bounds((id, "tab", &tab_id), bounds);
                                 });
                             }
                         },
@@ -339,12 +341,10 @@ pub fn tab_bar<V: ControlHost>(
                         // there rather than jumping to sit by its edge.
                         let grab = this
                             .control_state()
-                            .tab_bounds
-                            .get(id)
-                            .and_then(|slots| slots.get(slot))
+                            .slot(id, slot)
                             .map(|bounds| pointer - f32::from(bounds.left()))
                             .unwrap_or(0.0);
-                        this.control_state_mut().tab_drag = Some(TabDrag {
+                        this.control_state_mut().begin_tab_drag(TabDrag {
                             bar: id,
                             from: slot,
                             to: slot,
@@ -363,8 +363,7 @@ pub fn tab_bar<V: ControlHost>(
                     cx.listener(move |this, _event, window, cx| {
                         let was_reorder = this
                             .control_state()
-                            .tab_drag
-                            .as_ref()
+                            .tab_drag()
                             .is_some_and(|drag| drag.moved);
                         if !was_reorder {
                             // Clicking a tab puts the keyboard on the bar, so
@@ -381,7 +380,7 @@ pub fn tab_bar<V: ControlHost>(
                     let on_close = on_close.clone();
                     el.child(
                         tab_close_glyph()
-                            .id(key("tab-close"))
+                            .id(element("tab-close"))
                             .hover(move |style| style.bg(palette.row_hover))
                             .on_click(cx.listener(move |this, _event, window, cx| {
                                 on_close(this, index, window, cx);
@@ -398,7 +397,7 @@ pub fn tab_bar<V: ControlHost>(
             move |bounds, _window, cx| {
                 if let Some(host) = weak.upgrade() {
                     host.update(cx, |host, _cx| {
-                        host.control_state_mut().group_bounds.insert(id, bounds);
+                        host.control_state_mut().record_group(id, bounds);
                     });
                 }
             },
@@ -611,7 +610,6 @@ pub fn collapsible<V: ControlHost>(
     body: impl IntoElement,
     on_toggle: impl Fn(&mut V, bool, &mut Window, &mut Context<V>) + 'static,
 ) -> impl IntoElement {
-    let element_id: ElementId = ElementId::Name(format!("{id}-disclosure").into());
     // Noticed from the value rather than announced by the click, so a
     // section opened by a shortcut or by the host's own code turns its
     // chevron exactly as a click does. The chevron turns from where it was,
@@ -619,15 +617,14 @@ pub fn collapsible<V: ControlHost>(
     // other end first.
     let turned = view
         .control_state()
-        .blend(&element_id, expanded, SWITCH_SLIDE);
+        .blend((id, "disclosure"), expanded, SWITCH_SLIDE);
     // The body's full height, from the last time it painted open, so it can
     // be shown growing to that height rather than appearing at it. Unknown
     // the first time it opens, when it fades in instead.
-    let body_key = ElementId::Name(format!("{id}-body").into());
+    let body_key = Tag::new((id, "body"));
     let body_height = view
         .control_state()
-        .measured
-        .get(&body_key)
+        .measured(body_key)
         .map(|bounds| f32::from(bounds.size.height));
     let weak = cx.entity().downgrade();
     let chevron: gpui::Hsla = crate::color::to_hsla(palette.text_secondary);
@@ -813,7 +810,7 @@ pub fn dialog<V: ControlHost>(
     // lets the keyboard wander off behind its own scrim has stopped being
     // modal.
     let handles: Vec<FocusHandle> = (0..buttons.len())
-        .map(|n| state.focus(ElementId::Name(format!("{id}-button-{n}").into()), cx))
+        .map(|n| state.dialog_button_focus(id, n, cx))
         .collect();
     // The default action is the primary button. Failing one, the first — by
     // convention the safe one, which is the right thing for Enter to do in
@@ -822,13 +819,11 @@ pub fn dialog<V: ControlHost>(
         .iter()
         .position(|spec| matches!(spec.variant, ButtonVariant::Primary))
         .unwrap_or(0);
-    let panel_focus = state
-        .focus(ElementId::Name(format!("{id}-panel").into()), cx)
-        .tab_stop(false);
+    let panel_focus = state.focus((id, "panel"), cx).tab_stop(false);
     // Tab is bound to an action and handled at the root; this is how
     // `keyboard::move_focus` finds out there is a dialog to stay inside. A
     // dialog on its way out is not one to stay inside of.
-    state.set_dialog_trap((!closing).then(|| handles.clone()));
+    state.set_dialog_trap((!closing).then_some((id, buttons.len())));
 
     let on_dismiss: Press<V> = Rc::new(on_dismiss);
     let dismiss_from_scrim = on_dismiss.clone();
@@ -1074,8 +1069,7 @@ pub fn arriving(
     state: &ControlState,
     content: impl IntoElement,
 ) -> Div {
-    let arrived =
-        crate::easing::ease_out_cubic(state.transition(&ElementId::Name(id.into()), key, MOVE));
+    let arrived = crate::easing::ease_out_cubic(state.transition(id, key, MOVE));
     div()
         .opacity(arrived)
         .relative()

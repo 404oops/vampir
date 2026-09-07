@@ -9,7 +9,7 @@ Most controls follow the same small pattern. This page explains that pattern and
 - **State goes to the host, not into the control.** `collapsible` takes `expanded` as a parameter for exactly this reason: whether a section is open usually outlives the view that draws it.
 - **Animation is noticed, not announced.** A control asks `ControlState` how far its value is from what it showed last frame — `blend`, `tween` — rather than starting a timer in its click handler. That is what makes a change from a shortcut or a menu move exactly as a click does, and it is why a control that animates takes `view: &V` alongside `cx`.
 
-`ControlState` is the exception, and it is a short list on purpose: which pop-up is open and how far into its fade, when each animated control last changed, and what is being dragged. If you want to add a field to it, the question to answer first is why the host cannot own that instead.
+`ControlState` is the exception, and it is a short list on purpose: which pop-up is open and how far into its fade, what each animated control showed last frame, where things painted, and what is being dragged. Everything a control remembers about itself goes in one table, under a `Tag` built from a tuple — `(id, "pill-x")`, `(id, "shown", &row.id)` — never a `format!` string, and is retired by `animating()` a frame or two after the control stops rendering. If you want to add a field to it, the question to answer first is why the host cannot own that instead, and the second is why it cannot be a record like the rest.
 
 ## Common implementation issues
 
@@ -39,7 +39,7 @@ If a bug was invisible in a unit test and obvious on screen, that usually means 
 2. Free function, generic over `V: ControlHost`, taking `Palette` by value.
 3. If it needs state between frames, ask hard whether the host should own it instead.
 4. If it drags, use the existing `TrackDrag` mechanism rather than a new field.
-5. Every visible change of state animates, with one of the three durations in [Design › Motion](design.md#motion): `blend` for a two-state look, `tween` for a position or a size, `present` before fading new rows into a list, `snap` for a value the pointer is holding. Nothing animates in on its first frame.
+5. Every visible change of state animates, with one of the three durations in [Design › Motion](design.md#motion): `blend` for a two-state look, `tween` for a position or a size, `present` before fading new rows into a list, `snap` for a value the pointer is holding. Nothing animates in on its first frame. Key each part with a tuple, `(id, "part")` or `(id, "part", &row.id)`, not a formatted string.
 6. Export it from `lib.rs`.
 7. Add a row to the table in [Widgets](widgets.md) and to the list in the [README](../README.md).
 8. Show it in `examples/gallery.rs`, in both schemes, and watch its motion once in slow motion (`VAMPIR_SLOW_MOTION=8 tools/gallery.sh launch`).
