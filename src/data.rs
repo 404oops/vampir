@@ -5,6 +5,7 @@
 //! the model to the host. That is what lets either sit above a
 //! `uniform_list` and stay cheap with thousands of rows.
 
+use std::hash::Hash;
 use std::rc::Rc;
 
 use gpui::{
@@ -12,10 +13,11 @@ use gpui::{
     MouseDownEvent, PathBuilder, SharedString, Window, canvas, div, point, prelude::*, px,
 };
 
+use crate::controls::WidgetContext;
 use crate::keyboard::{self, Key};
 use crate::lighting;
 use crate::palette::Palette;
-use crate::state::{ControlHost, ControlState, MOVE, SWITCH_SLIDE};
+use crate::state::{ControlHost, ControlState, MOVE, SWITCH_SLIDE, Tag};
 
 // ---- Tree -------------------------------------------------------------------
 
@@ -179,12 +181,11 @@ pub fn tree_row<V: ControlHost>(
     rows: &[TreeRow],
     index: usize,
     selected: bool,
-    palette: Palette,
-    view: &V,
-    cx: &mut Context<V>,
+    ctx: WidgetContext<'_, '_, '_, V>,
     on_select: impl Fn(&mut V, SharedString, &mut Window, &mut Context<V>) + 'static,
     on_toggle: impl Fn(&mut V, SharedString, bool, &mut Window, &mut Context<V>) + 'static,
 ) -> impl IntoElement {
+    let WidgetContext { palette, view, cx } = ctx;
     let row = &rows[index];
     let state = view.control_state();
     // One tab stop for the tree, riding the selected row. A tree of a
@@ -201,12 +202,12 @@ pub fn tree_row<V: ControlHost>(
     // Everything a row does to itself is keyed by the row's own id rather
     // than its index: opening a branch above it shifts every index below,
     // and a selection that jumped rows because of that would be a lie.
-    let key = |what: &str| ElementId::Name(format!("{id}-{what}-{}", row.id).into());
+    let key = |what: &'static str| Tag::new((id, what, &row.id));
     // The selection washes from row to row, the chevron turns rather than
     // flips, and rows a branch reveals fade in beneath it — unless the whole
     // tree has just appeared, in which case it arrives as one thing.
-    let on = state.blend(&key("selected"), selected, SWITCH_SLIDE);
-    let turned = expanded.map(|open| state.blend(&key("open"), open, SWITCH_SLIDE));
+    let on = state.blend(key("selected"), selected, SWITCH_SLIDE);
+    let turned = expanded.map(|open| state.blend(key("open"), open, SWITCH_SLIDE));
     let shown = if state.present(id) {
         state.tween_from(key("shown"), 0.0, 1.0, SWITCH_SLIDE)
     } else {
@@ -371,13 +372,13 @@ pub fn tree_row<V: ControlHost>(
                                     // from pointing right (closed) a quarter
                                     // turn to pointing down (open): gpui has
                                     // no transform, so the path is rebuilt.
-                                    let o = bounds.origin;
+                                    let origin = bounds.origin;
                                     let angle = turned * std::f32::consts::FRAC_PI_2;
                                     let (sin, cos) = angle.sin_cos();
                                     let at = |x: f32, y: f32| {
                                         point(
-                                            o.x + px(6.0 + x * cos - y * sin),
-                                            o.y + px(6.0 + x * sin + y * cos),
+                                            origin.x + px(6.0 + x * cos - y * sin),
+                                            origin.y + px(6.0 + x * sin + y * cos),
                                         )
                                     };
                                     let mut builder = PathBuilder::stroke(px(1.4));
@@ -537,7 +538,7 @@ pub fn table_cell(column: &Column, content: impl IntoElement) -> impl IntoElemen
 /// in it — lay it out with [`table_cell`] instead.
 pub fn table_row(
     table: &'static str,
-    key: impl Into<SharedString>,
+    key: impl Hash,
     slot: usize,
     columns: &[Column],
     values: impl IntoIterator<Item = impl Into<SharedString>>,
@@ -545,11 +546,7 @@ pub fn table_row(
     state: &ControlState,
 ) -> gpui::Div {
     let place = slot as f32 * TABLE_ROW_HEIGHT;
-    let offset = state.tween(
-        ElementId::Name(format!("{table}-row-{}", key.into()).into()),
-        place,
-        MOVE,
-    ) - place;
+    let offset = state.tween((table, "row", key), place, MOVE) - place;
     div()
         .relative()
         .top(px(offset))
@@ -651,16 +648,16 @@ pub fn table_header<V: ControlHost>(
                         canvas(
                             |_bounds, _window, _cx| {},
                             move |bounds, _state, window, _cx| {
-                                let o = bounds.origin;
+                                let origin = bounds.origin;
                                 let mut builder = PathBuilder::stroke(px(1.3));
                                 if arrow_up {
-                                    builder.move_to(point(o.x + px(0.5), o.y + px(6.5)));
-                                    builder.line_to(point(o.x + px(4.5), o.y + px(2.5)));
-                                    builder.line_to(point(o.x + px(8.5), o.y + px(6.5)));
+                                    builder.move_to(point(origin.x + px(0.5), origin.y + px(6.5)));
+                                    builder.line_to(point(origin.x + px(4.5), origin.y + px(2.5)));
+                                    builder.line_to(point(origin.x + px(8.5), origin.y + px(6.5)));
                                 } else {
-                                    builder.move_to(point(o.x + px(0.5), o.y + px(2.5)));
-                                    builder.line_to(point(o.x + px(4.5), o.y + px(6.5)));
-                                    builder.line_to(point(o.x + px(8.5), o.y + px(2.5)));
+                                    builder.move_to(point(origin.x + px(0.5), origin.y + px(2.5)));
+                                    builder.line_to(point(origin.x + px(4.5), origin.y + px(6.5)));
+                                    builder.line_to(point(origin.x + px(8.5), origin.y + px(2.5)));
                                 }
                                 if let Ok(path) = builder.build() {
                                     window.paint_path(path, arrow);

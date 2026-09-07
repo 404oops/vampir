@@ -60,9 +60,9 @@ pub use containers::{
 };
 pub use controls::{
     BadgeTone, ButtonVariant, CHIP_HEIGHT, CONTROL_HEIGHT, CONTROL_RADIUS, ChipSelection, Choice,
-    SliderTrack, badge, button, caption, checkbox, chip, chip_group, combo, fading_text, glyph,
-    icon_button, progress_bar, radio_group, scrollbar, search_field, segmented, separator, slider,
-    spinbox, spinner, switch, text_area, text_field,
+    SliderTrack, WidgetContext, badge, button, caption, checkbox, chip, chip_group, combo,
+    fading_text, glyph, icon_button, progress_bar, radio_group, scrollbar, search_field, segmented,
+    separator, slider, spinbox, spinner, switch, text_area, text_field,
 };
 pub use data::{
     Column, SortDirection, TABLE_ROW_HEIGHT, TreeMove, TreeRow, flatten_tree, table_cell,
@@ -86,9 +86,9 @@ pub use palette::Palette;
 pub use scroll::{SCROLL_FADE, ScrollAxis, ScrollDrag, apply_scroll_drag, scroll_fades};
 pub use shortcut::{Chord, display, display_keystroke, shortcut_recorder};
 pub use state::{
-    COMBO_REVEAL, ComboId, ControlHost, ControlState, MOVE, OpenDialog, OpenMenu, OpenPalette,
-    SCHEME_FADE, SWITCH_SLIDE, TabDrag, TrackAxis, continue_drags, end_drags, handle_mouse,
-    mouse_moved,
+    COMBO_REVEAL, ComboId, ControlHost, ControlState, MOVE, OpenCombo, OpenDialog, OpenMenu,
+    OpenPalette, SCHEME_FADE, SWITCH_SLIDE, TabDrag, Tag, TrackAxis, TrackDrag, continue_drags,
+    end_drags, handle_mouse, mouse_moved,
 };
 pub use swatch::{MAX_CHROMA, Oklch, color_pad, hue_slider, hue_wheel, swatch_grid};
 pub use text_input::{Highlighter, InputStyle, Span, TextInput};

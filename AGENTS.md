@@ -24,7 +24,7 @@ What cannot be a pure function is small, always the same shape, and lives in one
 
 This keeps controls generic over the host view rather than tying them to one application. The host owns application data and callbacks.
 
-**Nothing changes in a single frame.** Every visible change of state animates, with one of the three durations in [design.md › Motion](docs/design.md#motion), and it is noticed from the value during render (`ControlState::blend`, `tween`) rather than started by the click, so a shortcut or a menu item moves a control exactly as the pointer does. A control that animates takes `view: &V`.
+**Nothing changes in a single frame.** Every visible change of state animates, with one of the three durations in [design.md › Motion](docs/design.md#motion), and it is noticed from the value during render (`ControlState::blend`, `tween`) rather than started by the click, so a shortcut or a menu item moves a control exactly as the pointer does. A control that animates takes a `WidgetContext` — the palette, the host and the GPUI context in one parameter — so it can read `ControlState`; one that does not takes a `Palette` and a `cx`.
 
 ---
 
@@ -32,7 +32,7 @@ This keeps controls generic over the host view rather than tying them to one app
 
 Keep these conventions in mind when changing the library. Each is explained in more detail in the linked documentation.
 
-**Shape** — every control is a free function generic over `V: ControlHost`, taking `Palette` by value. No structs with builders, no trait objects, no `RootView` anywhere. State that has to survive a frame belongs to the host, not to the control. → [writing-a-control.md](docs/writing-a-control.md)
+**Shape** — every control is a free function generic over `V: ControlHost`, taking `Palette` by value, inside a `WidgetContext` when it also needs the host's state. No structs with builders, no trait objects, no `RootView` anywhere. State that has to survive a frame belongs to the host, not to the control. → [writing-a-control.md](docs/writing-a-control.md)
 
 **Light comes from above.** Raised means you press it; recessed means you put something in it. Never hard-code a shadow or a gradient — add a recipe to `lighting` instead. → [design.md](docs/design.md#light-comes-from-above)
 

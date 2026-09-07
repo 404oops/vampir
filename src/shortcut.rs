@@ -9,9 +9,9 @@ use gpui::{
     div, prelude::*, px,
 };
 
+use crate::controls::WidgetContext;
 use crate::controls::{CONTROL_HEIGHT, CONTROL_RADIUS};
 use crate::lighting;
-use crate::palette::Palette;
 use crate::state::{ComboId, ControlHost};
 
 /// A captured key chord, in gpui's own keystroke notation.
@@ -154,11 +154,10 @@ fn pretty_key(key: &str) -> String {
 pub fn shortcut_recorder<V: ControlHost>(
     id: ComboId,
     current: Option<&Chord>,
-    palette: Palette,
-    view: &V,
-    cx: &mut Context<V>,
+    ctx: WidgetContext<'_, '_, '_, V>,
     on_record: impl Fn(&mut V, Chord, &mut Window, &mut Context<V>) + 'static,
 ) -> impl IntoElement {
+    let WidgetContext { palette, view, cx } = ctx;
     let focus = view.control_state().focus(id, cx);
     let recording = view.control_state().recording == Some(id);
     let label: SharedString = match (recording, current) {
