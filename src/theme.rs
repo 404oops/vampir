@@ -20,7 +20,9 @@
 
 use std::cell::Cell;
 
-use gpui::{AnyElement, Context, Subscription, Window, WindowAppearance, prelude::*};
+use gpui::{AnyElement, Subscription, Window, WindowAppearance, prelude::*};
+
+use crate::controls::WidgetContext;
 
 use crate::controls::segmented;
 use crate::palette::Palette;
@@ -152,26 +154,20 @@ pub fn system_dark(window: &Window) -> bool {
 
 /// A segmented control that picks the theme's [`Scheme`]: System, Light or
 /// Dark. Choosing System hands control back to the desktop.
-pub fn scheme_picker<V: ControlHost>(
-    id: ComboId,
-    palette: Palette,
-    view: &V,
-    cx: &mut Context<V>,
-) -> AnyElement {
+pub fn scheme_picker<V: ControlHost>(id: ComboId, ctx: WidgetContext<'_, '_, '_, V>) -> AnyElement {
     let options: Vec<String> = Scheme::ALL
         .iter()
         .map(|scheme| scheme.label().to_string())
         .collect();
     // Boxed rather than `impl IntoElement`: in the 2024 edition an opaque
     // return would keep `options` borrowed past the end of this function.
+    let scheme = ctx.state().theme.scheme.index();
     segmented(
         id,
         &options,
-        view.control_state().theme.scheme.index(),
+        scheme,
         true,
-        palette,
-        view,
-        cx,
+        ctx,
         |this, index, _window, cx| {
             if let Some(scheme) = Scheme::from_index(index) {
                 this.control_state_mut().theme.scheme = scheme;
@@ -186,13 +182,11 @@ pub fn scheme_picker<V: ControlHost>(
 /// toolkit, so the host's `track_dragged` never hears about it.
 pub fn hue_picker<V: ControlHost>(
     id: ComboId,
-    palette: Palette,
-    view: &V,
-    cx: &mut Context<V>,
+    ctx: WidgetContext<'_, '_, '_, V>,
 ) -> impl IntoElement {
-    let theme = &view.control_state().theme;
+    let theme = &ctx.state().theme;
     theme.hue_track.set(Some(id));
-    hue_slider(id, theme.hue, palette, view, cx)
+    hue_slider(id, theme.hue, ctx)
 }
 
 #[cfg(test)]

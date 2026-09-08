@@ -7,31 +7,111 @@
 //! nothing here holds state between frames beyond what [`ControlState`]
 //! already holds.
 
-use std::rc::Rc;
-use std::time::Instant;
-
 use gpui::{
     Anchor, Context, Div, ElementId, Entity, FocusHandle, FontWeight, KeyDownEvent, MouseButton,
     MouseDownEvent, PathBuilder, ScrollHandle, SharedString, Window, anchored, canvas, deferred,
     div, point, prelude::*, px,
 };
+use std::rc::Rc;
 
-use crate::easing::{ease_in_cubic, ease_out_cubic, lerp_f32, progress};
+use crate::easing::{ease_out_cubic, lerp_f32};
 use crate::keyboard::{self, Dismiss, Key, Orientation};
 use crate::lighting;
 use crate::menu::VIEWPORT_MARGIN;
 use crate::overlay::Hint;
 use crate::palette::Palette;
 use crate::scroll::{SCROLLBAR_THICKNESS, ScrollAxis, ScrollDrag, THUMB_THICKNESS};
-use crate::state::{
-    COMBO_REVEAL, ComboId, ControlHost, ControlState, MOVE, SWITCH_SLIDE, TrackAxis,
-};
+use crate::state::{ComboId, ControlHost, ControlState, MOVE, SWITCH_SLIDE, Tag, TrackAxis};
 use crate::text_input::TextInput;
+
+/// What a control that animates is handed besides its own data: the palette
+/// to draw with, the host it reads its state from, and the GPUI context it
+/// makes listeners with. One parameter where there were three, built for
+/// the call with [`WidgetContext::new`] and never held between frames.
+///
+/// A control that draws other controls hands each of them a
+/// [`WidgetContext::reborrow`]: the context holds the `&mut` GPUI context,
+/// so it cannot be given away twice.
+pub struct WidgetContext<'v, 'c, 'app, V: ControlHost + 'v> {
+    pub palette: Palette,
+    pub view: &'v V,
+    pub cx: &'c mut Context<'app, V>,
+}
+
+impl<'v, 'c, 'app, V: ControlHost> WidgetContext<'v, 'c, 'app, V> {
+    pub fn new(palette: Palette, view: &'v V, cx: &'c mut Context<'app, V>) -> Self {
+        Self { palette, view, cx }
+    }
+
+    /// The host's control state, borrowed for as long as the host is rather
+    /// than for as long as this context is, so a control can hold it while
+    /// it uses `cx`.
+    pub fn state(&self) -> &'v ControlState {
+        self.view.control_state()
+    }
+
+    /// The same context, lent out for one more control.
+    pub fn reborrow(&mut self) -> WidgetContext<'v, '_, 'app, V> {
+        WidgetContext {
+            palette: self.palette,
+            view: self.view,
+            cx: &mut *self.cx,
+        }
+    }
+}
 
 /// Shared metrics: every field, pop-up and button is this tall and this
 /// round, so a row of mixed controls lines up without per-control tuning.
 pub const CONTROL_HEIGHT: f32 = 30.0;
 pub const CONTROL_RADIUS: f32 = 6.0;
+
+// ---- Repeated visual constants -----------------------------------------------
+
+pub const DISABLED_OPACITY: f32 = 0.5;
+
+const PRESS_SHADE_DELTA: f32 = -0.06;
+
+const CAPTION_TEXT_SIZE: f32 = 12.0;
+const BUTTON_TEXT_SIZE: f32 = 12.5;
+const BUTTON_PADDING_H: f32 = 12.0;
+
+const SWITCH_TRACK_H: f32 = 26.0;
+const SWITCH_TRACK_RADIUS: f32 = 13.0;
+const SWITCH_LABEL_TEXT_SIZE: f32 = 12.5;
+const SWITCH_TRACK_DISABLED: f32 = 0.45;
+const SWITCH_TRACK_OPACITY_DARK: f32 = 0.5;
+const SWITCH_TRACK_OPACITY_LIGHT: f32 = 0.58;
+
+const STEP_BUTTON_SIZE: f32 = 22.0;
+const STEP_BUTTON_RADIUS: f32 = 3.0;
+const STEP_BUTTON_TEXT_SIZE: f32 = 13.0;
+const SPINBOX_WIDTH: f32 = 118.0;
+const SPINBOX_PAD_H: f32 = 4.0;
+const SPINBOX_TEXT_SIZE: f32 = 12.0;
+
+const FOCUSED_GLOW_OPACITY: f32 = 0.35;
+const FOCUSED_GLOW_BLUR: f32 = 3.0;
+
+const TEXT_FIELD_PAD_H: f32 = 9.0;
+
+const TEXT_AREA_MIN_H: f32 = 40.0;
+const TEXT_AREA_LINE_HEIGHT: f32 = 17.0;
+const TEXT_AREA_PAD_H: f32 = 10.0;
+const TEXT_AREA_PAD_V: f32 = 8.0;
+
+const COMBO_PAD_L: f32 = 10.0;
+const COMBO_PAD_R: f32 = 28.0;
+const COMBO_TEXT_SIZE: f32 = 12.5;
+const COMBO_ROW_PAD_H: f32 = 9.0;
+const COMBO_BODY_LIT: f32 = 0.05;
+const COMBO_ROW_SELECTED_LIT: f32 = 0.08;
+
+const CHEVRON_STROKE_W: f32 = 1.5;
+const CHEVRON_CHIP_INSET_R: f32 = 5.0;
+const CHEVRON_CHIP_SIZE: f32 = 18.0;
+const CHEVRON_CHIP_LIT: f32 = 0.12;
+
+const SPIN_BUTTON_DISABLED: f32 = 0.45;
 
 // ---- Captions ---------------------------------------------------------------
 
@@ -40,11 +120,11 @@ pub const CONTROL_RADIUS: f32 = 6.0;
 pub fn caption(palette: Palette, text: &str) -> impl IntoElement {
     div()
         .flex_none()
-        .text_size(px(12.0))
+        .text_size(px(CAPTION_TEXT_SIZE))
         .font_weight(FontWeight::MEDIUM)
         .text_color(palette.text_secondary)
         .whitespace_nowrap()
-        .child(SharedString::from(text.to_string()))
+        .child(SharedString::from(text))
 }
 
 /// Text that fades its new words in when it changes — a status line, a
@@ -56,11 +136,7 @@ pub fn fading_text(id: &'static str, text: impl Into<SharedString>, state: &Cont
     let text = text.into();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut hasher);
-    let arrived = ease_out_cubic(state.transition(
-        &ElementId::Name(id.into()),
-        hasher.finish(),
-        SWITCH_SLIDE,
-    ));
+    let arrived = ease_out_cubic(state.transition(id, hasher.finish(), SWITCH_SLIDE));
     div().opacity(arrived).child(text)
 }
 
@@ -166,7 +242,7 @@ fn build_button<V: ControlHost>(
 ) -> impl IntoElement {
     let dark = palette.is_dark;
     let (fill, fill_hover, label_color) = variant.colors(palette);
-    let label: SharedString = text.to_string().into();
+    let label: SharedString = SharedString::from(text);
 
     // The click and the key press are one action arriving two ways, and
     // must not become two implementations of it.
@@ -195,7 +271,7 @@ fn build_button<V: ControlHost>(
         .id(id)
         .h(px(CONTROL_HEIGHT))
         .w_full()
-        .px(px(12.0))
+        .px(px(BUTTON_PADDING_H))
         .flex()
         .items_center()
         .justify_center()
@@ -205,18 +281,20 @@ fn build_button<V: ControlHost>(
         .border_1()
         .border_color(lighting::rim(fill, dark))
         .shadow(lighting::raised(dark))
-        .text_size(px(12.5))
+        .text_size(px(BUTTON_TEXT_SIZE))
         .font_weight(FontWeight::MEDIUM)
         .text_color(label_color)
         .whitespace_nowrap()
         .overflow_hidden()
-        .when(!enabled, |el| el.opacity(0.5))
+        .when(!enabled, |el| el.opacity(DISABLED_OPACITY))
         .when(enabled, move |el| {
             el.cursor_pointer()
                 .hover(move |style| style.bg(lighting::lit(fill_hover, 0.1)))
                 // Pressed: no gradient at all, so the control reads as
-                // pushed flat into the surface rather than merely darker.
-                .active(move |style| style.bg(lighting::lit(lighting::shade(fill, -0.06), 0.0)))
+                // Pushed flat into the surface rather than merely darker.
+                .active(move |style| {
+                    style.bg(lighting::lit(lighting::shade(fill, PRESS_SHADE_DELTA), 0.0))
+                })
                 .on_click(cx.listener(move |this, _event, window, cx| {
                     on_click(this, window, cx);
                 }))
@@ -240,9 +318,7 @@ pub fn switch<V: ControlHost>(
     checked: bool,
     label: Option<&str>,
     enabled: bool,
-    palette: Palette,
-    view: &V,
-    cx: &mut Context<V>,
+    ctx: WidgetContext<'_, '_, '_, V>,
     on_toggle: impl Fn(&mut V, bool, &mut Window, &mut Context<V>) + 'static,
 ) -> impl IntoElement {
     const KNOB: f32 = 20.0;
@@ -251,6 +327,7 @@ pub fn switch<V: ControlHost>(
     let left_off = PAD;
     let left_on = TRACK_W - KNOB - PAD;
 
+    let palette = ctx.palette;
     let id: ElementId = id.into();
     let track_off = palette.field_border;
     let track_on = palette.accent;
@@ -261,9 +338,13 @@ pub fn switch<V: ControlHost>(
     // The on state is the accent at reduced strength: at full saturation a
     // switch shouts louder than the setting it controls.
     let track_opacity = if !enabled {
-        0.45
+        SWITCH_TRACK_DISABLED
     } else if checked {
-        if palette.is_dark { 0.5 } else { 0.58 }
+        if palette.is_dark {
+            SWITCH_TRACK_OPACITY_DARK
+        } else {
+            SWITCH_TRACK_OPACITY_LIGHT
+        }
     } else {
         1.0
     };
@@ -271,15 +352,16 @@ pub fn switch<V: ControlHost>(
     // The change is noticed here, from the value, rather than announced by
     // the click handler — so a switch flipped from a menu, a shortcut or the
     // command palette slides exactly as one flipped by the pointer does.
-    let t = view
-        .control_state()
+    let transition = ctx
+        .state()
         .transition(&id, u64::from(checked), SWITCH_SLIDE);
-    let eased = ease_out_cubic(t);
+    let eased = ease_out_cubic(transition);
+    let cx: &mut Context<V> = &mut *ctx.cx;
     let track_color = crate::color::lerp(track_source, track_target, eased);
     let left = lerp_f32(left_source, left_target, eased);
 
     let ring_id = ElementId::Name(format!("{id}-ring").into());
-    let label: Option<SharedString> = label.map(|text| text.to_string().into());
+    let label: Option<SharedString> = label.map(std::convert::Into::into);
     let on_toggle = Rc::new(on_toggle);
     let toggled = on_toggle.clone();
 
@@ -302,13 +384,13 @@ pub fn switch<V: ControlHost>(
         .child(
             div()
                 .w(px(TRACK_W))
-                .h(px(26.0))
+                .h(px(SWITCH_TRACK_H))
                 .flex_none()
                 .relative()
                 // The track is the switch's fill, and it lives here rather
                 // than on a child so the ring has something solid to sit
                 // around.
-                .rounded(px(13.0))
+                .rounded(px(SWITCH_TRACK_RADIUS))
                 .bg(crate::color::with_alpha(track_color, track_opacity))
                 .child(
                     div()
@@ -324,24 +406,25 @@ pub fn switch<V: ControlHost>(
                 )
                 .when(enabled, |el| {
                     el.child(
-                        keyboard::ring(ring_id, 13.0, palette).on_key_down(cx.listener(
-                            move |this, event: &KeyDownEvent, window, cx| {
-                                if keyboard::key(event) == Some(Key::Activate) {
-                                    cx.stop_propagation();
-                                    toggled(this, !checked, window, cx);
-                                    cx.notify();
-                                }
-                            },
-                        )),
+                        keyboard::ring(ring_id, SWITCH_TRACK_RADIUS, palette).on_key_down(
+                            ctx.cx
+                                .listener(move |this, event: &KeyDownEvent, window, cx| {
+                                    if keyboard::key(event) == Some(Key::Activate) {
+                                        cx.stop_propagation();
+                                        toggled(this, !checked, window, cx);
+                                        cx.notify();
+                                    }
+                                }),
+                        ),
                     )
                 }),
         )
         .children(label.map(|label| {
             div()
-                .text_size(px(12.5))
+                .text_size(px(SWITCH_LABEL_TEXT_SIZE))
                 .text_color(palette.text_primary)
                 .whitespace_nowrap()
-                .when(!enabled, |el| el.opacity(0.5))
+                .when(!enabled, |el| el.opacity(DISABLED_OPACITY))
                 .child(label)
         }))
 }
@@ -392,15 +475,15 @@ pub fn spinbox<V: ControlHost>(
         let step_ring = ElementId::Name(format!("{id:?}-ring").into());
         div()
             .id(id)
-            .w(px(22.0))
-            .h(px(22.0))
-            .rounded(px(3.0))
+            .w(px(STEP_BUTTON_SIZE))
+            .h(px(STEP_BUTTON_SIZE))
+            .rounded(px(STEP_BUTTON_RADIUS))
             .flex()
             .items_center()
             .justify_center()
-            .text_size(px(13.0))
+            .text_size(px(STEP_BUTTON_TEXT_SIZE))
             .text_color(palette.text_secondary)
-            .when(!enabled, |el| el.opacity(0.45))
+            .when(!enabled, |el| el.opacity(SPIN_BUTTON_DISABLED))
             // A stepper at its limit stays visible but stops responding:
             // removing it would shift the other one under the pointer.
             .when(enabled && active, move |el| {
@@ -414,22 +497,22 @@ pub fn spinbox<V: ControlHost>(
                         handler(this, window, cx);
                     }))
                     .child(
-                        keyboard::ring(step_ring, 3.0, palette).on_key_down(cx.listener(
-                            move |this, event: &KeyDownEvent, window, cx| {
+                        keyboard::ring(step_ring, STEP_BUTTON_RADIUS, palette).on_key_down(
+                            cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                                 if keyboard::key(event) == Some(Key::Activate) {
                                     cx.stop_propagation();
                                     key_handler(this, window, cx);
                                     cx.notify();
                                 }
-                            },
-                        )),
+                            }),
+                        ),
                     )
             })
             .child(glyph)
     };
 
     div()
-        .w(px(118.0))
+        .w(px(SPINBOX_WIDTH))
         .h(px(CONTROL_HEIGHT))
         .flex_none()
         .rounded(px(CONTROL_RADIUS))
@@ -437,11 +520,11 @@ pub fn spinbox<V: ControlHost>(
         .border_1()
         .border_color(palette.field_border)
         .shadow(lighting::recessed(palette.is_dark))
-        .when(!enabled, |el| el.opacity(0.5))
+        .when(!enabled, |el| el.opacity(DISABLED_OPACITY))
         .flex()
         .items_center()
         .justify_between()
-        .px(px(4.0))
+        .px(px(SPINBOX_PAD_H))
         // Up and down step the value from inside the field, which is what
         // every spin box has done with them for as long as there have been
         // spin boxes. They arrive as the field's own actions: a single-line
@@ -494,8 +577,8 @@ pub fn spinbox<V: ControlHost>(
         .child(
             div()
                 .flex_1()
-                .px(px(4.0))
-                .text_size(px(12.0))
+                .px(px(SPINBOX_PAD_H))
+                .text_size(px(SPINBOX_TEXT_SIZE))
                 .text_color(palette.text_primary)
                 .child(edit_input.clone()),
         )
@@ -519,7 +602,11 @@ type Commit<V> = Rc<dyn Fn(&mut V, i32, &mut Window, &mut Context<V>)>;
 fn well_shadows(palette: Palette, focused: bool) -> Vec<gpui::BoxShadow> {
     let mut shadows = lighting::recessed(palette.is_dark);
     if focused {
-        shadows.push(lighting::glow(palette.accent, 0.35, 3.0));
+        shadows.push(lighting::glow(
+            palette.accent,
+            FOCUSED_GLOW_OPACITY,
+            FOCUSED_GLOW_BLUR,
+        ));
     }
     shadows
 }
@@ -545,7 +632,7 @@ pub fn text_field<V: ControlHost>(
     div()
         .h(px(CONTROL_HEIGHT))
         .w_full()
-        .px(px(9.0))
+        .px(px(TEXT_FIELD_PAD_H))
         .flex()
         .items_center()
         .rounded(px(CONTROL_RADIUS))
@@ -592,11 +679,13 @@ pub fn text_area<V: ControlHost>(
             format!("text-area-{}", input.entity_id()).into(),
         ))
         .when_some(height, |el, h| el.h(px(h)))
-        .when(height.is_none(), |el| el.flex_1().min_h(px(40.0)))
-        .line_height(px(17.0))
+        .when(height.is_none(), |el| {
+            el.flex_1().min_h(px(TEXT_AREA_MIN_H))
+        })
+        .line_height(px(TEXT_AREA_LINE_HEIGHT))
         .w_full()
-        .px(px(10.0))
-        .py(px(8.0))
+        .px(px(TEXT_AREA_PAD_H))
+        .py(px(TEXT_AREA_PAD_V))
         .rounded(px(CONTROL_RADIUS))
         .bg(palette.area_surface)
         .border_1()
@@ -606,7 +695,7 @@ pub fn text_area<V: ControlHost>(
             palette.area_border
         })
         .shadow(well_shadows(palette, focused))
-        .when(!enabled, |el| el.opacity(0.5))
+        .when(!enabled, |el| el.opacity(DISABLED_OPACITY))
         .overflow_y_scroll()
         // A sideways gesture must not scroll this. GPUI maps an x-delta onto
         // y for a container that only scrolls vertically, so without this a
@@ -692,33 +781,23 @@ pub fn combo<V: ControlHost>(
     current_index: usize,
     options: &[String],
     width: Option<f32>,
-    palette: Palette,
-    view: &V,
-    cx: &mut Context<V>,
+    ctx: WidgetContext<'_, '_, '_, V>,
     on_select: impl Fn(&mut V, usize, &mut Window, &mut Context<V>) + 'static,
 ) -> impl IntoElement {
+    let palette = ctx.palette;
+    let view = ctx.view;
+    let cx: &mut Context<V> = &mut *ctx.cx;
     let dark = palette.is_dark;
     let state = view.control_state();
     let is_open = state.is_combo_open(id);
     let list_scroll = state.scroll(id);
     // The list keeps rendering while it fades back out after a close.
-    let closing_since = state.combo_closing.and_then(|(closing, since)| {
-        (closing == id && since.elapsed() < state.scaled(COMBO_REVEAL)).then_some(since)
-    });
-    let showing = is_open || closing_since.is_some();
     // Reveal progress: opacity, plus the short drift down into place a menu
     // makes, so the two things that drop out of a click arrive the same
-    // way. Opening eases out and closing eases in.
-    let reveal = if is_open {
-        state
-            .combo_opened_at
-            .map(|since| ease_out_cubic(progress(since, state.scaled(COMBO_REVEAL))))
-            .unwrap_or(1.0)
-    } else if let Some(since) = closing_since {
-        1.0 - ease_in_cubic(progress(since, state.scaled(COMBO_REVEAL)))
-    } else {
-        1.0
-    };
+    // way.
+    let fade = state.combo_fade(id);
+    let showing = fade.is_some();
+    let reveal = fade.map_or(1.0, |(reveal, _)| reveal);
     let drift = -4.0 * (1.0 - reveal);
 
     let display: SharedString = options
@@ -731,10 +810,10 @@ pub fn combo<V: ControlHost>(
     // The list lies over the row that was current when it opened — that
     // rather than `current_index`, which a pick changes under a list still
     // fading out.
-    let placement = combo_placement(state.combo_opened_on.unwrap_or(current_index), count);
+    let placement = combo_placement(state.combo_opened_on(id).unwrap_or(current_index), count);
     // Where the button was last frame, in window coordinates: what the list
     // is laid over, whatever the button is nested inside.
-    let button = state.track_bounds.get(id).copied();
+    let button = state.track(id);
     let weak = cx.entity().downgrade();
     let keyboard_at = if is_open {
         state.combo_highlight_or(current_index)
@@ -763,7 +842,7 @@ pub fn combo<V: ControlHost>(
                 move |bounds, _window, cx| {
                     if let Some(host) = weak.upgrade() {
                         host.update(cx, |host, _cx| {
-                            host.control_state_mut().track_bounds.insert(id, bounds);
+                            host.control_state_mut().record_track(id, bounds);
                         });
                     }
                 },
@@ -777,12 +856,12 @@ pub fn combo<V: ControlHost>(
                 .id(ElementId::Name(format!("{id}-toggle").into()))
                 .h(px(CONTROL_HEIGHT))
                 .w_full()
-                .pl(px(10.0))
-                .pr(px(28.0))
+                .pl(px(COMBO_PAD_L))
+                .pr(px(COMBO_PAD_R))
                 .flex()
                 .items_center()
                 .rounded(px(CONTROL_RADIUS))
-                .bg(lighting::lit(body_fill, 0.05))
+                .bg(lighting::lit(body_fill, COMBO_BODY_LIT))
                 .border_1()
                 .border_color(if is_open {
                     palette.accent
@@ -867,12 +946,7 @@ pub fn combo<V: ControlHost>(
                     // the list. Don't reopen it. The marker expires by
                     // itself, because the release that would clear it may
                     // land on an occluding surface and never arrive.
-                    let dismissed_recently = state
-                        .combo_dismissed_at
-                        .is_some_and(|since| since.elapsed() < COMBO_REVEAL);
-                    let dismissed = state.combo_dismissed.take();
-                    state.combo_dismissed_at = None;
-                    if dismissed_recently && dismissed == Some(id) {
+                    if state.take_combo_dismissal() == Some(id) {
                         cx.notify();
                         return;
                     }
@@ -915,9 +989,7 @@ pub fn combo<V: ControlHost>(
                                     el.occlude().on_mouse_down_out(cx.listener(
                                         move |this, _event, _window, cx| {
                                             let state = this.control_state_mut();
-                                            state.close_combo();
-                                            state.combo_dismissed = Some(id);
-                                            state.combo_dismissed_at = Some(Instant::now());
+                                            state.combo_pressed_outside(id);
                                             cx.notify();
                                         },
                                     ))
@@ -948,11 +1020,11 @@ pub fn combo<V: ControlHost>(
                                                     .h(px(COMBO_ROW_HEIGHT))
                                                     .flex_none()
                                                     .w_full()
-                                                    .px(px(9.0))
+                                                    .px(px(COMBO_ROW_PAD_H))
                                                     .flex()
                                                     .items_center()
                                                     .rounded(px(CONTROL_RADIUS - 1.0))
-                                                    .text_size(px(12.5))
+                                                    .text_size(px(COMBO_TEXT_SIZE))
                                                     .text_color(if highlighted {
                                                         palette.control_label
                                                     } else {
@@ -961,7 +1033,7 @@ pub fn combo<V: ControlHost>(
                                                     .when(highlighted, |elem| {
                                                         elem.bg(lighting::lit(
                                                             palette.control_fill,
-                                                            0.08,
+                                                            COMBO_ROW_SELECTED_LIT,
                                                         ))
                                                     })
                                                     .when(!highlighted, |elem| {
@@ -1007,25 +1079,25 @@ pub fn combo<V: ControlHost>(
 fn chevron_chip(fill: gpui::Rgba, chevron: gpui::Hsla, dark: bool) -> impl IntoElement {
     div()
         .absolute()
-        .right(px(5.0))
-        .top(px((CONTROL_HEIGHT - 2.0 - 18.0) / 2.0))
-        .w(px(18.0))
-        .h(px(18.0))
+        .right(px(CHEVRON_CHIP_INSET_R))
+        .top(px((CONTROL_HEIGHT - 2.0 - CHEVRON_CHIP_SIZE) / 2.0))
+        .w(px(CHEVRON_CHIP_SIZE))
+        .h(px(CHEVRON_CHIP_SIZE))
         .rounded(px(CONTROL_RADIUS - 2.0))
-        .bg(lighting::lit(fill, 0.12))
+        .bg(lighting::lit(fill, CHEVRON_CHIP_LIT))
         .shadow(lighting::raised(dark))
         .child(
             canvas(
                 |_bounds, _window, _cx| {},
                 move |bounds, _state, window, _cx| {
-                    let o = bounds.origin;
-                    let mut builder = PathBuilder::stroke(px(1.5));
-                    builder.move_to(point(o.x + px(5.5), o.y + px(7.5)));
-                    builder.line_to(point(o.x + px(9.0), o.y + px(4.0)));
-                    builder.line_to(point(o.x + px(12.5), o.y + px(7.5)));
-                    builder.move_to(point(o.x + px(5.5), o.y + px(10.5)));
-                    builder.line_to(point(o.x + px(9.0), o.y + px(14.0)));
-                    builder.line_to(point(o.x + px(12.5), o.y + px(10.5)));
+                    let origin = bounds.origin;
+                    let mut builder = PathBuilder::stroke(px(CHEVRON_STROKE_W));
+                    builder.move_to(point(origin.x + px(5.5), origin.y + px(7.5)));
+                    builder.line_to(point(origin.x + px(9.0), origin.y + px(4.0)));
+                    builder.line_to(point(origin.x + px(12.5), origin.y + px(7.5)));
+                    builder.move_to(point(origin.x + px(5.5), origin.y + px(10.5)));
+                    builder.line_to(point(origin.x + px(9.0), origin.y + px(14.0)));
+                    builder.line_to(point(origin.x + px(12.5), origin.y + px(10.5)));
                     if let Ok(path) = builder.build() {
                         window.paint_path(path, chevron);
                     }
@@ -1075,10 +1147,9 @@ pub fn slider<V: ControlHost>(
     id: ComboId,
     ratio: f32,
     track: SliderTrack,
-    palette: Palette,
-    view: &V,
-    cx: &mut Context<V>,
+    ctx: WidgetContext<'_, '_, '_, V>,
 ) -> impl IntoElement {
+    let WidgetContext { palette, view, cx } = ctx;
     let ratio = ratio.clamp(0.0, 1.0);
     let stops = track.stops();
     let weak = cx.entity().downgrade();
@@ -1087,9 +1158,9 @@ pub fn slider<V: ControlHost>(
     // motion, and a thumb trailing the pointer reads as lag.
     let state = view.control_state();
     let shown = if state.is_dragging(id) {
-        state.snap(format!("{id}-ratio"), ratio)
+        state.snap((id, "ratio"), ratio)
     } else {
-        state.tween(format!("{id}-ratio"), ratio, MOVE)
+        state.tween((id, "ratio"), ratio, MOVE)
     };
 
     // The keyboard lives on the thumb, not on the box around it. The thumb
@@ -1191,7 +1262,7 @@ pub(crate) fn track_probe<V: ControlHost>(
         move |bounds, _window, cx| {
             if let Some(host) = weak.upgrade() {
                 host.update(cx, |host, _cx| {
-                    host.control_state_mut().track_bounds.insert(id, bounds);
+                    host.control_state_mut().record_track(id, bounds);
                 });
             }
         },
@@ -1232,27 +1303,22 @@ pub fn checkbox<V: ControlHost>(
     checked: bool,
     label: Option<&str>,
     enabled: bool,
-    palette: Palette,
-    view: &V,
-    cx: &mut Context<V>,
+    ctx: WidgetContext<'_, '_, '_, V>,
     on_toggle: impl Fn(&mut V, bool, &mut Window, &mut Context<V>) + 'static,
 ) -> impl IntoElement {
     const BOX: f32 = 15.0;
-    let dark = palette.is_dark;
+    let dark = ctx.palette.is_dark;
+    let palette = ctx.palette;
     let tick: gpui::Hsla = crate::color::to_hsla(palette.control_label);
-    let label: Option<SharedString> = label.map(|text| text.to_string().into());
-
+    let label: Option<SharedString> = label.map(std::convert::Into::into);
     let on_toggle = Rc::new(on_toggle);
     let id: ElementId = id.into();
     let box_id = id.clone();
     // Noticed from the value, so a box ticked by a shortcut or by the host's
     // own code crosses over exactly as a click does. The well fills and
     // rises while the tick draws itself in; unticking runs it backwards.
-    let on = view.control_state().blend(
-        &ElementId::Name(format!("{box_id}-state").into()),
-        checked,
-        SWITCH_SLIDE,
-    );
+    let on = ctx.state().blend((&box_id, "state"), checked, SWITCH_SLIDE);
+    let cx: &mut Context<V> = &mut *ctx.cx;
     let fill = lighting::lit_mix(palette.field_surface, palette.control_fill, 0.1, on);
     let border = crate::color::lerp(
         palette.field_border_strong,
@@ -1302,12 +1368,12 @@ pub fn checkbox<V: ControlHost>(
                             move |bounds, _state, window, _cx| {
                                 // The tick grows out from the box's centre
                                 // and fades in as it comes.
-                                let o = bounds.origin;
+                                let origin = bounds.origin;
                                 let scale = 0.6 + 0.4 * on;
                                 let at = |x: f32, y: f32| {
                                     point(
-                                        o.x + px(7.5 + (x - 7.5) * scale),
-                                        o.y + px(7.5 + (y - 7.5) * scale),
+                                        origin.x + px(7.5 + (x - 7.5) * scale),
+                                        origin.y + px(7.5 + (y - 7.5) * scale),
                                     )
                                 };
                                 let mut tick = tick;
@@ -1365,11 +1431,12 @@ pub fn segmented<V: ControlHost>(
     options: &[String],
     selected: usize,
     enabled: bool,
-    palette: Palette,
-    view: &V,
-    cx: &mut Context<V>,
+    ctx: WidgetContext<'_, '_, '_, V>,
     on_select: impl Fn(&mut V, usize, &mut Window, &mut Context<V>) + 'static,
 ) -> impl IntoElement {
+    let palette = ctx.palette;
+    let view = ctx.view;
+    let cx: &mut Context<V> = &mut *ctx.cx;
     let dark = palette.is_dark;
     let on_select = Rc::new(on_select);
     let fill = palette.control_fill;
@@ -1397,21 +1464,16 @@ pub fn segmented<V: ControlHost>(
     // frame there is nothing to slide and the selected option draws its own
     // fill instead — which looks the same, and is what the pill takes over.
     let pill = state
-        .group_bounds
-        .get(id)
-        .zip(state.slot_bounds.get(id))
-        .and_then(|(group, slots)| {
-            let slot = slots.get(selected)?;
+        .group(id)
+        .zip(state.slot(id, selected))
+        .map(|(group, slot)| {
             // Both probes report padding boxes, and an absolute child is
             // positioned against its parent's, so the difference is the
             // pill's `left` exactly.
             let x = f32::from(slot.origin.x) - f32::from(group.origin.x);
-            Some((x, f32::from(slot.size.width)))
-        })
-        .map(|(x, width)| {
             (
-                state.tween(format!("{id}-pill-x"), x, MOVE),
-                state.tween(format!("{id}-pill-w"), width, MOVE),
+                state.tween((id, "pill-x"), x, MOVE),
+                state.tween((id, "pill-w"), f32::from(slot.size.width), MOVE),
             )
         });
 
@@ -1427,11 +1489,7 @@ pub fn segmented<V: ControlHost>(
         let active = index == selected;
         let click_focus = focus.clone();
         // The label crosses over at the same time as the pill arrives.
-        let on = state.blend(
-            &ElementId::NamedInteger(format!("{id}-segment-on").into(), index as u64),
-            active,
-            SWITCH_SLIDE,
-        );
+        let on = state.blend((id, "segment-on", index), active, SWITCH_SLIDE);
         // The selected segment is the one with a fill, so it is the one the
         // ring can sit on — and it is the option the arrows are pointing at.
         let segment_arrows = if active { arrows.take() } else { None };
@@ -1530,11 +1588,7 @@ fn slot_probe<V: ControlHost>(
         move |bounds, _window, cx| {
             if let Some(host) = weak.upgrade() {
                 host.update(cx, |host, _cx| {
-                    let slots = host.control_state_mut().slot_bounds.entry(id).or_default();
-                    if slots.len() <= slot {
-                        slots.resize(slot + 1, bounds);
-                    }
-                    slots[slot] = bounds;
+                    host.control_state_mut().record_slot(id, slot, bounds);
                 });
             }
         },
@@ -1547,19 +1601,17 @@ fn slot_probe<V: ControlHost>(
     .bottom_0()
 }
 
-/// Records an element's bounds into `ControlState::measured` under `key`, for
-/// anything that has to know a size before it can be laid out to it.
+/// Remembers an element's bounds in [`ControlState::measured`] under `tag`,
+/// for anything that has to know a size before it can be laid out to it.
 pub(crate) fn measure_probe<V: ControlHost>(
-    key: ElementId,
+    tag: Tag,
     weak: gpui::WeakEntity<V>,
 ) -> impl IntoElement {
     canvas(
         move |bounds, _window, cx| {
             if let Some(host) = weak.upgrade() {
                 host.update(cx, |host, _cx| {
-                    host.control_state_mut()
-                        .measured
-                        .insert(key.clone(), bounds);
+                    host.control_state_mut().measure(tag, bounds);
                 });
             }
         },
@@ -1579,7 +1631,7 @@ fn group_probe<V: ControlHost>(id: ComboId, weak: gpui::WeakEntity<V>) -> impl I
         move |bounds, _window, cx| {
             if let Some(host) = weak.upgrade() {
                 host.update(cx, |host, _cx| {
-                    host.control_state_mut().group_bounds.insert(id, bounds);
+                    host.control_state_mut().record_group(id, bounds);
                 });
             }
         },
@@ -1727,20 +1779,19 @@ pub fn scrollbar<V: ControlHost>(
     id: &'static str,
     handle: &ScrollHandle,
     axis: ScrollAxis,
-    palette: Palette,
-    view: &V,
-    cx: &mut Context<V>,
+    ctx: WidgetContext<'_, '_, '_, V>,
 ) -> gpui::AnyElement {
     use crate::scroll::{apply_scroll_drag, scrollbar_geometry};
+    let WidgetContext { palette, view, cx } = ctx;
 
     let Some(geometry) = scrollbar_geometry(handle, axis) else {
         return div().absolute().into_any_element();
     };
     // A bar that appears because the content just grew fades in rather than
     // switching on beside it.
-    let shown =
-        view.control_state()
-            .tween_from(format!("scrollbar-{id}-shown"), 0.0, 1.0, SWITCH_SLIDE);
+    let shown = view
+        .control_state()
+        .tween_from(("scrollbar", id, "shown"), 0.0, 1.0, SWITCH_SLIDE);
     let mut thumb_color: gpui::Hsla = crate::color::to_hsla(palette.text_secondary);
     thumb_color.alpha = 0.24;
 
@@ -1775,7 +1826,7 @@ pub fn scrollbar<V: ControlHost>(
                     grab,
                 };
                 apply_scroll_drag(&drag, position);
-                this.control_state_mut().scroll_drag = Some(drag);
+                this.control_state_mut().begin_scroll_drag(drag);
                 cx.notify();
             }),
         )
@@ -1879,24 +1930,21 @@ pub fn chip<V: ControlHost>(
     label: &str,
     selected: bool,
     enabled: bool,
-    palette: Palette,
-    view: &V,
-    cx: &mut Context<V>,
+    ctx: WidgetContext<'_, '_, '_, V>,
     on_click: impl Fn(&mut V, &mut Window, &mut Context<V>) + 'static,
 ) -> impl IntoElement {
+    let WidgetContext { palette, view, cx } = ctx;
     let dark = palette.is_dark;
-    let text: SharedString = label.to_string().into();
+    let text: SharedString = SharedString::from(label);
     let on_click = Rc::new(on_click);
     let id: ElementId = id.into();
     let chip_id = id.clone();
     // Selected takes the accent; the rest stay quiet, so one chip reads out
     // of a field of them at a glance. The accent washes in rather than
     // switching on, whoever toggled the chip.
-    let on = view.control_state().blend(
-        &ElementId::Name(format!("{chip_id}-state").into()),
-        selected,
-        SWITCH_SLIDE,
-    );
+    let on = view
+        .control_state()
+        .blend((&chip_id, "state"), selected, SWITCH_SLIDE);
     let mix = |a, b| crate::color::lerp(a, b, on);
     let fill = mix(palette.soft_fill, palette.control_fill);
     let fill_hover = mix(palette.soft_fill_hover, palette.control_fill);
@@ -1970,18 +2018,13 @@ pub fn chip_group<V: ControlHost>(
     options: &[String],
     selected: ChipSelection<'_>,
     enabled: bool,
-    palette: Palette,
-    view: &V,
-    cx: &mut Context<V>,
+    mut ctx: WidgetContext<'_, '_, '_, V>,
     on_select: impl Fn(&mut V, usize, &mut Window, &mut Context<V>) + 'static,
 ) -> impl IntoElement {
     let on_select = Rc::new(on_select);
 
     let mut chips: Vec<gpui::AnyElement> = Vec::with_capacity(options.len());
     for (index, option) in options.iter().enumerate() {
-        // Fresh reborrow per chip: the listener closure takes `cx` by move,
-        // and the loop needs it again next time round.
-        let cx: &mut Context<V> = &mut *cx;
         let on_select = on_select.clone();
         chips.push(
             chip(
@@ -1989,9 +2032,7 @@ pub fn chip_group<V: ControlHost>(
                 option,
                 selected.holds(index),
                 enabled,
-                palette,
-                view,
-                cx,
+                ctx.reborrow(),
                 move |this, window, cx| on_select(this, index, window, cx),
             )
             .into_any_element(),
@@ -2049,11 +2090,12 @@ pub fn radio_group<V: ControlHost>(
     choices: &[Choice],
     selected: usize,
     enabled: bool,
-    palette: Palette,
-    view: &V,
-    cx: &mut Context<V>,
+    ctx: WidgetContext<'_, '_, '_, V>,
     on_select: impl Fn(&mut V, usize, &mut Window, &mut Context<V>) + 'static,
 ) -> impl IntoElement {
+    let palette = ctx.palette;
+    let view = ctx.view;
+    let cx: &mut Context<V> = &mut *ctx.cx;
     let dark = palette.is_dark;
     let on_select = Rc::new(on_select);
     // The group's handle, which sits on whichever choice is current. It has
@@ -2097,11 +2139,9 @@ pub fn radio_group<V: ControlHost>(
         let click_focus = focus.clone();
         // The core grows into the chosen dot and shrinks out of the one it
         // left, so the choice is seen to move rather than to reappear.
-        let on = view.control_state().blend(
-            &ElementId::NamedInteger(format!("{id}-choice-on").into(), index as u64),
-            active,
-            SWITCH_SLIDE,
-        );
+        let on = view
+            .control_state()
+            .blend((id, "choice-on", index), active, SWITCH_SLIDE);
         // Only the current choice carries the handle and the arrow keys.
         let dot_arrows = if active { arrows.take() } else { None };
         rows.push(
@@ -2258,12 +2298,12 @@ pub fn search_field<V: ControlHost>(
                     canvas(
                         |_bounds, _window, _cx| {},
                         move |bounds, _state, window, _cx| {
-                            let o = bounds.origin;
+                            let origin = bounds.origin;
                             let mut builder = PathBuilder::stroke(px(1.3));
                             // A ring approximated by a dodecagon: at 10px
                             // across, a circle and this are the same
                             // picture, and this needs no curve support.
-                            let (cx_, cy, r) = (o.x + px(6.0), o.y + px(6.0), 4.3f32);
+                            let (cx_, cy, r) = (origin.x + px(6.0), origin.y + px(6.0), 4.3f32);
                             for step in 0..=12 {
                                 let angle = step as f32 * std::f32::consts::TAU / 12.0;
                                 let at = point(cx_ + px(r * angle.cos()), cy + px(r * angle.sin()));
@@ -2273,8 +2313,8 @@ pub fn search_field<V: ControlHost>(
                                     builder.line_to(at);
                                 }
                             }
-                            builder.move_to(point(o.x + px(9.2), o.y + px(9.2)));
-                            builder.line_to(point(o.x + px(13.0), o.y + px(13.0)));
+                            builder.move_to(point(origin.x + px(9.2), origin.y + px(9.2)));
+                            builder.line_to(point(origin.x + px(13.0), origin.y + px(13.0)));
                             if let Ok(path) = builder.build() {
                                 window.paint_path(path, glyph);
                             }
@@ -2360,8 +2400,8 @@ pub fn spinner(size: f32, palette: Palette) -> impl IntoElement {
         canvas(
             |_bounds, _window, _cx| {},
             move |bounds, _state, window, _cx| {
-                let o = bounds.origin;
-                let centre = point(o.x + px(size / 2.0), o.y + px(size / 2.0));
+                let origin = bounds.origin;
+                let centre = point(origin.x + px(size / 2.0), origin.y + px(size / 2.0));
                 let mut builder = PathBuilder::stroke(px(1.8));
                 // Three quarters of a ring: the gap is what makes the
                 // rotation visible at all.
@@ -2420,7 +2460,7 @@ pub fn badge(text: &str, tone: BadgeTone, palette: Palette) -> impl IntoElement 
         .font_weight(FontWeight::MEDIUM)
         .text_color(label)
         .whitespace_nowrap()
-        .child(SharedString::from(text.to_string()))
+        .child(SharedString::from(text))
 }
 
 #[cfg(test)]

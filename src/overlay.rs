@@ -8,12 +8,12 @@ use gpui::{
     MouseButton, MouseDownEvent, Render, SharedString, Window, deferred, div, prelude::*, px,
 };
 
-use crate::controls::search_field;
+use crate::controls::{WidgetContext, search_field};
 use crate::easing::{ease_out_cubic, progress};
 use crate::keyboard::{self, Dismiss, Key, Orientation};
 use crate::lighting;
 use crate::palette::Palette;
-use crate::state::{COMBO_REVEAL, ComboId, ControlHost, MOVE, SWITCH_SLIDE};
+use crate::state::{COMBO_REVEAL, ComboId, ControlHost, MOVE, SWITCH_SLIDE, Tag};
 use crate::text_input::{self as text, TextInput};
 
 // ---- Tooltip ----------------------------------------------------------------
@@ -252,11 +252,10 @@ pub fn command_list<V: ControlHost>(
     id: &'static str,
     matches: &[Command],
     highlighted: usize,
-    palette: Palette,
-    view: &V,
-    cx: &mut Context<V>,
+    ctx: WidgetContext<'_, '_, '_, V>,
     on_activate: impl Fn(&mut V, SharedString, &mut Window, &mut Context<V>) + 'static,
 ) -> Div {
+    let WidgetContext { palette, view, cx } = ctx;
     // A concrete `Div` rather than `impl IntoElement`: in the 2024 edition an
     // opaque return captures every input lifetime, which would keep `cx`
     // borrowed for as long as the list lived and stop the caller building
@@ -274,10 +273,10 @@ pub fn command_list<V: ControlHost>(
         let on_activate = on_activate.clone();
         let command_id = command.id.clone();
         let active = index == highlighted;
-        let key = |what: &str| ElementId::Name(format!("{id}-{what}-{command_id}").into());
+        let key = |what: &'static str| Tag::new((id, what, &command_id));
         // Keyed by the command rather than the row, so the highlight and the
         // fade belong to the command as it moves.
-        let on = state.blend(&key("lit"), active, SWITCH_SLIDE);
+        let on = state.blend(key("lit"), active, SWITCH_SLIDE);
         let shown = if fresh {
             state.tween(key("shown"), 1.0, SWITCH_SLIDE)
         } else {
@@ -369,14 +368,14 @@ pub fn search_list<V: ControlHost>(
     id: &'static str,
     query: &Entity<TextInput>,
     items: &[Command],
-    palette: Palette,
-    view: &V,
+    mut ctx: WidgetContext<'_, '_, '_, V>,
     window: &Window,
-    cx: &mut Context<V>,
     on_activate: impl Fn(&mut V, SharedString, &mut Window, &mut Context<V>) + 'static,
 ) -> Div {
+    let palette = ctx.palette;
+    let view = ctx.view;
     let on_activate: Activate<V> = Rc::new(on_activate);
-    let text = query.read(cx).text();
+    let text = query.read(ctx.cx).text();
     let matches = fuzzy_filter(&text, items);
     let highlighted = view
         .control_state()
@@ -388,12 +387,11 @@ pub fn search_list<V: ControlHost>(
             id,
             &matches,
             highlighted,
-            palette,
-            view,
-            cx,
+            ctx.reborrow(),
             move |view, id, window, cx| on_activate(view, id, window, cx),
         )
     };
+    let cx: &mut Context<V> = &mut *ctx.cx;
     let ids = matches.iter().map(|command| command.id.clone()).collect();
     let list = div()
         .flex()
@@ -459,12 +457,12 @@ pub fn command_palette<V: ControlHost>(
     id: ComboId,
     query: &Entity<TextInput>,
     commands: &[Command],
-    palette: Palette,
-    view: &V,
+    mut ctx: WidgetContext<'_, '_, '_, V>,
     window: &Window,
-    cx: &mut Context<V>,
     on_activate: impl Fn(&mut V, SharedString, &mut Window, &mut Context<V>) + 'static,
 ) -> Option<impl IntoElement> {
+    let palette = ctx.palette;
+    let view = ctx.view;
     let state = view.control_state();
     let opened_at = state
         .palette_overlay
@@ -479,14 +477,14 @@ pub fn command_palette<V: ControlHost>(
     // The panel arrives the way a menu does: the same reveal, a short drift
     // down into place.
     let reveal = ease_out_cubic(progress(opened_at, state.scaled(COMBO_REVEAL)));
-    let list_scroll = state.scroll(ElementId::Name(format!("{id}-list").into()));
+    let list_scroll = state.scroll((id, "list"));
     let fill = if dark {
         palette.soft_fill
     } else {
         palette.field_surface
     };
 
-    let text = query.read(cx).text();
+    let text = query.read(ctx.cx).text();
     let matches = fuzzy_filter(&text, commands);
     let highlighted = state
         .list_highlight(id, &text)
@@ -498,12 +496,11 @@ pub fn command_palette<V: ControlHost>(
             id,
             &matches,
             highlighted,
-            palette,
-            view,
-            cx,
+            ctx.reborrow(),
             move |view, id, window, cx| on_activate(view, id, window, cx),
         )
     };
+    let cx: &mut Context<V> = &mut *ctx.cx;
     let ids = matches.iter().map(|command| command.id.clone()).collect();
 
     let panel = div()

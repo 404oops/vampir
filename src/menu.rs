@@ -23,6 +23,7 @@ use gpui::{
     Window, anchored, canvas, deferred, div, point, prelude::*, px,
 };
 
+use crate::controls::WidgetContext;
 use crate::keyboard::{self, Dismiss, Key, Orientation};
 use crate::lighting;
 use crate::palette::Palette;
@@ -199,11 +200,9 @@ pub fn context_menu<V: ControlHost>(
     for (index, item) in items.into_iter().enumerate() {
         let lit = highlight.is_some_and(|at| reachable.get(at) == Some(&index));
         // The keyboard's wash moves from row to row rather than jumping.
-        let lit = view.control_state().blend(
-            &ElementId::NamedInteger(format!("{id}-menu-lit").into(), index as u64),
-            lit,
-            crate::state::SWITCH_SLIDE,
-        );
+        let lit =
+            view.control_state()
+                .blend((id, "menu-lit", index), lit, crate::state::SWITCH_SLIDE);
         rows.push(render_item(
             index,
             item,
@@ -336,8 +335,7 @@ pub fn context_menu<V: ControlHost>(
                                 // open it straight back up.
                                 let on_own_button = this
                                     .control_state()
-                                    .track_bounds
-                                    .get(id)
+                                    .track(id)
                                     .is_some_and(|bounds| bounds.contains(&event.position));
                                 if on_own_button {
                                     return;
@@ -485,11 +483,11 @@ fn render_item<V: ControlHost>(
                             canvas(
                                 |_bounds, _window, _cx| {},
                                 move |bounds, _state, window, _cx| {
-                                    let o = bounds.origin;
+                                    let origin = bounds.origin;
                                     let mut builder = gpui::PathBuilder::stroke(px(1.5));
-                                    builder.move_to(point(o.x + px(1.5), o.y + px(6.0)));
-                                    builder.line_to(point(o.x + px(4.5), o.y + px(9.0)));
-                                    builder.line_to(point(o.x + px(10.5), o.y + px(2.5)));
+                                    builder.move_to(point(origin.x + px(1.5), origin.y + px(6.0)));
+                                    builder.line_to(point(origin.x + px(4.5), origin.y + px(9.0)));
+                                    builder.line_to(point(origin.x + px(10.5), origin.y + px(2.5)));
                                     if let Ok(path) = builder.build() {
                                         window.paint_path(path, tick);
                                     }
@@ -521,10 +519,9 @@ pub fn menu_button<V: ControlHost>(
     id: ComboId,
     label: &str,
     enabled: bool,
-    palette: Palette,
-    view: &V,
-    cx: &mut Context<V>,
+    ctx: WidgetContext<'_, '_, '_, V>,
 ) -> impl IntoElement {
+    let WidgetContext { palette, view, cx } = ctx;
     let dark = palette.is_dark;
     let open = view.control_state().is_menu_open(id);
     let fill = if dark {
@@ -566,7 +563,7 @@ pub fn menu_button<V: ControlHost>(
                 move |bounds, _window, cx| {
                     if let Some(host) = weak.upgrade() {
                         host.update(cx, |host, _cx| {
-                            host.control_state_mut().track_bounds.insert(id, bounds);
+                            host.control_state_mut().record_track(id, bounds);
                         });
                     }
                 },
@@ -581,11 +578,11 @@ pub fn menu_button<V: ControlHost>(
                 canvas(
                     |_bounds, _window, _cx| {},
                     move |bounds, _state, window, _cx| {
-                        let o = bounds.origin;
+                        let origin = bounds.origin;
                         let mut builder = gpui::PathBuilder::stroke(px(1.4));
-                        builder.move_to(point(o.x + px(0.5), o.y + px(3.0)));
-                        builder.line_to(point(o.x + px(4.5), o.y + px(7.0)));
-                        builder.line_to(point(o.x + px(8.5), o.y + px(3.0)));
+                        builder.move_to(point(origin.x + px(0.5), origin.y + px(3.0)));
+                        builder.line_to(point(origin.x + px(4.5), origin.y + px(7.0)));
+                        builder.line_to(point(origin.x + px(8.5), origin.y + px(3.0)));
                         if let Ok(path) = builder.build() {
                             let color: gpui::Hsla = crate::color::to_hsla(palette.text_secondary);
                             window.paint_path(path, color);
@@ -600,7 +597,7 @@ pub fn menu_button<V: ControlHost>(
                 let state = this.control_state_mut();
                 if state.is_menu_open(id) {
                     state.close_menu();
-                } else if let Some(bounds) = state.track_bounds.get(id).copied() {
+                } else if let Some(bounds) = state.track(id) {
                     state.open_menu_under(id, bounds, "");
                 }
                 cx.notify();
