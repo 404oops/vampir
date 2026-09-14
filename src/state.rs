@@ -1952,10 +1952,15 @@ mod tests {
 
     /// Slow motion stretches every duration, so a slide that would be over
     /// is still under way.
+    ///
+    /// The scale is huge on purpose: a millisecond becomes a quarter of an
+    /// hour, so a test runner that stalls for a second between two lines,
+    /// as a loaded CI machine does, still reads a slide that has barely
+    /// begun.
     #[test]
     fn time_scale_stretches_every_duration() {
         let mut state = ControlState::new();
-        state.set_time_scale(1000.0);
+        state.set_time_scale(1_000_000.0);
         state.tween("x", 0.0, std::time::Duration::from_millis(1));
         state.tween("x", 1.0, std::time::Duration::from_millis(1));
         std::thread::sleep(std::time::Duration::from_millis(10));
