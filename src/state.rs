@@ -278,15 +278,22 @@ pub struct TabDrag {
     pub from: usize,
     /// Where it would land if released now.
     pub to: usize,
-    /// Whether the pointer has actually moved. A press that never moves is a
-    /// click on the tab, not a reorder.
+    /// Whether the pointer has travelled far enough from the press to count
+    /// as a drag. Until then the gesture is a click on the tab, not a
+    /// reorder: a real click almost always wobbles a pixel between press and
+    /// release, and that must still select the tab.
     pub moved: bool,
     /// How far into the tab the pointer took hold, in window x, so the tab
     /// rides under the hand where it was grabbed rather than by its edge.
     pub grab: f32,
+    /// Where the pointer was pressed, in window x.
+    pub pressed: f32,
     /// Where the pointer is now, in window x.
     pub pointer: f32,
 }
+
+/// How far a pressed tab has to travel before the press becomes a drag.
+pub const TAB_DRAG_THRESHOLD: f32 = 4.0;
 
 /// The one gesture the controls can have in flight. One pointer, one
 /// gesture: a thumb, a track and a tab cannot be held at once, so they
@@ -1300,36 +1307,57 @@ impl ControlState {
     /// so every move during a drag is a redraw, and some moves also change
     /// the landing slot.
     ///
-    /// A tab moves only once the pointer is past the midpoint of its
+    /// Nothing happens until the pointer is [`TAB_DRAG_THRESHOLD`] from
+    /// where it pressed: a click that wobbles a pixel stays a click. Past
+    /// that, a tab moves only once the pointer is past the midpoint of its
     /// neighbour, so a tab never swaps back and forth under a still hand.
+    /// It keeps going while the pointer is past the next neighbour too, so
+    /// a fling that clears several tabs in one event lands where the hand
+    /// stopped rather than one slot along.
     pub fn drag_tab_to(&mut self, position: Point<Pixels>) -> bool {
         let pointer = f32::from(position.x);
         let Some(Drag::Tab(drag)) = &self.drag else {
             return false;
         };
-        let (bar, to) = (drag.bar, drag.to);
-        let mut target = None;
-        if let Some(current) = self.slot(bar, to) {
-            if pointer < f32::from(current.left())
-                && to > 0
-                && let Some(previous) = self.slot(bar, to - 1)
-                && pointer < f32::from(previous.center().x)
-            {
-                target = Some(to - 1);
+        if !drag.moved && (pointer - drag.pressed).abs() < TAB_DRAG_THRESHOLD {
+            return false;
+        }
+        let (bar, mut to) = (drag.bar, drag.to);
+        // Only walk one way: slots are last frame's geometry, and walking
+        // back over ground just covered could otherwise loop for ever.
+        let leftwards = self
+            .slot(bar, to)
+            .is_some_and(|current| pointer < f32::from(current.left()));
+        while let Some(current) = self.slot(bar, to) {
+            let next = if leftwards {
+                if pointer >= f32::from(current.left()) || to == 0 {
+                    break;
+                }
+                to - 1
+            } else {
+                if pointer <= f32::from(current.right()) {
+                    break;
+                }
+                to + 1
+            };
+            let Some(neighbour) = self.slot(bar, next) else {
+                break;
+            };
+            let centre = f32::from(neighbour.center().x);
+            let past = if leftwards {
+                pointer < centre
+            } else {
+                pointer > centre
+            };
+            if !past {
+                break;
             }
-            if pointer > f32::from(current.right())
-                && let Some(next) = self.slot(bar, to + 1)
-                && pointer > f32::from(next.center().x)
-            {
-                target = Some(to + 1);
-            }
+            to = next;
         }
         if let Some(Drag::Tab(drag)) = &mut self.drag {
             drag.pointer = pointer;
             drag.moved = true;
-            if let Some(to) = target {
-                drag.to = to;
-            }
+            drag.to = to;
         }
         true
     }
@@ -2031,6 +2059,7 @@ mod tests {
             to: 0,
             moved: false,
             grab: 0.0,
+            pressed: 0.0,
             pointer: 0.0,
         });
         assert!(!state.track_dragging(), "the tab took over");
@@ -2050,8 +2079,14 @@ mod tests {
             to: 0,
             moved: false,
             grab: 10.0,
+            pressed: 10.0,
             pointer: 10.0,
         });
+        assert!(
+            !state.drag_tab_to(at(11.0, 10.0)),
+            "a one-pixel wobble is still a click"
+        );
+        assert_eq!(state.tab_drag().map(|drag| drag.moved), Some(false));
         assert!(
             state.drag_tab_to(at(40.0, 10.0)),
             "every move during a drag redraws"
@@ -2062,6 +2097,36 @@ mod tests {
             "not past the neighbour's middle"
         );
         state.drag_tab_to(at(130.0, 10.0));
+        assert_eq!(state.tab_drag().map(|drag| drag.to), Some(1));
+        assert_eq!(state.end_drag(), Some(("tabs", 0, 1)));
+    }
+
+    /// One move event that clears several tabs lands where the pointer is,
+    /// not one slot along; and the walk back goes the same way.
+    #[test]
+    fn a_fling_lands_where_the_pointer_stops() {
+        let mut state = ControlState::new();
+        for slot in 0..4 {
+            let left = slot as f32 * 82.0;
+            state.record_slot("tabs", slot, rect(left, 0.0, 80.0, 26.0));
+        }
+        state.begin_tab_drag(TabDrag {
+            bar: "tabs",
+            from: 0,
+            to: 0,
+            moved: false,
+            grab: 10.0,
+            pressed: 10.0,
+            pointer: 10.0,
+        });
+        // Past the middle of slot 3 (centre 286) in one go.
+        state.drag_tab_to(at(300.0, 10.0));
+        assert_eq!(state.tab_drag().map(|drag| drag.to), Some(3));
+        // Back to just past the middle of slot 1 (centre 122).
+        state.drag_tab_to(at(120.0, 10.0));
+        assert_eq!(state.tab_drag().map(|drag| drag.to), Some(1));
+        // Short of the middle of slot 0 (centre 40): stays.
+        state.drag_tab_to(at(50.0, 10.0));
         assert_eq!(state.tab_drag().map(|drag| drag.to), Some(1));
         assert_eq!(state.end_drag(), Some(("tabs", 0, 1)));
     }

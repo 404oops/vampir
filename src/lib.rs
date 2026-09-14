@@ -87,8 +87,8 @@ pub use scroll::{SCROLL_FADE, ScrollAxis, ScrollDrag, apply_scroll_drag, scroll_
 pub use shortcut::{Chord, display, display_keystroke, shortcut_recorder};
 pub use state::{
     COMBO_REVEAL, ComboId, ControlHost, ControlState, MOVE, OpenCombo, OpenDialog, OpenMenu,
-    OpenPalette, SCHEME_FADE, SWITCH_SLIDE, TabDrag, Tag, TrackAxis, TrackDrag, continue_drags,
-    end_drags, handle_mouse, mouse_moved,
+    OpenPalette, SCHEME_FADE, SWITCH_SLIDE, TAB_DRAG_THRESHOLD, TabDrag, Tag, TrackAxis, TrackDrag,
+    continue_drags, end_drags, handle_mouse, mouse_moved,
 };
 pub use swatch::{MAX_CHROMA, Oklch, color_pad, hue_slider, hue_wheel, swatch_grid};
 pub use text_input::{Highlighter, InputStyle, Span, TextInput};

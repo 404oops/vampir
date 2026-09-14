@@ -351,6 +351,7 @@ pub fn tab_bar<V: ControlHost>(
                             to: slot,
                             moved: false,
                             grab,
+                            pressed: pointer,
                             pointer,
                         });
                         cx.notify();
@@ -362,11 +363,15 @@ pub fn tab_bar<V: ControlHost>(
                 .on_mouse_up(
                     MouseButton::Left,
                     cx.listener(move |this, _event, window, cx| {
-                        let was_reorder = this
+                        // Only a press on this very tab that never became a
+                        // drag is a click on it. A release here after a
+                        // press elsewhere (the well, a slider, the ✕) is
+                        // not.
+                        let clicked = this
                             .control_state()
                             .tab_drag()
-                            .is_some_and(|drag| drag.moved);
-                        if !was_reorder {
+                            .is_some_and(|drag| drag.bar == id && drag.from == slot && !drag.moved);
+                        if clicked {
                             // Clicking a tab puts the keyboard on the bar, so
                             // Tab carries on from the tab just chosen.
                             window.focus(&click_focus, cx);
@@ -383,6 +388,12 @@ pub fn tab_bar<V: ControlHost>(
                         tab_close_glyph()
                             .id(element("tab-close"))
                             .hover(move |style| style.bg(palette.row_hover))
+                            // A press on the ✕ is not a hold on the tab: it
+                            // must neither start a reorder nor, on release,
+                            // select a tab that has just been closed.
+                            .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                                cx.stop_propagation()
+                            })
                             .on_click(cx.listener(move |this, _event, window, cx| {
                                 on_close(this, index, window, cx);
                                 cx.notify();
