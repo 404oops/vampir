@@ -308,12 +308,12 @@ pub fn tree_row<V: ControlHost>(
             // A double-click on a branch opens or closes it, as it does in
             // every file browser. The first click of the pair has already
             // selected the row, so this only adds the toggle.
-            if event.click_count() == 2 {
-                if let Some(open) = expanded {
-                    dbl_toggle(this, row_id.clone(), !open, window, cx);
-                    cx.notify();
-                    return;
-                }
+            if event.click_count() == 2
+                && let Some(open) = expanded
+            {
+                dbl_toggle(this, row_id.clone(), !open, window, cx);
+                cx.notify();
+                return;
             }
             on_select(this, row_id.clone(), window, cx);
             cx.notify();

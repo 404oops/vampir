@@ -48,5 +48,5 @@ jobs:
         run: cargo build --example gallery
 
       # The library's own promise: two dependencies, on every platform.
-      - name: Build the core alone
-        run: cargo build --no-default-features
+      - name: Test without the app icon
+        run: cargo test --no-default-features

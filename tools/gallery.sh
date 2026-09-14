@@ -18,6 +18,7 @@
 #   tools/gallery.sh park                    move the pointer off the window
 #   tools/gallery.sh bounds                  the window: X Y W H on screen
 #   tools/gallery.sh shot out.png [X Y W H]  the window, or a region of it
+#   tools/gallery.sh shot --no-park out.png preserve keyboard focus rings
 #   tools/gallery.sh ink out.png Y0 Y1 X0 X1 first and last inked column
 #   tools/gallery.sh screenshots             regenerate docs/*.png
 #   tools/gallery.sh quit
@@ -165,7 +166,11 @@ park() {
 # The window, or a window-relative region of it, at 1x.
 shot() {
 	activate
-	park
+	if [ "${1:-}" = --no-park ]; then
+		shift
+	else
+		park
+	fi
 	read -r wx wy ww wh <<<"$(bounds)"
 	if [ "$#" -ge 5 ]; then
 		screencapture -x -o -R "$((wx + $2)),$((wy + $3)),$4,$5" "$1"

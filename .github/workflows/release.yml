@@ -3,13 +3,8 @@ name: Release
 # Pushing a tag such as v0.2.0 runs the checks, publishes a GitHub release and
 # publishes the crate to crates.io.
 #
-# crates.io publishing has a precondition this repository does not yet meet:
-# every dependency must come from a registry, and `gpui` is pinned to Zed's git
-# main because the registry release lags behind the APIs the toolkit uses. The
-# publish job checks for that first and fails with a plain message rather than
-# a cargo error, so the GitHub release still happens. When gpui publishes a
-# release this builds against, change the dependency to a version and the
-# same tag will publish the crate.
+# GPUI comes from the gpui-ce registry release. The publish job guards
+# against accidentally restoring a git dependency, which crates.io rejects.
 #
 # Authentication is crates.io Trusted Publishing: no token is stored here. On
 # crates.io, under the crate's settings, add this repository and workflow file

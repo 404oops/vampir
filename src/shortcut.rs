@@ -4,9 +4,11 @@
 //! result is the host's business, because only the host knows what its
 //! actions are and gpui wants a keymap, not a widget, to own them.
 
+use std::rc::Rc;
+
 use gpui::{
-    Context, ElementId, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, SharedString, Window,
-    div, prelude::*, px,
+    Context, ElementId, KeyDownEvent, KeyUpEvent, Keystroke, SharedString, Window, div, prelude::*,
+    px,
 };
 
 use crate::controls::WidgetContext;
@@ -30,7 +32,10 @@ pub struct Chord {
 /// Command-S, every one of those presses arrives here, and recording the
 /// first would end the capture before they got to the letter.
 pub fn chord_from(event: &KeyDownEvent) -> Option<Chord> {
-    let keystroke = &event.keystroke;
+    chord_for_keystroke(&event.keystroke)
+}
+
+fn chord_for_keystroke(keystroke: &Keystroke) -> Option<Chord> {
     let key = keystroke.key.as_str();
     if key.is_empty() || matches!(key, "cmd" | "ctrl" | "alt" | "shift" | "fn" | "function") {
         return None;
@@ -49,6 +54,9 @@ pub fn chord_from(event: &KeyDownEvent) -> Option<Chord> {
     }
     if modifiers.platform {
         parts.push("cmd");
+    }
+    if modifiers.function {
+        parts.push("fn");
     }
     parts.push(key);
 
@@ -82,6 +90,9 @@ pub fn display_keystroke(keystroke: &Keystroke) -> String {
         if modifiers.platform {
             display.push('\u{2318}');
         }
+        if modifiers.function {
+            display.push_str("Fn");
+        }
         display.push_str(&key);
         display
     } else {
@@ -104,6 +115,9 @@ pub fn display_keystroke(keystroke: &Keystroke) -> String {
         }
         if modifiers.shift {
             parts.push("Shift".into());
+        }
+        if modifiers.function {
+            parts.push("Fn".into());
         }
         parts.push(key);
         parts.join("+")
@@ -151,6 +165,7 @@ fn pretty_key(key: &str) -> String {
 /// the recorder's handle lives in [`ControlState`](crate::ControlState)
 /// under `id` like a composite control's. While recording, Escape cancels
 /// and every other chord is recorded and ends the capture.
+/// Space or Enter starts recording when the field has keyboard focus.
 pub fn shortcut_recorder<V: ControlHost>(
     id: ComboId,
     current: Option<&Chord>,
@@ -165,13 +180,14 @@ pub fn shortcut_recorder<V: ControlHost>(
         (false, Some(chord)) => chord.display.clone(),
         (false, None) => "Not set".into(),
     };
-    let focus_for_click = focus.clone();
+    let on_record: Record<V> = Rc::new(on_record);
+    let on_click_record = on_record.clone();
 
     div()
         .id(ElementId::Name(format!("{id}-recorder").into()))
         // The recorder is a tab stop like any other field: it is where a
         // chord gets typed, so the keyboard has to be able to get to it.
-        .track_focus(&focus)
+        .relative()
         .key_context("ShortcutRecorder")
         .h(px(CONTROL_HEIGHT))
         .w_full()
@@ -201,30 +217,125 @@ pub fn shortcut_recorder<V: ControlHost>(
         } else {
             palette.text_secondary
         })
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
-                this.control_state_mut().recording = Some(id);
-                window.focus(&focus_for_click, cx);
-                cx.notify();
-            }),
-        )
-        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
-            if this.control_state().recording != Some(id) {
-                return;
-            }
-            // Escape leaves the current shortcut alone, which is the only
-            // way out for someone who opened this by accident.
-            if event.keystroke.key == "escape" {
-                this.control_state_mut().recording = None;
-                cx.notify();
-                return;
-            }
-            if let Some(chord) = chord_from(event) {
-                this.control_state_mut().recording = None;
-                on_record(this, chord, window, cx);
+        .on_click(cx.listener(move |this, _event, window, cx| {
+            start_recording(this, id, None, on_click_record.clone(), window, cx);
+        }))
+        .on_mouse_down_out(cx.listener(move |this, _event, _window, cx| {
+            if this.control_state().recording == Some(id) {
+                stop_recording(this);
                 cx.notify();
             }
         }))
+        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+            if crate::keyboard::key(event) == Some(crate::keyboard::Key::Activate) && !event.is_held
+            {
+                let activation = if event.keystroke.key == "space" {
+                    "space"
+                } else {
+                    "enter"
+                };
+                start_recording(this, id, Some(activation), on_record.clone(), window, cx);
+                cx.stop_propagation();
+            }
+        }))
+        .on_key_up(cx.listener(move |this, event: &KeyUpEvent, _window, _cx| {
+            let state = this.control_state_mut();
+            if state.recording == Some(id)
+                && state.recording_activation == Some(event.keystroke.key.as_str())
+            {
+                state.recording_activation = None;
+            }
+        }))
         .child(label)
+        .child(crate::keyboard::ring_for(&focus, CONTROL_RADIUS, palette))
+}
+
+type Record<V> = Rc<dyn Fn(&mut V, Chord, &mut Window, &mut Context<V>)>;
+
+fn stop_recording<V: ControlHost>(view: &mut V) {
+    let state = view.control_state_mut();
+    state.recording = None;
+    state.recording_keys = None;
+    state.recording_activation = None;
+}
+
+fn start_recording<V: ControlHost>(
+    view: &mut V,
+    id: ComboId,
+    activation: Option<&'static str>,
+    on_record: Record<V>,
+    window: &mut Window,
+    cx: &mut Context<V>,
+) {
+    let focus = view.control_state().focus(id, cx);
+    window.focus(&focus, cx);
+    let weak = cx.weak_entity();
+    let focus_for_keys = focus.clone();
+    // A bound shortcut becomes an action before `on_key_down` runs. Capture
+    // it first, while this field holds focus, so recording cannot execute it.
+    let keys = cx.intercept_keystrokes(move |event, window, cx| {
+        if !focus_for_keys.is_focused(window) {
+            return;
+        }
+        let _ = weak.update(cx, |this, cx| {
+            if this.control_state().recording != Some(id) {
+                return;
+            }
+            cx.stop_propagation();
+            // The interceptor omits `is_held`. Ignore repeats of the key
+            // that started recording until its release reaches the field.
+            if this.control_state().recording_activation == Some(event.keystroke.key.as_str()) {
+                return;
+            }
+            if event.keystroke.key == "escape" {
+                stop_recording(this);
+            } else if let Some(chord) = chord_for_keystroke(&event.keystroke) {
+                stop_recording(this);
+                on_record(this, chord, window, cx);
+            }
+            cx.notify();
+        });
+    });
+    let blur = cx.on_blur(&focus, window, move |this, _window, cx| {
+        if this.control_state().recording == Some(id) {
+            stop_recording(this);
+            cx.notify();
+        }
+    });
+    let state = view.control_state_mut();
+    state.recording = Some(id);
+    state.recording_keys = Some([keys, blur]);
+    state.recording_activation = activation;
+    cx.notify();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn captured_chords_round_trip_every_modifier() {
+        for binding in [
+            "cmd-k",
+            "ctrl-alt-shift-cmd-fn-k",
+            "fn-left",
+            "tab",
+            "shift-tab",
+        ] {
+            let original = Keystroke::parse(binding).unwrap();
+            let chord = chord_for_keystroke(&original).unwrap();
+            assert_eq!(Keystroke::parse(&chord.keystroke).unwrap(), original);
+            assert!(!chord.display.is_empty());
+        }
+        assert!(display("fn-left").contains("Fn"));
+    }
+
+    #[test]
+    fn modifier_presses_do_not_finish_a_recording() {
+        for key in ["", "cmd", "ctrl", "alt", "shift", "fn", "function"] {
+            let mut stroke = Keystroke::parse("k").unwrap();
+            stroke.key = key.into();
+            assert_eq!(chord_for_keystroke(&stroke), None);
+        }
+    }
 }

@@ -68,7 +68,8 @@ The application's own keys — ⌘K, ⌘S — are still the host's to bind, afte
 | `color_pad` | Left and right move chroma, up and down move lightness. |
 | `swatch_grid` | Each swatch is a tab stop. |
 | `spinbox` | Up and down step the value from inside the field, Enter commits a typed one; the steppers are tab stops too. |
-| `text_field`, `text_area`, `search_field`, `shortcut_recorder` | Tab stops. Their editing keys are bound by `bind_keys`; the actions are public for a host that wants them bound differently — see [Hosting](hosting.md#key-bindings-and-menus). |
+| `text_field`, `text_area`, `search_field` | Tab stops. Their editing keys are bound by `bind_keys`; the actions are public for a host that wants them bound differently — see [Hosting](hosting.md#key-bindings-and-menus). |
+| `shortcut_recorder` | Space or Enter begins recording; Escape cancels. The next chord is captured even if the host has already bound it, without executing that binding. |
 
 ## Keys a field passes on
 

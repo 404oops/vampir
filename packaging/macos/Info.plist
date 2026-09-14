@@ -5,9 +5,8 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 
-	<!-- The executable name inside Contents/MacOS. `cargo build --example
-	     gallery` produces `gallery`, and bundle.sh copies it under that
-	     name, so the two have to agree. -->
+	<!-- This must match the gallery example's binary name, which bundle.sh
+	     copies into Contents/MacOS. -->
 	<key>CFBundleExecutable</key>
 	<string>gallery</string>
 
@@ -33,9 +32,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.0</string>
+	<string>@VAMPIR_VERSION@</string>
 	<key>CFBundleVersion</key>
-	<string>0.1.0</string>
+	<string>@VAMPIR_VERSION@</string>
 
 	<key>LSMinimumSystemVersion</key>
 	<string>11.0</string>

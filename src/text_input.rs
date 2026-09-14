@@ -13,7 +13,7 @@
 //! Adapted from gpui's `input.rs` example, extended with multi-line
 //! wrapping, styled colors, highlight spans, and a change callback.
 
-use std::ops::Range;
+use std::{ops::Range, rc::Rc};
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
@@ -204,7 +204,8 @@ pub struct TextInput {
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
-    last_lines: Vec<gpui::WrappedLine>,
+    last_lines: Rc<[gpui::WrappedLine]>,
+    shaped: Option<ShapedText>,
     last_line_height: Pixels,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
@@ -242,7 +243,8 @@ impl TextInput {
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
-            last_lines: Vec::new(),
+            last_lines: Rc::from([]),
+            shaped: None,
             last_line_height: px(0.0),
             last_bounds: None,
             is_selecting: false,
@@ -318,6 +320,9 @@ impl TextInput {
             return;
         }
         window.focus(&self.focus_handle, cx);
+        // The chrome has no focus handle of its own, so prevent a focusable
+        // ancestor from taking this press after we hand it to the input.
+        window.prevent_default();
         let inside_text = self
             .last_bounds
             .is_some_and(|bounds| bounds.contains(&position));
@@ -403,12 +408,11 @@ impl TextInput {
         };
         let target_y = current.y + line_height * direction as f32 + line_height / 2.0;
         let target = point(current.x, target_y);
-        if let Some(index) = self.offset_for_position_local(target) {
-            if select {
-                self.select_to(index, cx);
-            } else {
-                self.move_to(index, cx);
-            }
+        let index = self.offset_for_position_local(target);
+        if select {
+            self.select_to(index, cx);
+        } else {
+            self.move_to(index, cx);
         }
     }
 
@@ -507,6 +511,9 @@ impl TextInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.disabled {
+            return;
+        }
         if self.selected_range.is_empty() {
             let boundary = self.previous_word_boundary(self.cursor_offset());
             if boundary == self.cursor_offset() {
@@ -523,6 +530,9 @@ impl TextInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.disabled {
+            return;
+        }
         if self.selected_range.is_empty() {
             let start = self.line_start(self.cursor_offset());
             if start == self.cursor_offset() {
@@ -586,6 +596,9 @@ impl TextInput {
     }
 
     fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+        if self.disabled {
+            return;
+        }
         if self.multi_line {
             self.replace_text_in_range(None, "\n", window, cx);
         } else if let Some(on_submit) = self.on_submit.take() {
@@ -599,6 +612,9 @@ impl TextInput {
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        if self.disabled {
+            return;
+        }
         if self.selected_range.is_empty() {
             let prev = self.previous_boundary(self.cursor_offset());
             if self.cursor_offset() == prev {
@@ -610,6 +626,9 @@ impl TextInput {
     }
 
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
+        if self.disabled {
+            return;
+        }
         if self.selected_range.is_empty() {
             let next = self.next_boundary(self.cursor_offset());
             if self.cursor_offset() == next {
@@ -633,11 +652,9 @@ impl TextInput {
         let index = self.index_for_mouse_position(event.position);
         match event.click_count {
             2 => {
-                // Double-click selects the word under the cursor.
-                let start = self.previous_word_boundary(self.next_boundary(index).min(index + 1));
-                let end = self.next_word_boundary(index);
-                self.move_to(start.min(end), cx);
-                self.select_to(end.max(start), cx);
+                let range = word_range_at(&self.content, index);
+                self.move_to(range.start, cx);
+                self.select_to(range.end, cx);
             }
             n if n >= 3 => {
                 // Triple-click selects the line.
@@ -659,6 +676,10 @@ impl TextInput {
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        // A release outside the window may never reach on_mouse_up.
+        if self.disabled || event.pressed_button != Some(MouseButton::Left) {
+            self.is_selecting = false;
+        }
         if self.is_selecting {
             let index = self.index_for_mouse_position(event.position);
             self.select_to(index, cx);
@@ -694,6 +715,9 @@ impl TextInput {
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+        if self.disabled {
+            return;
+        }
         if !self.selected_range.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
@@ -704,6 +728,7 @@ impl TextInput {
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.selected_range = offset..offset;
+        self.selection_reversed = false;
         cx.notify()
     }
 
@@ -717,46 +742,17 @@ impl TextInput {
 
     /// Cursor position in text-local coordinates (top-left of glyph line).
     fn position_for_offset(&self, offset: usize) -> Option<Point<Pixels>> {
-        let line_height = self.last_line_height;
-        let mut y_offset = px(0.0);
-        let mut start = 0usize;
-        for line in &self.last_lines {
-            let line_len = line.text.len();
-            let end = start + line_len;
-            if offset <= end {
-                let local = line.position_for_index(offset - start, line_height)?;
-                return Some(point(local.x, local.y + y_offset));
-            }
-            y_offset += line.size(line_height).height;
-            start = end + 1; // skip the '\n'
-        }
-        None
+        position_for_offset(&self.last_lines, self.last_line_height, offset)
     }
 
     /// Offset for a point in text-local coordinates.
-    fn offset_for_position_local(&self, position: Point<Pixels>) -> Option<usize> {
-        let line_height = self.last_line_height;
-        let mut y_offset = px(0.0);
-        let mut start = 0usize;
-        for (i, line) in self.last_lines.iter().enumerate() {
-            let height = line.size(line_height).height;
-            let local = point(position.x, position.y - y_offset);
-            let within = position.y >= y_offset && position.y < y_offset + height;
-            let is_last = i + 1 == self.last_lines.len();
-            if within || (is_last && position.y >= y_offset) {
-                let index = line
-                    .closest_index_for_position(local, line_height)
-                    .unwrap_or_else(|idx| idx);
-                return Some(start + index.min(line.text.len()));
-            }
-            y_offset += height;
-            start += line.text.len() + 1;
-        }
-        if position.y < px(0.0) {
-            Some(0)
-        } else {
-            Some(self.content.len())
-        }
+    fn offset_for_position_local(&self, position: Point<Pixels>) -> usize {
+        offset_for_position(
+            &self.content,
+            &self.last_lines,
+            self.last_line_height,
+            position,
+        )
     }
 
     fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
@@ -771,7 +767,6 @@ impl TextInput {
             position.y - bounds.top(),
         );
         self.offset_for_position_local(local)
-            .unwrap_or(self.content.len())
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -788,16 +783,7 @@ impl TextInput {
     }
 
     fn offset_from_utf16(&self, offset: usize) -> usize {
-        let mut utf8_offset = 0;
-        let mut utf16_count = 0;
-        for ch in self.content.chars() {
-            if utf16_count >= offset {
-                break;
-            }
-            utf16_count += ch.len_utf16();
-            utf8_offset += ch.len_utf8();
-        }
-        utf8_offset
+        utf8_offset_for_utf16(&self.content, offset)
     }
 
     fn offset_to_utf16(&self, offset: usize) -> usize {
@@ -837,6 +823,102 @@ impl TextInput {
     }
 }
 
+fn word_range_at(text: &str, offset: usize) -> Range<usize> {
+    text.split_word_bound_indices()
+        .find_map(|(start, word)| {
+            let end = start + word.len();
+            (offset < end || end == text.len()).then_some(start..end)
+        })
+        .unwrap_or(0..0)
+}
+
+fn position_for_offset(
+    lines: &[gpui::WrappedLine],
+    line_height: Pixels,
+    offset: usize,
+) -> Option<Point<Pixels>> {
+    let mut y_offset = px(0.0);
+    let mut start = 0usize;
+    for line in lines {
+        let end = start + line.text.len();
+        if offset <= end {
+            let local = line.position_for_index(offset - start, line_height)?;
+            return Some(point(local.x, local.y + y_offset));
+        }
+        y_offset += line.size(line_height).height;
+        start = end + 1; // skip the '\n'
+    }
+    None
+}
+
+fn offset_for_position(
+    content: &str,
+    lines: &[gpui::WrappedLine],
+    line_height: Pixels,
+    position: Point<Pixels>,
+) -> usize {
+    if content.is_empty() || position.y < px(0.0) {
+        return 0;
+    }
+    let mut y_offset = px(0.0);
+    let mut start = 0usize;
+    for line in lines {
+        let height = line.size(line_height).height;
+        if position.y < y_offset + height {
+            let local = point(position.x, position.y - y_offset);
+            let index = line
+                .closest_index_for_position(local, line_height)
+                .unwrap_or_else(|idx| idx);
+            // Layout can still describe a placeholder or the preceding edit.
+            let mut offset = (start + index.min(line.text.len())).min(content.len());
+            while !content.is_char_boundary(offset) {
+                offset -= 1;
+            }
+            return offset;
+        }
+        y_offset += height;
+        start += line.text.len() + 1;
+    }
+    content.len()
+}
+
+fn horizontal_scroll_offset(
+    previous: Pixels,
+    cursor_x: Pixels,
+    text_width: Pixels,
+    viewport_width: Pixels,
+) -> Pixels {
+    let visible_width = (viewport_width - px(2.0)).max(px(0.0));
+    let max_scroll = (text_width - visible_width).max(px(0.0));
+    previous
+        .max(cursor_x - visible_width)
+        .min(cursor_x)
+        .clamp(px(0.0), max_scroll)
+}
+
+fn first_rect_for_range(
+    bounds: Bounds<Pixels>,
+    start: Point<Pixels>,
+    end: Point<Pixels>,
+    line_height: Pixels,
+    scroll_offset: Pixels,
+) -> Bounds<Pixels> {
+    // The platform wants the first visual row for its IME candidate window.
+    // A range ending on a later row may end to the left of its start.
+    let right = if start.y == end.y {
+        end.x
+    } else {
+        bounds.size.width
+    };
+    Bounds::new(
+        point(
+            bounds.left() + start.x - scroll_offset,
+            bounds.top() + start.y,
+        ),
+        size((right - start.x).max(px(0.0)), line_height),
+    )
+}
+
 /// UTF-8 byte offset in `text` for a UTF-16 code-unit offset, clamped to the
 /// end of the string.
 fn utf8_offset_for_utf16(text: &str, utf16_offset: usize) -> usize {
@@ -865,10 +947,13 @@ impl EntityInputHandler for TextInput {
 
     fn selected_text_range(
         &mut self,
-        _ignore_disabled_input: bool,
+        ignore_disabled_input: bool,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
+        if self.disabled && !ignore_disabled_input {
+            return None;
+        }
         Some(UTF16Selection {
             range: self.range_to_utf16(&self.selected_range),
             reversed: self.selection_reversed,
@@ -885,8 +970,10 @@ impl EntityInputHandler for TextInput {
             .map(|range| self.range_to_utf16(range))
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
-        self.marked_range = None;
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.marked_range.take().is_some() {
+            cx.notify();
+        }
     }
 
     fn replace_text_in_range(
@@ -910,10 +997,9 @@ impl EntityInputHandler for TextInput {
         if self.marked_range.is_none() {
             self.push_undo();
         }
-        self.content =
-            (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
-                .into();
+        self.content = replacing_text(&self.content, range.clone(), new_text).into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
+        self.selection_reversed = false;
         self.marked_range.take();
         self.emit_change(cx);
         cx.notify();
@@ -940,9 +1026,7 @@ impl EntityInputHandler for TextInput {
         if self.marked_range.is_none() {
             self.push_undo();
         }
-        self.content =
-            (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
-                .into();
+        self.content = replacing_text(&self.content, range.clone(), new_text).into();
         if !new_text.is_empty() {
             self.marked_range = Some(range.start..range.start + new_text.len());
         } else {
@@ -959,6 +1043,7 @@ impl EntityInputHandler for TextInput {
                 start..end
             })
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
+        self.selection_reversed = false;
 
         self.emit_change(cx);
         cx.notify();
@@ -974,10 +1059,12 @@ impl EntityInputHandler for TextInput {
         let range = self.range_from_utf16(&range_utf16);
         let start = self.position_for_offset(range.start)?;
         let end = self.position_for_offset(range.end)?;
-        let line_height = self.last_line_height;
-        Some(Bounds::from_corners(
-            point(bounds.left() + start.x, bounds.top() + start.y),
-            point(bounds.left() + end.x, bounds.top() + end.y + line_height),
+        Some(first_rect_for_range(
+            bounds,
+            start,
+            end,
+            self.last_line_height,
+            self.scroll_offset,
         ))
     }
 
@@ -987,10 +1074,13 @@ impl EntityInputHandler for TextInput {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
-        let bounds = self.last_bounds?;
-        let local = point(point_.x - bounds.left(), point_.y - bounds.top());
-        let utf8_index = self.offset_for_position_local(local)?;
+        self.last_bounds?;
+        let utf8_index = self.index_for_mouse_position(point_);
         Some(self.offset_to_utf16(utf8_index))
+    }
+
+    fn accepts_text_input(&self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
+        !self.disabled
     }
 }
 
@@ -998,8 +1088,48 @@ struct TextElement {
     input: Entity<TextInput>,
 }
 
+// One layout per input, shared with paint and hit testing. GPUI caches glyph
+// layouts, but shape_text still copies every hard line and allocates its
+// decorations on every call, including repeated layout measurements.
+struct ShapedText {
+    key: ShapeKey,
+    lines: Rc<[gpui::WrappedLine]>,
+}
+
+#[derive(PartialEq)]
+struct ShapeKey {
+    text: SharedString,
+    is_placeholder: bool,
+    font: gpui::Font,
+    style: InputStyle,
+    selection: Range<usize>,
+    marked: Option<Range<usize>>,
+    spans: Vec<Span>,
+    wrap: Option<Pixels>,
+    scale_factor: f32,
+}
+
+impl ShapeKey {
+    fn selection(range: &Range<usize>, is_placeholder: bool) -> Range<usize> {
+        // A caret moves without changing the text's decorations.
+        if range.is_empty() || is_placeholder {
+            0..0
+        } else {
+            range.clone()
+        }
+    }
+}
+
+fn replacing_text(text: &str, range: Range<usize>, replacement: &str) -> String {
+    let mut result = String::with_capacity(text.len() - range.len() + replacement.len());
+    result.push_str(&text[..range.start]);
+    result.push_str(replacement);
+    result.push_str(&text[range.end..]);
+    result
+}
+
 struct PrepaintState {
-    lines: Vec<gpui::WrappedLine>,
+    lines: Rc<[gpui::WrappedLine]>,
     line_height: Pixels,
     cursor: Option<PaintQuad>,
 }
@@ -1018,7 +1148,7 @@ impl TextElement {
         wrap_width: Option<Pixels>,
         window: &mut Window,
         cx: &mut App,
-    ) -> (Vec<gpui::WrappedLine>, Pixels) {
+    ) -> (Rc<[gpui::WrappedLine]>, Pixels) {
         let input = self.input.read(cx);
         let content = input.content.clone();
         let selected_range = input.selected_range.clone();
@@ -1028,10 +1158,10 @@ impl TextElement {
         let font_size = px(input_style.font_size);
         let multi_line = input.multi_line;
 
-        let (display_text, text_color) = if content.is_empty() {
-            (input.placeholder.clone(), input_style.placeholder_color)
+        let display_text = if content.is_empty() {
+            input.placeholder.clone()
         } else {
-            (content, input_style.text_color)
+            content
         };
         let is_placeholder = input.content.is_empty();
         // Highlight spans, sanitised: dropped if they fall outside the text
@@ -1047,106 +1177,158 @@ impl TextElement {
                 .unwrap_or_default()
         };
 
-        let base_run = TextRun {
-            len: display_text.len(),
+        let key = ShapeKey {
+            text: display_text,
+            is_placeholder,
             font: style.font(),
-            color: crate::color::to_hsla(text_color),
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-            letter_spacing: None,
+            style: input_style,
+            selection: ShapeKey::selection(&selected_range, is_placeholder),
+            marked: if is_placeholder { None } else { marked_range },
+            spans,
+            wrap: if multi_line { wrap_width } else { None },
+            scale_factor: window.scale_factor(),
         };
-
-        // Split into runs so the selection gets a background color, any
-        // marked (IME composition) range gets an underline, and each
-        // highlight span gets its own styling.
-        let mut runs: Vec<TextRun> = Vec::new();
-        if is_placeholder {
-            runs.push(base_run.clone());
-        } else {
-            let mut boundaries: Vec<usize> = vec![0, display_text.len()];
-            boundaries.push(selected_range.start.min(display_text.len()));
-            boundaries.push(selected_range.end.min(display_text.len()));
-            if let Some(marked) = &marked_range {
-                boundaries.push(marked.start.min(display_text.len()));
-                boundaries.push(marked.end.min(display_text.len()));
-            }
-            for span in &spans {
-                boundaries.push(span.range.start);
-                boundaries.push(span.range.end);
-            }
-            boundaries.sort_unstable();
-            boundaries.dedup();
-            for pair in boundaries.windows(2) {
-                let (start, end) = (pair[0], pair[1]);
-                if end <= start {
-                    continue;
-                }
-                let mut run = TextRun {
-                    len: end - start,
-                    ..base_run.clone()
-                };
-                if let Some(span) = spans
-                    .iter()
-                    .find(|span| span.range.start <= start && end <= span.range.end)
-                {
-                    if span.accent {
-                        run.color = crate::color::to_hsla(input_style.accent_color);
-                    } else if let Some(color) = span.color {
-                        run.color = crate::color::to_hsla(color);
-                    }
-                    if let Some(background) = span.background {
-                        run.background_color = Some(crate::color::to_hsla(background));
-                    }
-                    if span.bold {
-                        run.font.weight = gpui::FontWeight::BOLD;
-                    }
-                    if span.italic {
-                        run.font.style = gpui::FontStyle::Italic;
-                    }
-                    if let Some(color) = span.underline {
-                        run.underline = Some(UnderlineStyle {
-                            color: Some(crate::color::to_hsla(color)),
-                            thickness: px(1.0),
-                            wavy: span.wavy,
-                        });
-                    }
-                    if span.strikethrough {
-                        run.strikethrough = Some(gpui::StrikethroughStyle {
-                            color: Some(run.color),
-                            thickness: px(1.0),
-                        });
-                    }
-                }
-                // The selection wash goes over any span background: while
-                // text is selected, that is the state worth seeing.
-                if start >= selected_range.start && end <= selected_range.end {
-                    let mut sel: gpui::Hsla = crate::color::to_hsla(input_style.selection_color);
-                    sel.alpha = 0.45;
-                    run.background_color = Some(sel);
-                }
-                if let Some(marked) = &marked_range
-                    && start >= marked.start
-                    && end <= marked.end
-                {
-                    run.underline = Some(UnderlineStyle {
-                        color: Some(run.color),
-                        thickness: px(1.0),
-                        wavy: false,
-                    });
-                }
-                runs.push(run);
-            }
+        // Highlighters are public callbacks that may read external state,
+        // so run them on every layout even when the content is unchanged.
+        if let Some(shaped) = &input.shaped
+            && shaped.key == key
+        {
+            return (shaped.lines.clone(), window.line_height());
         }
 
-        let wrap = if multi_line { wrap_width } else { None };
-        let lines = window
+        let runs = text_runs(&key);
+        let lines: Rc<[gpui::WrappedLine]> = window
             .text_system()
-            .shape_text(display_text, font_size, &runs, wrap, None)
-            .map(|lines| lines.into_vec())
-            .unwrap_or_default();
+            .shape_text(key.text.clone(), font_size, &runs, key.wrap, None)
+            .map(|lines| Rc::from(lines.into_vec()))
+            .unwrap_or_else(|_| Rc::from([]));
+        self.input.update(cx, |input, _| {
+            input.shaped = Some(ShapedText {
+                key,
+                lines: lines.clone(),
+            });
+        });
         (lines, window.line_height())
     }
+}
+
+fn text_runs(key: &ShapeKey) -> Vec<TextRun> {
+    let ShapeKey {
+        text: display_text,
+        is_placeholder,
+        font,
+        style: input_style,
+        selection: selected_range,
+        marked: marked_range,
+        spans,
+        ..
+    } = key;
+    let base_run = TextRun {
+        len: display_text.len(),
+        font: font.clone(),
+        color: crate::color::to_hsla(if *is_placeholder {
+            input_style.placeholder_color
+        } else {
+            input_style.text_color
+        }),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+        letter_spacing: None,
+    };
+
+    // Split into runs so the selection gets a background color, any
+    // marked (IME composition) range gets an underline, and each
+    // highlight span gets its own styling.
+    if *is_placeholder || (spans.is_empty() && selected_range.is_empty() && marked_range.is_none())
+    {
+        return vec![base_run];
+    }
+
+    let mut runs: Vec<TextRun> = Vec::new();
+    let mut boundaries = Vec::with_capacity(6 + spans.len() * 2);
+    boundaries.extend([0, display_text.len()]);
+    boundaries.push(selected_range.start.min(display_text.len()));
+    boundaries.push(selected_range.end.min(display_text.len()));
+    if let Some(marked) = marked_range {
+        boundaries.push(marked.start.min(display_text.len()));
+        boundaries.push(marked.end.min(display_text.len()));
+    }
+    for span in spans {
+        boundaries.push(span.range.start);
+        boundaries.push(span.range.end);
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    runs.reserve(boundaries.len().saturating_sub(1));
+    let mut spans = spans.iter().peekable();
+    for pair in boundaries.windows(2) {
+        let (start, end) = (pair[0], pair[1]);
+        if end <= start {
+            continue;
+        }
+        let mut run = TextRun {
+            len: end - start,
+            ..base_run.clone()
+        };
+        // Sanitised spans are ordered and disjoint. Advance once
+        // through them instead of searching from the beginning for
+        // every run (quadratic for syntax-highlighted documents).
+        while spans.peek().is_some_and(|span| span.range.end <= start) {
+            spans.next();
+        }
+        if let Some(span) = spans.peek()
+            && span.range.start <= start
+            && end <= span.range.end
+        {
+            if span.accent {
+                run.color = crate::color::to_hsla(input_style.accent_color);
+            } else if let Some(color) = span.color {
+                run.color = crate::color::to_hsla(color);
+            }
+            if let Some(background) = span.background {
+                run.background_color = Some(crate::color::to_hsla(background));
+            }
+            if span.bold {
+                run.font.weight = gpui::FontWeight::BOLD;
+            }
+            if span.italic {
+                run.font.style = gpui::FontStyle::Italic;
+            }
+            if let Some(color) = span.underline {
+                run.underline = Some(UnderlineStyle {
+                    color: Some(crate::color::to_hsla(color)),
+                    thickness: px(1.0),
+                    wavy: span.wavy,
+                });
+            }
+            if span.strikethrough {
+                run.strikethrough = Some(gpui::StrikethroughStyle {
+                    color: Some(run.color),
+                    thickness: px(1.0),
+                });
+            }
+        }
+        // The selection wash goes over any span background: while
+        // text is selected, that is the state worth seeing.
+        if start >= selected_range.start && end <= selected_range.end {
+            let mut sel: gpui::Hsla = crate::color::to_hsla(input_style.selection_color);
+            sel.alpha = 0.45;
+            run.background_color = Some(sel);
+        }
+        if let Some(marked) = marked_range
+            && start >= marked.start
+            && end <= marked.end
+        {
+            run.underline = Some(UnderlineStyle {
+                color: Some(run.color),
+                thickness: px(1.0),
+                wavy: false,
+            });
+        }
+        runs.push(run);
+    }
+    runs
 }
 
 /// Drops spans that no longer fit the text, or that start or end mid
@@ -1248,22 +1430,7 @@ impl Element for TextElement {
         let cursor_pos = if content_empty {
             Some(point(px(0.0), px(0.0)))
         } else {
-            let mut pos = None;
-            let mut y_offset = px(0.0);
-            let mut start = 0usize;
-            for line in &lines {
-                let end = start + line.text.len();
-                if cursor_offset <= end {
-                    if let Some(local) = line.position_for_index(cursor_offset - start, line_height)
-                    {
-                        pos = Some(point(local.x, local.y + y_offset));
-                    }
-                    break;
-                }
-                y_offset += line.size(line_height).height;
-                start = end + 1;
-            }
-            pos
+            position_for_offset(&lines, line_height, cursor_offset)
         };
 
         // Keep the caret visible in single-line fields by scrolling the text
@@ -1271,15 +1438,9 @@ impl Element for TextElement {
         if multi_line {
             scroll_offset = px(0.0);
         } else if let Some(pos) = cursor_pos {
-            let margin = px(2.0);
-            let visible_width = (bounds.size.width - margin).max(px(0.0));
-            if pos.x - scroll_offset > visible_width {
-                scroll_offset = pos.x - visible_width;
-            }
-            if pos.x - scroll_offset < px(0.0) {
-                scroll_offset = pos.x;
-            }
-            scroll_offset = scroll_offset.max(px(0.0));
+            let text_width = lines.first().map_or(px(0.0), |line| line.width());
+            scroll_offset =
+                horizontal_scroll_offset(scroll_offset, pos.x, text_width, bounds.size.width);
         }
         self.input
             .update(cx, |input, _| input.scroll_offset = scroll_offset);
@@ -1288,15 +1449,13 @@ impl Element for TextElement {
         if selected_range.is_empty()
             && let Some(pos) = cursor_pos
         {
-            {
-                cursor = Some(fill(
-                    Bounds::new(
-                        point(bounds.left() + pos.x - scroll_offset, bounds.top() + pos.y),
-                        size(px(1.5), line_height),
-                    ),
-                    cursor_color,
-                ));
-            }
+            cursor = Some(fill(
+                Bounds::new(
+                    point(bounds.left() + pos.x - scroll_offset, bounds.top() + pos.y),
+                    size(px(1.5), line_height),
+                ),
+                cursor_color,
+            ));
         }
 
         PrepaintState {
@@ -1328,7 +1487,7 @@ impl Element for TextElement {
         // Clip: scrolled single-line text must not bleed past the field.
         window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
             let mut origin = point(bounds.origin.x - scroll_offset, bounds.origin.y);
-            for line in &prepaint.lines {
+            for line in prepaint.lines.iter() {
                 let _ = line.paint_background(
                     origin,
                     line_height,
@@ -1348,7 +1507,7 @@ impl Element for TextElement {
             }
         });
 
-        let lines = std::mem::take(&mut prepaint.lines);
+        let lines = prepaint.lines.clone();
         self.input.update(cx, |input, _cx| {
             input.last_lines = lines;
             input.last_line_height = line_height;
@@ -1363,7 +1522,7 @@ impl Render for TextInput {
             .flex()
             .w_full()
             .key_context("TextInput")
-            .track_focus(&self.focus_handle(cx))
+            .track_focus(&self.focus_handle(cx).tab_stop(!self.disabled))
             .cursor(if self.disabled {
                 CursorStyle::Arrow
             } else {
@@ -1412,5 +1571,283 @@ impl Render for TextInput {
 impl Focusable for TextInput {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn shape_key(text: &str) -> ShapeKey {
+        ShapeKey {
+            text: text.to_owned().into(),
+            is_placeholder: false,
+            font: gpui::Font::default(),
+            style: InputStyle::from_palette(Palette::default(), 14.0),
+            selection: 0..0,
+            marked: None,
+            spans: Vec::new(),
+            wrap: Some(px(200.0)),
+            scale_factor: 1.0,
+        }
+    }
+
+    #[test]
+    fn shaping_ignores_caret_motion_but_tracks_selection_and_external_highlights() {
+        let original = shape_key("hello world");
+        let mut changed = shape_key("hello world");
+        changed.selection = ShapeKey::selection(&(5..5), false);
+        assert!(original == changed);
+        assert_eq!(text_runs(&changed).len(), 1);
+
+        changed.selection = ShapeKey::selection(&(0..5), false);
+        assert!(original != changed);
+        let runs = text_runs(&changed);
+        assert!(runs[0].background_color.is_some());
+        assert!(runs[1].background_color.is_none());
+
+        changed.selection = 0..0;
+        changed.spans = vec![Span::new(0..5).bold()];
+        assert!(original != changed);
+        assert_eq!(text_runs(&changed)[0].font.weight, gpui::FontWeight::BOLD);
+
+        changed.spans.clear();
+        changed.marked = Some(0..5);
+        assert!(original != changed);
+        assert!(text_runs(&changed)[0].underline.is_some());
+    }
+
+    #[test]
+    fn shaping_tracks_content_placeholder_theme_font_width_and_scale() {
+        let original = shape_key("hello");
+        let changes: [fn(&mut ShapeKey); 8] = [
+            |key: &mut ShapeKey| key.text = "world".into(),
+            |key: &mut ShapeKey| key.is_placeholder = true,
+            |key: &mut ShapeKey| key.style.font_size = 20.0,
+            |key: &mut ShapeKey| {
+                key.style = InputStyle::from_palette(Palette::from_hue(30.0, true), 14.0)
+            },
+            |key: &mut ShapeKey| key.font = gpui::font("monospace"),
+            |key: &mut ShapeKey| key.wrap = Some(px(100.0)),
+            |key: &mut ShapeKey| key.wrap = None,
+            |key: &mut ShapeKey| key.scale_factor = 2.0,
+        ];
+        for change in changes {
+            let mut changed = shape_key("hello");
+            change(&mut changed);
+            assert!(original != changed);
+        }
+    }
+
+    #[test]
+    fn highlight_run_walk_preserves_gaps_selection_and_ime_overrides() {
+        let mut key = shape_key("abcdefghi");
+        key.spans = vec![
+            Span::new(1..3).bold().background(key.style.accent_color),
+            Span::new(5..8).italic().squiggle(key.style.accent_color),
+        ];
+        key.selection = 2..6;
+        key.marked = Some(6..7);
+        let runs = text_runs(&key);
+        assert_eq!(
+            runs.iter().map(|run| run.len).sum::<usize>(),
+            key.text.len()
+        );
+        let mut offset = 0;
+        for run in runs {
+            for byte in offset..offset + run.len {
+                assert_eq!(
+                    run.font.weight == gpui::FontWeight::BOLD,
+                    (1..3).contains(&byte)
+                );
+                assert_eq!(
+                    run.font.style == gpui::FontStyle::Italic,
+                    (5..8).contains(&byte)
+                );
+                if (2..6).contains(&byte) {
+                    assert_eq!(run.background_color.unwrap().alpha, 0.45);
+                } else {
+                    assert_eq!(run.background_color.is_some(), byte == 1);
+                }
+                if byte == 6 {
+                    assert!(!run.underline.unwrap().wavy);
+                } else if (5..8).contains(&byte) {
+                    assert!(run.underline.unwrap().wavy);
+                } else {
+                    assert!(run.underline.is_none());
+                }
+            }
+            offset += run.len;
+        }
+    }
+
+    #[test]
+    fn replacement_preserves_unicode_at_the_start_middle_and_end() {
+        for (text, range, replacement, expected) in [
+            ("a😀éz", 1..7, "日本", "a日本z"),
+            ("text", 0..0, "prefix ", "prefix text"),
+            ("text", 4..4, " suffix", "text suffix"),
+            ("text", 0..4, "", ""),
+        ] {
+            let result = replacing_text(text, range, replacement);
+            assert_eq!(result, expected);
+        }
+    }
+
+    fn line(text: &str, wrap_at: Option<usize>) -> gpui::WrappedLine {
+        let glyphs: Vec<_> = text
+            .char_indices()
+            .enumerate()
+            .map(|(column, (index, _))| gpui::ShapedGlyph {
+                id: gpui::GlyphId(0),
+                position: point(px(column as f32 * 10.0), px(0.0)),
+                index,
+                is_emoji: false,
+            })
+            .collect();
+        let mut line = gpui::WrappedLine::default();
+        line.text = text.to_string().into();
+        *line = Arc::new(gpui::WrappedLineLayout {
+            unwrapped_layout: Arc::new(gpui::LineLayout {
+                width: px(glyphs.len() as f32 * 10.0),
+                len: text.len(),
+                runs: vec![gpui::ShapedRun {
+                    font_id: gpui::FontId(0),
+                    glyphs,
+                }],
+                ..Default::default()
+            }),
+            wrap_boundaries: wrap_at
+                .map(|glyph_ix| gpui::WrapBoundary {
+                    run_ix: 0,
+                    glyph_ix,
+                })
+                .into_iter()
+                .collect(),
+            wrap_width: wrap_at.map(|column| px(column as f32 * 10.0)),
+        });
+        line
+    }
+
+    #[test]
+    fn double_click_selects_the_word_whitespace_or_punctuation_under_it() {
+        let text = "hello  world!";
+        assert_eq!(word_range_at(text, 2), 0..5);
+        assert_eq!(word_range_at(text, 5), 5..7);
+        assert_eq!(word_range_at(text, 6), 5..7);
+        assert_eq!(word_range_at(text, 7), 7..12);
+        assert_eq!(word_range_at(text, 12), 12..13);
+        assert_eq!(word_range_at("", 0), 0..0);
+
+        let text = "café déjà";
+        assert_eq!(word_range_at(text, 3), 0..5);
+        assert_eq!(word_range_at(text, 8), 6..12);
+        assert_eq!(word_range_at(text, text.len()), 6..12);
+    }
+
+    #[test]
+    fn utf16_offsets_handle_surrogates_and_clamp_to_the_text() {
+        let text = "a😀é";
+        for (utf16, utf8) in [(0, 0), (1, 1), (2, 5), (3, 5), (4, 7), (usize::MAX, 7)] {
+            assert_eq!(utf8_offset_for_utf16(text, utf16), utf8);
+        }
+    }
+
+    #[test]
+    fn empty_input_never_selects_its_multiline_placeholder() {
+        let lines = [line("placeholder", Some(5)), line("second line", None)];
+        for y in [-20.0, 10.0, 30.0, 50.0, 100.0] {
+            assert_eq!(
+                offset_for_position("", &lines, px(20.0), point(px(80.0), px(y))),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn hit_testing_clamps_stale_layout_to_valid_content_boundaries() {
+        let lines = [line("stale layout", None)];
+        assert_eq!(
+            offset_for_position("é", &lines, px(20.0), point(px(10.0), px(10.0))),
+            0
+        );
+        assert_eq!(
+            offset_for_position("é", &lines, px(20.0), point(px(80.0), px(10.0))),
+            2
+        );
+    }
+
+    #[test]
+    fn hit_testing_and_caret_positions_account_for_wrapping_and_newlines() {
+        let content = "abcdef\néz";
+        let lines = [line("abcdef", Some(3)), line("éz", None)];
+        assert_eq!(
+            offset_for_position(content, &lines, px(20.0), point(px(10.0), px(30.0))),
+            4
+        );
+        assert_eq!(
+            offset_for_position(content, &lines, px(20.0), point(px(10.0), px(50.0))),
+            9
+        );
+        assert_eq!(
+            position_for_offset(&lines, px(20.0), 4),
+            Some(point(px(10.0), px(20.0)))
+        );
+        assert_eq!(
+            position_for_offset(&lines, px(20.0), 9),
+            Some(point(px(10.0), px(40.0)))
+        );
+        assert_eq!(
+            offset_for_position(content, &lines, px(20.0), point(px(0.0), px(80.0))),
+            content.len()
+        );
+        assert_eq!(
+            offset_for_position(content, &lines, px(20.0), point(px(80.0), px(-1.0))),
+            0
+        );
+    }
+
+    #[test]
+    fn scrolling_keeps_the_caret_visible_and_releases_unused_space() {
+        for (previous, cursor, text, viewport, expected) in [
+            (0.0, 180.0, 200.0, 100.0, 82.0),
+            (82.0, 20.0, 200.0, 100.0, 20.0),
+            (82.0, 90.0, 90.0, 100.0, 0.0),
+            (82.0, 180.0, 200.0, 300.0, 0.0),
+            (0.0, 20.0, 200.0, 1.0, 20.0),
+        ] {
+            assert_eq!(
+                horizontal_scroll_offset(px(previous), px(cursor), px(text), px(viewport)),
+                px(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn ime_bounds_follow_horizontal_scrolling_and_the_first_visual_row() {
+        let bounds = Bounds::new(point(px(100.0), px(200.0)), size(px(100.0), px(100.0)));
+        let scrolled = first_rect_for_range(
+            bounds,
+            point(px(80.0), px(0.0)),
+            point(px(90.0), px(0.0)),
+            px(20.0),
+            px(60.0),
+        );
+        assert_eq!(
+            scrolled,
+            Bounds::new(point(px(120.0), px(200.0)), size(px(10.0), px(20.0)))
+        );
+        let wrapped = first_rect_for_range(
+            bounds,
+            point(px(80.0), px(20.0)),
+            point(px(10.0), px(60.0)),
+            px(20.0),
+            px(0.0),
+        );
+        assert_eq!(
+            wrapped,
+            Bounds::new(point(px(180.0), px(220.0)), size(px(20.0), px(20.0)))
+        );
     }
 }

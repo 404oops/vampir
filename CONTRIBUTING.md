@@ -4,7 +4,7 @@ Thanks for considering a contribution. Vampir is a small toolkit with a delibera
 
 ## Getting set up
 
-You need a Rust toolchain on 1.85 or newer, because the crate is on the 2024 edition. On macOS you need Xcode's command line tools; on Linux you need the Wayland/X11/Vulkan headers GPUI itself wants.
+Use the current stable Rust toolchain. The core's locked dependencies require at least Rust 1.89; the gallery's Linux backend requires at least 1.92. On macOS you need Xcode's command line tools; on Linux you need the Wayland/X11/Vulkan headers GPUI itself wants.
 
 ```bash
 git clone https://github.com/404oops/vampir
@@ -28,8 +28,8 @@ src/
   data.rs         tree rows and table headers
   text_input.rs   the full text input: selection, IME, undo, wrapping
   swatch.rs       the Oklch colour pickers
-  palette.rs      the colour roles, and from_hue
-  theme.rs        one hue and a scheme that follows the desktop; the pickers bound to them
+  palette.rs      the colour roles, derived from hue and saturation
+  theme.rs        hue, saturation and a scheme that follows the desktop; the bound pickers
   lighting.rs     the shadow and gradient recipes everything draws with
   state.rs        ControlState and the ControlHost trait; the host's root handlers
   keyboard.rs     the standard bindings, focus movement, the ring, the Edit menu
@@ -56,7 +56,7 @@ These documents describe the decisions that keep the toolkit coherent. If a chan
 - **Both colour schemes.** A light-only or dark-only path is a bug; the `is_dark` flag exists so one code path covers both. Check your change with the System | Light | Dark segment in the gallery's header — the gallery opens in the desktop's scheme, so click the other one — and drag the hue slider across while you are there.
 - **Nothing changes in one frame.** A state that flips slides, a thing that moves slides, a colour crosses over — [Design › Motion](docs/design.md#motion) has the three durations and the rules. A slide is faster than a screenshot, so to look at one launch the gallery with `VAMPIR_SLOW_MOTION=8 tools/gallery.sh launch`: every animation runs eight times slower and the footer carries a badge saying so. Frames taken that way are for looking at, never for the docs.
 - **Test the logic, not the pixels.** Fuzzy scoring, span sanitising, gamut clamping and geometry are all testable without a window. The drawing is not, so keep drawing thin and put the thinking where a test can reach it. If a bug was invisible to the tests and obvious on screen, that usually means a calculation is buried in a paint closure — lift it out and test it.
-- **No new dependencies.** The crate has two. That is a feature of it, and a patch that adds a third needs to argue for it.
+- **No new dependencies.** The core has two; the optional `app-icon` feature adds platform-specific icon support. A patch that adds another dependency needs to argue for it.
 - A new control is exported from `lib.rs`, added to the table in [`docs/widgets.md`](docs/widgets.md) and the list in the README, and shown in `examples/gallery.rs` — see the next section, which is not optional.
 
 ## Every addition ships in the gallery

@@ -76,13 +76,7 @@ if self.controls.animating() || self.my_own_transitions_running() {
 }
 ```
 
-`spinner` is the exception: it is indeterminate, so it never finishes and never stops needing frames. Ask for them only while one is actually on screen — `request_animation_frame` holds the display link open, and a spinner nobody can see should not be costing 60Hz. The gallery scopes it to the one page that has a spinner on it:
-
-```rust
-if self.controls.animating() || page == Page::Controls {
-    window.request_animation_frame();
-}
-```
+`spinner` requests its own frames while it intersects the visible area, so the host needs no special frame loop for it. Scrolling it outside a clipped container stops those requests, and bringing it back starts them again. It stays still when GPUI's reduced-motion preference is enabled. Do not request frames just because a page contains a spinner: that keeps rebuilding the page even while its spinner is out of sight.
 
 Do not drive hover from an `Instant`. Scrolling a list re-fires hover on every row and will pin the display link at 60Hz. Use GPUI's `.hover()`.
 
@@ -110,26 +104,25 @@ Everything a control remembers between frames — `blend`, `tween`, `present`, i
 
 ## Themes
 
-Every `ControlState` carries a `Theme`: one hue, and a `Scheme` that is `System`, `Light` or `Dark`. `self.controls.palette()` is the palette to hand every control this frame, and it follows the theme rather than jumping to it. A scheme change crosses over through `Palette::mix` over `SCHEME_FADE`; a hue change glides the short way round; a hue under the hand on its own slider sits under the hand. Every control is a function of the palette it is handed, so one cross-fade at the root is every colour on screen crossing over, whoever made the change.
+Every `ControlState` carries a `Theme`: a hue, a saturation, and a `Scheme` that is `System`, `Light` or `Dark`. `self.controls.palette()` is the palette to hand every control this frame, and it follows the theme rather than jumping to it. A scheme change crosses over through `Palette::mix` over `SCHEME_FADE`; hue glides the short way round and saturation changes smoothly. A theme slider under the hand follows the pointer directly. Every control is a function of the palette it is handed, so one transition at the root carries the whole interface.
 
-Start from the system rather than from a guess. `self.controls.observe_appearance(window, cx)` in the view's constructor reads whether the desktop is light or dark and keeps following it. A window that opens dark on a light desktop looks broken before it looks like a choice. `Scheme::System` means the desktop's choice, `Light` and `Dark` are the user's, and picking `System` again hands control back.
+Choose the app's hue and saturation in code as part of its design, based on its purpose and existing visual identity. A quiet editing tool might use a restrained saturation; an expressive creative tool might use more. These are defaults for the developer or coding agent to choose, without requiring the end user to configure a theme. Add theme controls only when customization serves the product. The gallery's App theme controls on the Colour page demonstrate the APIs for evaluation.
+
+Saturation is a multiplier from `0.0` to `MAX_SATURATION` (`2.0`): zero makes every palette role grey, `DEFAULT_SATURATION` (`1.0`) preserves the toolkit's original colour strength, and two is more vivid. It applies to the whole palette, including surfaces and semantic colours. Values outside the range are clamped; NaN uses the default. `Palette::from_hue(hue, dark)` retains saturation one; `Palette::from_hue_and_saturation(hue, saturation, dark)` sets it explicitly, and `Palette::neutral(dark)` is greyscale.
+
+Follow the desktop's scheme with `self.controls.observe_appearance(window, cx)` in the view's constructor. `Scheme::System` means the desktop's choice; `Light` and `Dark` are explicit overrides if the product needs them. Configure the app's colours before the first render:
 
 ```rust
-// In the constructor:
+self.controls.theme.hue = 210.0;
+self.controls.theme.saturation = 0.55;
 self.controls.observe_appearance(window, cx);
-
-// Anywhere:
-self.controls.theme.scheme = Scheme::Dark;
-self.controls.theme.hue = 200.0;
-
-// In render, the toolkit's own pickers, bound to the theme:
-vampir::scheme_picker("scheme", WidgetContext::new(palette, self, cx))   // System | Light | Dark
-vampir::hue_picker("hue", WidgetContext::new(palette, self, cx))         // a slider the toolkit reads itself
 ```
+
+If the app offers theme customization, `scheme_picker`, `hue_picker` and `saturation_picker` bind directly to `ControlState::theme`; the toolkit handles their drags. The generic `saturation_slider` takes a saturation in `0.0..=2.0` and reports a normalized `0.0..=1.0` track position through `ControlHost::track_dragged`, like other sliders. Convert that position with `Theme::saturation_from_track(at.x)` before storing it.
 
 The window's own ground is `palette.backdrop`, lit with `vampir::ground(palette.backdrop)` on the root; `scroll_area` fades scrolling content into it at the right height. `vampir::ui_font()` is the system's interface face, for `.font_family` on the root.
 
-A host with a richer theme of its own ignores all of this. `Palette` is a plain public struct of `Copy` colour roles: build one with `Palette::from_hue` or field by field and pass it, **by value**, into every control. See [Design](design.md#colour) for what the roles mean and when adding one is justified.
+A host with a richer theme of its own can build `Palette` directly. It is a plain public struct of `Copy` colour roles: use `Palette::from_hue_and_saturation` or fill it field by field, then pass it, **by value**, into every control. See [Design](design.md#colour) for what the roles mean and when adding one is justified.
 
 Text inputs hold their own colours, because they are GPUI entities rather than functions. Style them with `InputStyle::from_palette(palette, size)`, and the field that holds one — `text_field`, `text_area`, `search_field`, `spinbox` — keeps it in step with whatever palette it is handed, so a theme crossing over carries the text with it. A style written out by hand is left alone. A highlighter that wants the accent uses `Span::accent()`, which reads the colour when the text paints rather than when the closure was written.
 

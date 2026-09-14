@@ -33,7 +33,6 @@ use gpui::{
     MenuItem as OsMenuItem, MouseDownEvent, OsAction, Stateful, Styled, Window, actions, div, px,
 };
 
-use crate::lighting;
 use crate::palette::Palette;
 use crate::state::ControlHost;
 use crate::text_input as text;
@@ -44,18 +43,6 @@ use crate::text_input as text;
 // none of them took it.
 actions!(vampir, [FocusNext, FocusPrevious, Dismiss]);
 
-/// Makes a control a tab stop and rings it when the keyboard lands on it.
-///
-/// `own_shadows` are the control's own lighting. The ring is added to them
-/// rather than replacing them, so a focused button still reads as raised.
-///
-/// The element must already have an id: GPUI hangs the focus handle off the
-/// element's state, and an element with no id has none to hang it on, so it
-/// would take focus one frame and lose it the next.
-///
-/// A disabled control must not be passed through here. Tab stopping on
-/// something nobody can operate is worse than not reaching it at all: it
-/// reads as the keyboard being stuck.
 /// The focus ring, laid over a control as its **last** child.
 ///
 /// A box shadow paints *behind* the element that owns it. On a filled
@@ -72,6 +59,8 @@ actions!(vampir, [FocusNext, FocusPrevious, Dismiss]);
 /// It is also the tab stop: its hitbox covers the control, so clicking
 /// anywhere on the control focuses it and the keyboard picks up where the
 /// mouse left off. The control it goes on needs `.relative()`.
+/// A disabled control must not get a ring: Tab should skip controls that
+/// cannot be operated.
 ///
 /// ```ignore
 /// div().id("save").relative()
@@ -92,7 +81,7 @@ pub fn ring_for(focus: &FocusHandle, radius: f32, palette: Palette) -> Div {
 }
 
 fn dress<E: InteractiveElement + Styled>(el: E, radius: f32, palette: Palette) -> E {
-    let (accent, dark) = (palette.accent, palette.is_dark);
+    let accent = palette.accent;
     el.absolute()
         .inset_0()
         .rounded(px(radius))
@@ -104,13 +93,9 @@ fn dress<E: InteractiveElement + Styled>(el: E, radius: f32, palette: Palette) -
         // `focus_visible` rather than `focus`: the ring is a keyboard
         // affordance, and drawing it on a control someone has just clicked
         // tells them something they already know.
-        .focus_visible(move |style| {
-            style.border_color(accent).shadow(vec![lighting::glow(
-                accent,
-                if dark { 0.8 } else { 0.5 },
-                4.0,
-            )])
-        })
+        // A shadow behind this transparent overlay would cover the label
+        // underneath it. The border alone stays inside the control's edge.
+        .focus_visible(move |style| style.border_color(accent))
 }
 
 /// The bindings that are the same in every application: Tab and Shift-Tab
@@ -288,7 +273,11 @@ pub fn move_focus<V: ControlHost>(view: &mut V, window: &mut Window, cx: &mut Ap
     // leaving, and a list still on screen looks as though the next key
     // pressed will land in it.
     state.dismiss_popups();
-    let reveal = std::mem::take(&mut state.ring_hidden) && window.focused(cx).is_some();
+    state.restore_menu_focus(window, cx);
+    let reveal = std::mem::take(&mut state.ring_hidden)
+        && window
+            .focused(cx)
+            .is_some_and(|focus| focus != state.root_focus(cx));
     if reveal {
         return;
     }

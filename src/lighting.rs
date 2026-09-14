@@ -53,12 +53,7 @@ pub fn lit(base: Rgba, lift: f32) -> Background {
 /// over whatever is behind it: a selected row arriving, a keyboard
 /// highlight moving on.
 pub fn lit_at(base: Rgba, lift: f32, opacity: f32) -> Background {
-    let (top, bottom) = lit_stops(base, lift);
-    linear_gradient(
-        180.0,
-        linear_color_stop(crate::color::with_alpha(top, opacity), 0.0),
-        linear_color_stop(crate::color::with_alpha(bottom, opacity), 1.0),
-    )
+    lit(base, lift).opacity(opacity.clamp(0.0, 1.0))
 }
 
 /// A flat surface crossing over into a lit one, `on` of the way there: a
@@ -187,5 +182,24 @@ pub fn glow(color: Rgba, alpha: f32, radius: f32) -> BoxShadow {
         blur_radius: px(radius),
         spread_radius: px(radius * 0.25),
         inset: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fading_a_translucent_fill_preserves_its_opacity() {
+        let base = rgba(0.4, 0.5, 0.6, 0.25);
+        assert_eq!(lit_at(base, 0.1, 1.0), lit(base, 0.1));
+        let gpui::BackgroundKind::LinearGradient { stops, .. } = lit_at(base, 0.1, 0.5).kind()
+        else {
+            panic!("a lit fill is a gradient");
+        };
+        for stop in stops {
+            let color: Hsla = stop.color.into();
+            assert_eq!(color.alpha, 0.125);
+        }
     }
 }

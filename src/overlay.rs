@@ -184,13 +184,14 @@ impl Command {
 /// matches that start a word and matches that run on from the last one, so
 /// "opf" ranks "Open File" above "Optional Prefix".
 pub fn fuzzy_score(query: &str, candidate: &str) -> Option<i32> {
-    if query.is_empty() {
+    if query.chars().all(char::is_whitespace) {
         return Some(0);
     }
     let candidate_lower = candidate.to_lowercase();
-    let mut haystack = candidate_lower.char_indices().peekable();
+    let mut haystack = candidate_lower.chars().enumerate();
     let mut score = 0i32;
     let mut last_index: Option<usize> = None;
+    let mut previous = None;
 
     for needle in query.to_lowercase().chars() {
         if needle.is_whitespace() {
@@ -198,16 +199,15 @@ pub fn fuzzy_score(query: &str, candidate: &str) -> Option<i32> {
         }
         loop {
             let (index, ch) = haystack.next()?;
+            let starts_word = previous.is_none_or(|previous: char| {
+                previous.is_whitespace() || previous == '-' || previous == '_'
+            });
+            previous = Some(ch);
             if ch != needle {
                 continue;
             }
             // Starting a word is the strongest signal that this is the
             // match the person meant.
-            let starts_word = index == 0
-                || candidate_lower[..index]
-                    .chars()
-                    .next_back()
-                    .is_some_and(|previous| previous == ' ' || previous == '-' || previous == '_');
             score += if starts_word { 12 } else { 2 };
             if last_index == Some(index.saturating_sub(1)) {
                 score += 6;
@@ -218,7 +218,7 @@ pub fn fuzzy_score(query: &str, candidate: &str) -> Option<i32> {
     }
     // Among equally good matches, the shortest candidate is the one that
     // most nearly *is* the query.
-    Some(score - (candidate.len() as i32 / 8))
+    Some(score - (candidate.chars().count() as i32 / 8))
 }
 
 /// Commands matching a query, best first. Ties keep their original order,
@@ -277,6 +277,9 @@ pub fn command_list<V: ControlHost>(
         // Keyed by the command rather than the row, so the highlight and the
         // fade belong to the command as it moves.
         let on = state.blend(key("lit"), active, SWITCH_SLIDE);
+        // Secondary ink is for unselected rows; all selected text needs
+        // the foreground paired with the accent surface underneath it.
+        let secondary = crate::color::lerp(palette.text_secondary, palette.soft_label, on);
         let shown = if fresh {
             state.tween(key("shown"), 1.0, SWITCH_SLIDE)
         } else {
@@ -305,11 +308,11 @@ pub fn command_list<V: ControlHost>(
                 .text_size(px(12.5))
                 .text_color(crate::color::lerp(
                     palette.text_primary,
-                    palette.control_label,
+                    palette.soft_label,
                     on,
                 ))
                 .when(on > 0.01, |el| {
-                    el.bg(lighting::lit_at(palette.control_fill, 0.08, on))
+                    el.bg(lighting::lit_at(palette.soft_fill, 0.08, on))
                 })
                 .when(!active, |el| {
                     el.hover(move |style| style.bg(palette.row_hover))
@@ -318,12 +321,12 @@ pub fn command_list<V: ControlHost>(
                     on_activate(this, command_id.clone(), window, cx);
                     cx.notify();
                 }))
-                .children(command.group.clone().map(|group| {
-                    div()
-                        .flex_none()
-                        .text_color(palette.text_secondary)
-                        .child(group)
-                }))
+                .children(
+                    command
+                        .group
+                        .clone()
+                        .map(|group| div().flex_none().text_color(secondary).child(group)),
+                )
                 .child(
                     div()
                         .flex_1()
@@ -334,7 +337,7 @@ pub fn command_list<V: ControlHost>(
                     div()
                         .flex_none()
                         .text_size(px(11.5))
-                        .text_color(palette.text_secondary)
+                        .text_color(secondary)
                         .child(shortcut)
                 }))
                 .into_any_element(),
@@ -621,10 +624,21 @@ mod tests {
 
     #[test]
     fn an_empty_query_keeps_everything_in_its_original_order() {
-        let commands = vec![Command::new("b", "Second"), Command::new("a", "First")];
-        let filtered = fuzzy_filter("", &commands);
-        let ids: Vec<&str> = filtered.iter().map(|command| command.id.as_ref()).collect();
-        assert_eq!(ids, vec!["b", "a"]);
+        let commands = vec![
+            Command::new("b", "Much longer first command"),
+            Command::new("a", "First"),
+        ];
+        for query in ["", " \t\n"] {
+            let filtered = fuzzy_filter(query, &commands);
+            let ids: Vec<&str> = filtered.iter().map(|command| command.id.as_ref()).collect();
+            assert_eq!(ids, vec!["b", "a"]);
+        }
+    }
+
+    #[test]
+    fn consecutive_unicode_characters_get_the_same_bonus_as_ascii() {
+        assert_eq!(fuzzy_score("été", "été"), fuzzy_score("ete", "ete"));
+        assert_eq!(fuzzy_score("b", "a\tb"), fuzzy_score("b", "a b"));
     }
 
     #[test]

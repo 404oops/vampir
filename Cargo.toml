@@ -1,8 +1,8 @@
 [package]
 name = "vampir"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 license = "MIT"
 description = "Lit widget toolkit for GPUI: buttons, fields, pop-ups, menus and a text input, over a small OKLCH palette."
 repository = "https://github.com/404oops/vampir"

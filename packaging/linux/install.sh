@@ -15,6 +15,10 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 prefix="${1:-$HOME/.local}"
 
+# Resolve a caller-relative prefix before building from the repository.
+[[ "$prefix" = /* ]] || prefix="$PWD/$prefix"
+cd "$root"
+
 cargo build --release --example gallery
 
 install -Dm755 "$root/target/release/examples/gallery" "$prefix/bin/vampir-gallery"

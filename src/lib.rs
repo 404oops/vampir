@@ -29,10 +29,10 @@
 //! ```
 //!
 //! [`ControlState::palette`] is the palette of the [`theme`] every host
-//! has by default — one hue, and the desktop's colour scheme — crossing
-//! over rather than cutting when either changes. A host with a theme of
-//! its own builds a [`Palette`] from it instead, with
-//! [`Palette::from_hue`] or field by field.
+//! has by default — an app-chosen hue and saturation, and the desktop's
+//! colour scheme — crossing over rather than cutting when they change.
+//! A host with a theme of its own builds a [`Palette`] from it instead, with
+//! [`Palette::from_hue_and_saturation`] or field by field.
 
 pub mod color;
 pub mod containers;
@@ -82,7 +82,7 @@ pub use menu::{ContextMenu, MenuAction, MenuItem, context_menu, menu_button, men
 pub use overlay::{
     Command, Hint, Tooltip, command_list, command_palette, fuzzy_filter, fuzzy_score, search_list,
 };
-pub use palette::Palette;
+pub use palette::{DEFAULT_SATURATION, MAX_SATURATION, Palette};
 pub use scroll::{SCROLL_FADE, ScrollAxis, ScrollDrag, apply_scroll_drag, scroll_fades};
 pub use shortcut::{Chord, display, display_keystroke, shortcut_recorder};
 pub use state::{
@@ -90,7 +90,11 @@ pub use state::{
     OpenPalette, SCHEME_FADE, SWITCH_SLIDE, TAB_DRAG_THRESHOLD, TabDrag, Tag, TrackAxis, TrackDrag,
     continue_drags, end_drags, handle_mouse, mouse_moved,
 };
-pub use swatch::{MAX_CHROMA, Oklch, color_pad, hue_slider, hue_wheel, swatch_grid};
+pub use swatch::{
+    MAX_CHROMA, Oklch, color_pad, hue_slider, hue_wheel, saturation_slider, swatch_grid,
+};
 pub use text_input::{Highlighter, InputStyle, Span, TextInput};
-pub use theme::{DEFAULT_HUE, Scheme, Theme, hue_picker, scheme_picker, system_dark};
+pub use theme::{
+    DEFAULT_HUE, Scheme, Theme, hue_picker, saturation_picker, scheme_picker, system_dark,
+};
 pub use typography::{SMALL_TEXT_SIZE, TEXT_SIZE, TITLE_TEXT_SIZE, ui_font};

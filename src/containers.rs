@@ -803,7 +803,7 @@ pub fn dialog<V: ControlHost>(
     let WidgetContext { palette, view, cx } = ctx;
     let state = view.control_state();
     let Some((opacity, _)) = state.dialog_fade(id) else {
-        state.set_dialog_trap(None);
+        state.clear_dialog_trap(id);
         return None;
     };
     let closing = !state.is_dialog_open(id);
@@ -824,15 +824,23 @@ pub fn dialog<V: ControlHost>(
     // The default action is the primary button. Failing one, the first — by
     // convention the safe one, which is the right thing for Enter to do in
     // a dialog that is asking about something destructive.
-    let default = buttons
-        .iter()
-        .position(|spec| matches!(spec.variant, ButtonVariant::Primary))
-        .unwrap_or(0);
+    let default = dialog_default(buttons.iter().map(|spec| (spec.variant, spec.enabled)));
     let panel_focus = state.focus((id, "panel"), cx).tab_stop(false);
     // Tab is bound to an action and handled at the root; this is how
     // `keyboard::move_focus` finds out there is a dialog to stay inside. A
     // dialog on its way out is not one to stay inside of.
-    state.set_dialog_trap((!closing).then_some((id, buttons.len())));
+    if closing {
+        state.clear_dialog_trap(id);
+    } else {
+        state.set_dialog_buttons(
+            id,
+            buttons
+                .iter()
+                .enumerate()
+                .filter_map(|(index, spec)| spec.enabled.then_some(index))
+                .collect(),
+        );
+    }
 
     let on_dismiss: Press<V> = Rc::new(on_dismiss);
     let dismiss_from_scrim = on_dismiss.clone();
@@ -852,7 +860,7 @@ pub fn dialog<V: ControlHost>(
                     spec.id,
                     &spec.label,
                     spec.variant,
-                    spec.enabled,
+                    spec.enabled && !closing,
                     &handles[n],
                     palette,
                     cx,
@@ -864,8 +872,8 @@ pub fn dialog<V: ControlHost>(
 
     let weak = cx.entity().downgrade();
     let grab_panel = panel_focus.clone();
-    let grab_default = handles.get(default).cloned();
-    let enter_press = presses.get(default).cloned();
+    let grab_default = default.and_then(|index| handles.get(index)).cloned();
+    let enter_press = default.and_then(|index| presses.get(index)).cloned();
 
     Some(
         deferred(
@@ -922,7 +930,10 @@ pub fn dialog<V: ControlHost>(
                         // through `keyboard::move_focus`; Escape arrives as
                         // `Dismiss`, below.
                         .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
-                            if event.keystroke.key != "enter" || closing {
+                            if event.keystroke.key != "enter"
+                                || keyboard::key(event) != Some(Key::Activate)
+                                || closing
+                            {
                                 return;
                             }
                             let Some(press) = enter_press.clone() else {
@@ -959,12 +970,12 @@ pub fn dialog<V: ControlHost>(
                                     if closing || grab_panel.contains_focused(window, cx) {
                                         return;
                                     }
-                                    let previous = window.focused(cx);
                                     if let Some(host) = weak.upgrade() {
-                                        host.update(cx, |host, _cx| {
+                                        host.update(cx, |host, cx| {
                                             let state = host.control_state_mut();
+                                            state.restore_menu_focus(window, cx);
                                             if state.dialog_return_focus.is_none() {
-                                                state.dialog_return_focus = previous;
+                                                state.dialog_return_focus = window.focused(cx);
                                             }
                                         });
                                     }
@@ -991,6 +1002,19 @@ pub fn dialog<V: ControlHost>(
         )
         .with_priority(150),
     )
+}
+
+fn dialog_default(buttons: impl IntoIterator<Item = (ButtonVariant, bool)>) -> Option<usize> {
+    let mut first = None;
+    for (index, (variant, enabled)) in buttons.into_iter().enumerate() {
+        if enabled {
+            first.get_or_insert(index);
+            if variant == ButtonVariant::Primary {
+                return Some(index);
+            }
+        }
+    }
+    first
 }
 
 /// What every way out of a dialog does, in the order it has to happen in:
@@ -1181,7 +1205,17 @@ fn moved_selection(selected: usize, from: usize, to: usize) -> usize {
 
 #[cfg(test)]
 mod layout_tests {
-    use super::{moved_selection, reorder};
+    use super::{ButtonVariant, dialog_default, moved_selection, reorder};
+
+    #[test]
+    fn a_dialog_only_defaults_to_an_enabled_button() {
+        use ButtonVariant::{Primary, Soft};
+        assert_eq!(dialog_default([(Soft, true), (Primary, true)]), Some(1));
+        assert_eq!(dialog_default([(Soft, true), (Primary, false)]), Some(0));
+        assert_eq!(dialog_default([(Soft, false), (Soft, true)]), Some(1));
+        assert_eq!(dialog_default([(Primary, false)]), None);
+        assert_eq!(dialog_default([]), None);
+    }
 
     /// The selection stays on the item it was on, wherever that item goes.
     #[test]

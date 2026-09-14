@@ -48,7 +48,10 @@ mkdir -p "$contents/MacOS" "$contents/Resources"
 
 # CFBundleExecutable in the plist names this file; keep the two in step.
 cp "target/$profile_dir/examples/gallery" "$contents/MacOS/gallery"
-cp packaging/macos/Info.plist "$contents/Info.plist"
+version="$(cargo pkgid)"
+version="${version##*#}"
+version="${version##*@}"
+sed "s/@VAMPIR_VERSION@/$version/g" packaging/macos/Info.plist >"$contents/Info.plist"
 cp assets/icon.icns "$contents/Resources/icon.icns"
 # GPUI is Apache-2.0, and a binary that ships it ships its notice.
 cp LICENSE "$contents/Resources/LICENSE"

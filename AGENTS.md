@@ -36,7 +36,9 @@ Keep these conventions in mind when changing the library. Each is explained in m
 
 **Light comes from above.** Raised means you press it; recessed means you put something in it. Never hard-code a shadow or a gradient — add a recipe to `lighting` instead. → [design.md](docs/design.md#light-comes-from-above)
 
-**Both colour schemes, always.** A light-only or dark-only path is a bug; the `is_dark` flag exists so one code path covers both. Only the roles in `Palette`; adding a role means adding it to `from_hue` for every hue and both schemes. → [design.md](docs/design.md#colour)
+**Both colour schemes, always.** A light-only or dark-only path is a bug; the `is_dark` flag exists so one code path covers both. Only the roles in `Palette`; adding a role means covering every hue, saturation and both schemes in palette generation. → [design.md](docs/design.md#colour)
+
+**Choose the app's colours as part of its design.** The developer or coding agent chooses `Theme::hue` and `Theme::saturation` for the app's purpose and existing brand, and sets them in the host's constructor. Use saturation `0.0` for grey, values below `1.0` for a muted tool, `1.0` for the standard palette, and up to `2.0` for a vivid app. Make and briefly explain that design decision; do not routinely ask the user to pick a hue or saturation. Do not add hue or saturation sliders to every app: expose them only when theme editing or personalisation is part of that app's requirements. The gallery's Colour page demonstrates the optional pickers; it is not a template for app chrome. Keep following the desktop's light/dark scheme unless the app's requirements say otherwise, and check text contrast at the chosen saturation in both schemes. → [hosting.md](docs/hosting.md#themes)
 
 **Shared metrics.** `CONTROL_HEIGHT` (30) and `CONTROL_RADIUS` (6), so a row of mixed controls lines up without tuning. `CHIP_HEIGHT` (26) is the one deliberate exception. → [design.md](docs/design.md#metrics)
 
@@ -100,7 +102,7 @@ Things that will otherwise cost you an hour:
 - **A keystroke that matches a binding never reaches a key listener.** GPUI dispatches it as the action and stops. If you are adding key handling to a control, listen for the action, or make sure nothing binds the key first.
 - **Focus on an element that has gone dispatches nothing** — not even the window's own shortcuts. If ⌘K "stopped working", something removed the focused element and did not re-home the keyboard.
 - **A double-click is `clickState`, not timing.** `tools/gallery.sh double` sets it; two `click`s in a row are two single clicks.
-- **The ring only shows for keyboard input.** After a click, press Tab once to reveal focus before judging where it is.
+- **The ring only shows for keyboard input.** After a click, press Tab once to reveal focus before judging where it is. Capture it with `shot --no-park out.png`: the default `shot` moves the pointer, which GPUI treats as mouse input and hides the ring.
 - **The spinner animates**, so two shots of the Controls page are never byte-identical. Crop it out when comparing.
 - **Coordinates are window-relative.** `bounds` prints where the window is; the docs screenshots were taken at the default 980×752.
 - **Animations are faster than the shutter.** A `shot` takes over a second from the command to the capture, so it never catches a 140ms slide. To see one half way, `VAMPIR_SLOW_MOTION=8 tools/gallery.sh launch`, then drive the pointer with `target/tools/input` and capture with `screencapture -x -o -R` against `bounds` directly, about a third of a second after the click. The footer shows a "slow motion" badge while it is on; never take a docs screenshot that way.

@@ -37,12 +37,18 @@ fn main() {
 /// the gallery hands AppKit one at startup instead — and nothing the system
 /// can remember about it. That needs a real bundle.
 fn embed_info_plist(root: &Path) {
-    let plist = root.join("packaging/macos/Info.plist");
     // Tolerate the file being absent so a vendored or repackaged copy of the
     // crate still builds; it only costs the examples their name.
-    if !plist.exists() {
+    let Ok(template) = std::fs::read_to_string(root.join("packaging/macos/Info.plist")) else {
         return;
-    }
+    };
+    let plist =
+        PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo sets OUT_DIR")).join("Info.plist");
+    std::fs::write(
+        &plist,
+        template.replace("@VAMPIR_VERSION@", env!("CARGO_PKG_VERSION")),
+    )
+    .expect("write the gallery's Info.plist");
     println!(
         "cargo::rustc-link-arg-examples=-Wl,-sectcreate,__TEXT,__info_plist,{}",
         plist.display()

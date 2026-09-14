@@ -71,31 +71,51 @@ pub fn relative_luminance(color: Rgba) -> f64 {
 /// so an out-of-gamut request desaturates instead of wrapping to some other
 /// colour.
 pub fn oklch_to_color(l_in: f64, c_in: f64, h_degrees: f64) -> Rgba {
-    let l = clamp01(l_in);
-    let c = c_in.max(0.0);
-    let hr = (h_degrees % 360.0) * std::f64::consts::PI / 180.0;
+    OklchHue::new(h_degrees).color(l_in, c_in)
+}
 
-    let a_ = c * hr.cos();
-    let b_ = c * hr.sin();
+/// A pad varies chroma and lightness thousands of times at one hue.
+#[derive(Clone, Copy)]
+pub(crate) struct OklchHue {
+    cos: f64,
+    sin: f64,
+}
 
-    let l_ = l + 0.3963377774 * a_ + 0.2158037573 * b_;
-    let m_ = l - 0.1055613458 * a_ - 0.0638541728 * b_;
-    let s_ = l - 0.0894841775 * a_ - 1.2914855480 * b_;
+impl OklchHue {
+    pub(crate) fn new(degrees: f64) -> Self {
+        let radians = (degrees % 360.0) * std::f64::consts::PI / 180.0;
+        Self {
+            cos: radians.cos(),
+            sin: radians.sin(),
+        }
+    }
 
-    let l3 = l_ * l_ * l_;
-    let m3 = m_ * m_ * m_;
-    let s3 = s_ * s_ * s_;
+    pub(crate) fn color(self, l_in: f64, c_in: f64) -> Rgba {
+        let l = clamp01(l_in);
+        let c = c_in.max(0.0);
 
-    let r_lin = 4.0767416621 * l3 - 3.3077115913 * m3 + 0.2309699292 * s3;
-    let g_lin = -1.2684380046 * l3 + 2.6097574011 * m3 - 0.3413193965 * s3;
-    let b_lin = -0.0041960863 * l3 - 0.7034186147 * m3 + 1.7076147010 * s3;
+        let a_ = c * self.cos;
+        let b_ = c * self.sin;
 
-    rgba(
-        linear_to_srgb(r_lin) as f32,
-        linear_to_srgb(g_lin) as f32,
-        linear_to_srgb(b_lin) as f32,
-        1.0,
-    )
+        let l_ = l + 0.3963377774 * a_ + 0.2158037573 * b_;
+        let m_ = l - 0.1055613458 * a_ - 0.0638541728 * b_;
+        let s_ = l - 0.0894841775 * a_ - 1.2914855480 * b_;
+
+        let l3 = l_ * l_ * l_;
+        let m3 = m_ * m_ * m_;
+        let s3 = s_ * s_ * s_;
+
+        let r_lin = 4.0767416621 * l3 - 3.3077115913 * m3 + 0.2309699292 * s3;
+        let g_lin = -1.2684380046 * l3 + 2.6097574011 * m3 - 0.3413193965 * s3;
+        let b_lin = -0.0041960863 * l3 - 0.7034186147 * m3 + 1.7076147010 * s3;
+
+        rgba(
+            linear_to_srgb(r_lin) as f32,
+            linear_to_srgb(g_lin) as f32,
+            linear_to_srgb(b_lin) as f32,
+            1.0,
+        )
+    }
 }
 
 /// `0xAARRGGBB` literal, for the few colours that are plain black or white

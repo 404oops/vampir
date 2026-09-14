@@ -47,13 +47,17 @@ Text is 12.5px for controls, 11.5px for secondary text, 14px for a dialog title 
 
 ## Colour
 
-Only the roles in `Palette`. If a control needs a colour that is not there, either it is one of the existing roles under another name, or the palette is genuinely missing a role — and adding one means adding it to `from_hue` for every hue and both schemes, to `mix`, and checking the result. `backdrop` is the window's ground and the one role no control paints: it is there so a host's ground and the toolkit's panels are derived from the same hue.
+Only the roles in `Palette`. If a control needs a colour that is not there, either it is one of the existing roles under another name, or the palette is missing a role — and adding one means adding it to `from_hue_and_saturation` for every hue, saturation and both schemes, to `mix`, and checking the result. `backdrop` is the window's ground and the one role no control paints: it is there so a host's ground and the toolkit's panels follow the same theme.
+
+Choose the app's hue and saturation in code to fit its purpose and visual identity. This is part of the developer's or coding agent's design work; it should not require asking the end user to choose a palette. A restrained editing surface and an expressive creative tool can use different colour strengths while sharing the same widgets. Expose theme pickers only when appearance customization is a product feature. The gallery's App theme section demonstrates the available controls for evaluation.
+
+Saturation scales palette chroma: `0.0` is greyscale across every role, `DEFAULT_SATURATION` (`1.0`) is the original restrained palette, and `MAX_SATURATION` (`2.0`) is more vivid. Hue changes the colour family; saturation changes its strength. Keep text legible against the fills it labels at every supported setting, and retain non-colour cues for meaning in a greyscale theme.
 
 **Both schemes always.** A light-mode-only or dark-mode-only path is a bug; the `is_dark` flag exists so one code path covers both.
 
 ![The same page in light mode](light.png)
 
-`from_hue` has a test that walks every 15 degrees through both schemes and asserts the results stay in gamut; extend it when you add a role.
+Palette tests cover hues, saturation levels and both schemes, including greyscale and colours staying in gamut; extend them when you add a role.
 
 ## Interaction
 
@@ -71,7 +75,7 @@ Only the roles in `Palette`. If a control needs a colour that is not there, eith
 
 Nothing on screen changes in a single frame. A state that flips slides between its two looks; a thing that moves slides to where it is going; a colour that changes crosses over. This is not decoration. A change that lands in one frame has to be noticed after the fact and worked out; a change that is seen happening is understood as it happens, and the eye is carried to where it went.
 
-- **Three speeds, and only three.** `SWITCH_SLIDE` (140ms) for a state flipping: a switch, a tick drawing in, a highlight moving to another row, a chevron turning. `MOVE` (180ms) for something going somewhere: the pill under a segmented control or a tab bar, a row taking its sorted place, a page arriving. `SCHEME_FADE` (240ms) for everything changing at once: light to dark, one hue to another. Pop-ups and menus reveal over `COMBO_REVEAL`. A new control picks one of these; it does not invent a fourth.
+- **Three speeds, and only three.** `SWITCH_SLIDE` (140ms) for a state flipping: a switch, a tick drawing in, a highlight moving to another row, a chevron turning. `MOVE` (180ms) for something going somewhere: the pill under a segmented control or a tab bar, a row taking its sorted place, a page arriving, a theme hue or saturation set in code. `SCHEME_FADE` (240ms) for the whole scheme changing from light to dark or back. Pop-ups and menus reveal over `COMBO_REVEAL`. A new control picks one of these; it does not invent a fourth.
 - **Ease out to arrive, ease in to leave.** Fast start, settling into the end value, for anything coming in; the reverse for anything going, so both ends of a motion sit against the control rather than drifting from it.
 - **Animate the state, not the click.** A control notices its value changed while it renders — `ControlState::transition` and `blend` for two states, `tween` for a continuous value — so a change from a shortcut, a menu item, the command palette, the host's own code or the desktop switching to dark at sunset moves exactly as a click does. The same goes for what a host shows: `arriving` for content that changes, `fading_text` for words that do, `ControlState::palette` for the whole scheme.
 - **Nothing animates in from nowhere.** The first time an element is seen it paints its end state. Rows joining a list that is already up fade in at their place; a list that has just appeared arrives whole, with whatever brought it — `ControlState::present` tells the two apart.

@@ -17,23 +17,27 @@ use gpui::{
 };
 use gpui_ce_platform::application;
 
+#[cfg(feature = "app-icon")]
+use vampir::AppIcon;
 use vampir::{
-    AppIcon, BadgeTone, ButtonVariant, CONTROL_HEIGHT, ChipSelection, Choice, Chord, Column,
-    ComboId, Command, ControlHost, ControlState, DialogButton, Hint, InputStyle, MAX_CHROMA,
-    MenuItem, Oklch, Palette, Scheme, ScrollAxis, SliderTrack, SortDirection, Span, TEXT_SIZE,
+    BadgeTone, ButtonVariant, CONTROL_HEIGHT, ChipSelection, Choice, Chord, Column, ComboId,
+    Command, ControlHost, ControlState, DialogButton, Hint, InputStyle, MAX_CHROMA, MenuItem,
+    Oklch, Palette, Scheme, ScrollAxis, SliderTrack, SortDirection, Span, TEXT_SIZE,
     TITLE_TEXT_SIZE, Tab, TextInput, Theme, TreeRow, WidgetContext, arriving, badge, bind_keys,
     button, caption, card, checkbox, chip_group, collapsible, color_pad, column, combo,
     command_palette, context_menu, dialog, edit_menu, fading_text, flatten_tree, glyph, ground,
     hue_picker, hue_slider, hue_wheel, icon_button, labelled, lit, menu_button, menu_target,
-    progress_bar, radio_group, reorder, row, scheme_picker, scroll_area, search_list, segmented,
-    separator, shortcut_recorder, slider, spinbox, spinner, split_area, split_handle, swatch_grid,
-    switch, tab_bar, table_header, table_row, text_area, text_field, tree_row, ui_font,
+    progress_bar, radio_group, reorder, row, saturation_picker, scheme_picker, scroll_area,
+    search_list, segmented, separator, shortcut_recorder, slider, spinbox, spinner, split_area,
+    split_handle, swatch_grid, switch, tab_bar, table_header, table_row, text_area, text_field,
+    tree_row, ui_font,
 };
 
 // The gallery is also the smallest complete *macOS* host, so it carries the
 // actions a real app has to own: the menu bar routes through these, and so
 // do the shortcuts the menu bar advertises.
 /// The icon this application shows in the dock, the task bar and its window.
+#[cfg(feature = "app-icon")]
 const ICON: AppIcon = AppIcon::default_icon();
 
 actions!(
@@ -228,8 +232,8 @@ impl ControlHost for Gallery {
     }
 
     /// One implementation for every draggable track in the gallery; the id
-    /// says which one moved. The theme's hue slider is not here: the
-    /// toolkit reads that one itself.
+    /// says which one moved. The theme's hue and saturation pickers are
+    /// read by the toolkit itself.
     fn track_dragged(&mut self, id: ComboId, at: Point<f32>, cx: &mut Context<Self>) {
         match id {
             "volume" => self.volume = at.x,
@@ -268,6 +272,10 @@ const SYNC: [&str; 3] = ["Off", "Auto", "On"];
 impl Gallery {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut controls = ControlState::new();
+        // Violet at standard saturation gives the gallery a consistent
+        // starting point. Each application chooses its own look here.
+        controls.theme.hue = 268.0;
+        controls.theme.saturation = 1.0;
         // The scheme starts as the desktop's and follows it until someone
         // picks one by hand. `VAMPIR_SLOW_MOTION=8 tools/gallery.sh launch`
         // runs every fade and slide eight times slower, which is how a
@@ -547,9 +555,8 @@ impl Render for Gallery {
 
         // Asked *after* the page is built, on purpose: a control notices its
         // own state change while it renders. Fades and slides stop asking
-        // when they finish; the spinner never does, so the controls page
-        // keeps the clock running and no other page pays for it.
-        if self.controls.animating() || page == Page::Controls {
+        // when they finish; the spinner requests its own frames while visible.
+        if self.controls.animating() {
             window.request_animation_frame();
         }
 
@@ -673,10 +680,6 @@ impl Gallery {
                 |_this, _index, _window, _cx| {},
             ))
             .child(div().flex_1())
-            .child(div().w(px(150.0)).child(hue_picker(
-                "theme-hue",
-                WidgetContext::new(palette, self, cx),
-            )))
             .child(div().w(px(216.0)).child(scheme_picker(
                 "scheme",
                 WidgetContext::new(palette, self, cx),
@@ -1197,6 +1200,9 @@ impl Gallery {
                     |this, index, _window, cx| {
                         if this.files.len() > 1 {
                             this.files.remove(index);
+                            if index < this.file {
+                                this.file -= 1;
+                            }
                             this.file = this.file.min(this.files.len() - 1);
                         }
                         cx.notify();
@@ -1328,30 +1334,73 @@ impl Gallery {
                         )),
                     ),
             )
-            .child(card(
-                palette,
-                "Palette roles at this hue",
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap(px(10.0))
-                    .children(roles.iter().map(|(name, colour)| {
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(4.0))
-                            .w(px(100.0))
-                            .child(
-                                div()
-                                    .h(px(34.0))
-                                    .rounded(px(6.0))
-                                    .border_1()
-                                    .border_color(palette.field_border)
-                                    .bg(lit(*colour, 0.05)),
-                            )
-                            .child(caption(palette, name))
-                    })),
-            ))
+            .child(
+                row()
+                    .items_start()
+                    .child(
+                        div().flex_1().child(card(
+                            palette,
+                            "App theme",
+                            column()
+                                .child(labelled(
+                                    palette,
+                                    "Hue",
+                                    hue_picker("theme-hue", WidgetContext::new(palette, self, cx)),
+                                ))
+                                .child(
+                                    column()
+                                        .gap(px(6.0))
+                                        .child(
+                                            row()
+                                                .child(caption(palette, "Saturation"))
+                                                .child(div().flex_1())
+                                                .child(
+                                                    fading_text(
+                                                        "theme-saturation-label",
+                                                        format!(
+                                                            "{:.0}%",
+                                                            self.controls.theme.saturation * 100.0
+                                                        ),
+                                                        &self.controls,
+                                                    )
+                                                    .text_color(palette.text_secondary),
+                                                ),
+                                        )
+                                        .child(saturation_picker(
+                                            "theme-saturation",
+                                            WidgetContext::new(palette, self, cx),
+                                        )),
+                                )
+                                .child(caption(palette, "0% grey · 100% standard · 200% vivid")),
+                        )),
+                    )
+                    .child(
+                        div().flex_1().child(card(
+                            palette,
+                            "App palette",
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap(px(10.0))
+                                .children(roles.iter().map(|(name, colour)| {
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(4.0))
+                                        .w(px(100.0))
+                                        .child(
+                                            div()
+                                                .h(px(34.0))
+                                                .rounded(px(6.0))
+                                                .border_1()
+                                                .border_color(palette.field_border)
+                                                .bg(lit(*colour, 0.05)),
+                                        )
+                                        .child(caption(palette, name))
+                                })),
+                        )),
+                    ),
+            )
             .into_any_element()
     }
 }
@@ -1518,6 +1567,7 @@ fn main() {
         cx.set_menus(app_menus());
         // Vampir's own, because the gallery has no face of its own to draw.
         // An application with one swaps a line: `AppIcon::png(include_bytes!(..))`.
+        #[cfg(feature = "app-icon")]
         ICON.install(cx);
 
         // One window, so closing it is quitting. Without this the process
@@ -1531,7 +1581,7 @@ fn main() {
 
         let bounds = Bounds::centered(None, size(px(980.0), px(720.0)), cx);
         #[cfg_attr(
-            not(any(target_os = "linux", target_os = "freebsd")),
+            not(all(feature = "app-icon", any(target_os = "linux", target_os = "freebsd"))),
             allow(unused_mut)
         )]
         let mut options = WindowOptions {
@@ -1546,7 +1596,7 @@ fn main() {
         // Set rather than passed in the literal: the field's type comes from
         // GPUI's own image crate, which only this platform's dev-dependencies
         // bring in, so elsewhere there is no name for it to be written under.
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        #[cfg(all(feature = "app-icon", any(target_os = "linux", target_os = "freebsd")))]
         {
             options.icon = ICON.window_icon();
         }

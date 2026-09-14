@@ -291,10 +291,7 @@ pub fn context_menu<V: ControlHost>(
                                 }
                                 Key::Activate => {
                                     if let Some(id) = at.and_then(|at| reachable_ids.get(at)) {
-                                        let id = *id;
-                                        this.control_state_mut().close_menu();
-                                        restore_focus(this, window, cx);
-                                        on_key_activate(this, id, window, cx);
+                                        activate(this, id, opened_at, window, cx, &on_key_activate);
                                     }
                                 }
                                 key => {
@@ -327,7 +324,7 @@ pub fn context_menu<V: ControlHost>(
                         }))
                         .occlude()
                         .on_mouse_down_out(cx.listener(
-                            move |this, event: &MouseDownEvent, _window, cx| {
+                            move |this, event: &MouseDownEvent, window, cx| {
                                 // A press on the button that opened this menu
                                 // is a toggle, and the button's own click
                                 // closes it on release. Closing here as well
@@ -341,6 +338,7 @@ pub fn context_menu<V: ControlHost>(
                                     return;
                                 }
                                 this.control_state_mut().close_menu();
+                                restore_focus(this, window, cx);
                                 cx.notify();
                             },
                         ))
@@ -365,9 +363,24 @@ type Activate<V> = Rc<dyn Fn(&mut V, ComboId, &mut Window, &mut Context<V>)>;
 /// in the tree, and the next Tab starts again from the top of the window —
 /// which for someone navigating by keyboard means losing their place.
 fn restore_focus<V: ControlHost>(view: &mut V, window: &mut Window, cx: &mut App) {
-    let state = view.control_state_mut();
-    let previous = state.menu_return_focus.take();
-    state.return_focus_to(previous, window, cx);
+    view.control_state_mut().restore_menu_focus(window, cx);
+}
+
+fn activate<V: ControlHost>(
+    view: &mut V,
+    id: ComboId,
+    opened_at: Instant,
+    window: &mut Window,
+    cx: &mut Context<V>,
+    on_activate: &Activate<V>,
+) {
+    // Restore first so a callback that opens another overlay remembers a
+    // live control, while retaining the menu's target until it has run.
+    restore_focus(view, window, cx);
+    on_activate(view, id, window, cx);
+    if view.control_state().menu_opened_at() == Some(opened_at) {
+        view.control_state_mut().close_menu();
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -460,18 +473,7 @@ fn render_item<V: ControlHost>(
                             ))
                         })
                         .on_click(cx.listener(move |this, _event, window, cx| {
-                            // The target the menu was summoned on lives in
-                            // the same state the menu does, so closing first
-                            // takes it away from the one callback that
-                            // exists to receive it. Run, then close.
-                            on_activate(this, id, window, cx);
-                            // Unless the callback opened a menu of its own —
-                            // a "Rename" that drops a second one is a fair
-                            // thing for a host to do, and closing blind
-                            // would swallow it.
-                            if this.control_state().menu_opened_at() == Some(opened_at) {
-                                this.control_state_mut().close_menu();
-                            }
+                            activate(this, id, opened_at, window, cx, &on_activate);
                             cx.notify();
                         }))
                 })
@@ -593,10 +595,11 @@ pub fn menu_button<V: ControlHost>(
             ),
         )
         .when(enabled, |el| {
-            el.on_click(cx.listener(move |this, _event, _window, cx| {
+            el.on_click(cx.listener(move |this, _event, window, cx| {
                 let state = this.control_state_mut();
                 if state.is_menu_open(id) {
                     state.close_menu();
+                    state.restore_menu_focus(window, cx);
                 } else if let Some(bounds) = state.track(id) {
                     state.open_menu_under(id, bounds, "");
                 }

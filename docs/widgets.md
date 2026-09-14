@@ -25,7 +25,7 @@ Every control animates its changes of state — the switch slides, the tick draw
 | `combo` | Pop-up menu button and its list. The list opens over the button with the current option on it, and is shifted to stay inside the window, so one near the bottom needs nothing special. |
 | `slider` | `SliderTrack::Continuous` or `Stepped { stops }`, which draws ticks and snaps. |
 | `progress_bar` | Determinate. |
-| `spinner` | Indeterminate. Only animates while the host is asking for frames — see [Hosting](hosting.md#request-frames-for-animations). |
+| `spinner` | Indeterminate. Requests frames while visible, stops when clipped out of view, and respects reduced motion — see [Hosting](hosting.md#request-frames-for-animations). |
 | `badge` | `BadgeTone::{Neutral, Accent, Danger}`. |
 | `separator` | Hairline rule, horizontal or vertical. |
 | `scrollbar` | Overlay bar. Put it in a `.relative()` wrapper around the scroll container; it renders nothing while the content fits and fades in when it stops fitting. |
@@ -84,7 +84,7 @@ The tree stays the host's, and `flatten_tree` walks it into `TreeRow`s each fram
 
 ![The colour page, with an Oklch chroma and lightness pad](colour.png)
 
-`hue_slider`, `color_pad` (chroma across, lightness up), `swatch_grid`, `hue_wheel`. Everything is `Oklch`.
+`hue_slider`, `saturation_slider`, `color_pad` (chroma across, lightness up), `swatch_grid`, `hue_wheel`. The hue, pad, swatches and wheel use `Oklch`; the saturation slider uses the palette's `0.0..=2.0` chroma multiplier. Zero is grey, one is the original colour strength, and two is more vivid. Its drag reports a normalized track position; convert with `Theme::saturation_from_track` when storing the value.
 
 ## Shortcuts — `vampir::shortcut`
 
@@ -92,7 +92,7 @@ The tree stays the host's, and `flatten_tree` walks it into `TreeRow`s each fram
 
 ## Theme — `vampir::theme`
 
-Every `ControlState` carries a `Theme` — one hue and a `Scheme` of `System`, `Light` or `Dark` — and `ControlState::palette()` is the palette derived from it, crossing over rather than cutting when either changes. `ControlState::observe_appearance` keeps `System` following the desktop. `scheme_picker` and `hue_picker` are the segmented control and the slider bound to the theme, as the gallery's header shows them; `system_dark` reads the desktop. See [Hosting › Themes](hosting.md#themes).
+Every `ControlState` carries a `Theme` — hue, saturation, and a `Scheme` of `System`, `Light` or `Dark` — and `ControlState::palette()` derives the palette with smooth transitions. `ControlState::observe_appearance` keeps `System` following the desktop. The developer or coding agent chooses the app's hue and saturation in code to suit its purpose; user-facing theme controls are optional. `scheme_picker`, `hue_picker` and `saturation_picker` bind directly to the theme when the product calls for customization; `system_dark` reads the desktop. The gallery demonstrates hue and saturation under App theme on the Colour page. See [Hosting › Themes](hosting.md#themes).
 
 ## Text — `vampir::text_input`
 
@@ -116,7 +116,7 @@ input.update(cx, |input, cx| {
 
 ## Colour and lighting — `vampir::color`, `vampir::lighting`
 
-`Palette::from_hue(hue, dark)` derives the whole set from one hue. A host with a richer theme of its own writes the twenty-odd fields directly, which is the point of the struct being plain and public. `Palette::backdrop` is the window's own ground, and `ground(palette.backdrop)` lights it for the root.
+`Palette::from_hue_and_saturation(hue, saturation, dark)` derives the whole set from an app's chosen hue and saturation. `Palette::from_hue(hue, dark)` keeps the original saturation of one, and `Palette::neutral(dark)` is greyscale. A host with a richer theme of its own writes the twenty-odd fields directly, which is the point of the struct being plain and public. `Palette::backdrop` is the window's own ground, and `ground(palette.backdrop)` lights it for the root.
 
 `lighting` is the vocabulary every control draws itself with — `lit`, `raised`, `recessed`, `panel`, `rim`, `glow`, `shade`, `ground`. [Design](design.md) explains what each means and when to reach for it.
 

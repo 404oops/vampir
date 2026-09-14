@@ -258,13 +258,9 @@ fn build_button<V: ControlHost>(
         Some(focus) => keyboard::ring_for(focus, CONTROL_RADIUS, palette)
             .on_key_down(activate)
             .into_any_element(),
-        None => keyboard::ring(
-            ElementId::Name(format!("{id}-ring").into()),
-            CONTROL_RADIUS,
-            palette,
-        )
-        .on_key_down(activate)
-        .into_any_element(),
+        None => keyboard::ring("ring", CONTROL_RADIUS, palette)
+            .on_key_down(activate)
+            .into_any_element(),
     };
 
     div()
@@ -331,10 +327,6 @@ pub fn switch<V: ControlHost>(
     let id: ElementId = id.into();
     let track_off = palette.field_border;
     let track_on = palette.accent;
-    let track_target = if checked { track_on } else { track_off };
-    let track_source = if checked { track_off } else { track_on };
-    let left_target = if checked { left_on } else { left_off };
-    let left_source = if checked { left_off } else { left_on };
     // The on state is the accent at reduced strength: at full saturation a
     // switch shouts louder than the setting it controls.
     let track_opacity = if !enabled {
@@ -352,15 +344,11 @@ pub fn switch<V: ControlHost>(
     // The change is noticed here, from the value, rather than announced by
     // the click handler — so a switch flipped from a menu, a shortcut or the
     // command palette slides exactly as one flipped by the pointer does.
-    let transition = ctx
-        .state()
-        .transition(&id, u64::from(checked), SWITCH_SLIDE);
-    let eased = ease_out_cubic(transition);
+    let on = ctx.state().blend(&id, checked, SWITCH_SLIDE);
     let cx: &mut Context<V> = &mut *ctx.cx;
-    let track_color = crate::color::lerp(track_source, track_target, eased);
-    let left = lerp_f32(left_source, left_target, eased);
+    let track_color = crate::color::lerp(track_off, track_on, on);
+    let left = lerp_f32(left_off, left_on, on);
 
-    let ring_id = ElementId::Name(format!("{id}-ring").into());
     let label: Option<SharedString> = label.map(std::convert::Into::into);
     let on_toggle = Rc::new(on_toggle);
     let toggled = on_toggle.clone();
@@ -406,7 +394,7 @@ pub fn switch<V: ControlHost>(
                 )
                 .when(enabled, |el| {
                     el.child(
-                        keyboard::ring(ring_id, SWITCH_TRACK_RADIUS, palette).on_key_down(
+                        keyboard::ring("ring", SWITCH_TRACK_RADIUS, palette).on_key_down(
                             ctx.cx
                                 .listener(move |this, event: &KeyDownEvent, window, cx| {
                                     if keyboard::key(event) == Some(Key::Activate) {
@@ -452,12 +440,20 @@ pub fn spinbox<V: ControlHost>(
 ) -> impl IntoElement {
     edit_input.update(cx, |input, _cx| {
         input.restyle(palette);
+        input.disabled = !enabled;
     });
     // The box draws its input, not its value, so a step writes the number
     // into the field before the host hears about it.
     let edit = edit_input.clone();
     let commit: Commit<V> = Rc::new(move |this, value, window, cx| {
-        edit.update(cx, |input, cx| input.set_text(&value.to_string(), cx));
+        edit.update(cx, |input, cx| {
+            // The stepper's ring disappears at its limit. Hand focus to
+            // the field before that happens so the keyboard stays live.
+            if value == min || value == max {
+                window.focus(&input.focus_handle, cx);
+            }
+            input.set_text(&value.to_string(), cx);
+        });
         on_change(this, value, window, cx);
     });
     let dec = commit.clone();
@@ -472,7 +468,6 @@ pub fn spinbox<V: ControlHost>(
                        active: bool,
                        cx: &mut Context<V>,
                        handler: Step<V>| {
-        let step_ring = ElementId::Name(format!("{id:?}-ring").into());
         div()
             .id(id)
             .w(px(STEP_BUTTON_SIZE))
@@ -497,7 +492,7 @@ pub fn spinbox<V: ControlHost>(
                         handler(this, window, cx);
                     }))
                     .child(
-                        keyboard::ring(step_ring, STEP_BUTTON_RADIUS, palette).on_key_down(
+                        keyboard::ring("ring", STEP_BUTTON_RADIUS, palette).on_key_down(
                             cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                                 if keyboard::key(event) == Some(Key::Activate) {
                                     cx.stop_propagation();
@@ -566,7 +561,7 @@ pub fn spinbox<V: ControlHost>(
             ))
         })
         .child(step_button(
-            ElementId::Name(format!("{id_prefix}-dec").into()),
+            Tag::new((id_prefix, "spinbox-dec")).element_id(),
             "\u{2212}",
             value > min,
             cx,
@@ -583,7 +578,7 @@ pub fn spinbox<V: ControlHost>(
                 .child(edit_input.clone()),
         )
         .child(step_button(
-            ElementId::Name(format!("{id_prefix}-inc").into()),
+            Tag::new((id_prefix, "spinbox-inc")).element_id(),
             "+",
             value < max,
             cx,
@@ -671,13 +666,12 @@ pub fn text_area<V: ControlHost>(
 ) -> impl IntoElement {
     input.update(cx, |input, _cx| {
         input.restyle(palette);
+        input.disabled = !enabled;
     });
     let focused = input.read(cx).focus_handle.is_focused(window);
     let click_input = input.clone();
     div()
-        .id(ElementId::Name(
-            format!("text-area-{}", input.entity_id()).into(),
-        ))
+        .id(("text-area", input.entity_id()))
         .when_some(height, |el, h| el.h(px(h)))
         .when(height.is_none(), |el| {
             el.flex_1().min_h(px(TEXT_AREA_MIN_H))
@@ -759,6 +753,10 @@ fn combo_placement(chosen: usize, count: usize) -> ComboPlacement {
 /// Opens `id`'s list on `chosen`, scrolled as [`combo_placement`] asks, so
 /// the row that lands on the button is one the list is actually showing.
 fn open_list(state: &mut ControlState, id: ComboId, chosen: usize, count: usize) {
+    let Some(last) = count.checked_sub(1) else {
+        return;
+    };
+    let chosen = chosen.min(last);
     state.open_combo(id, chosen);
     let placement = combo_placement(chosen, count);
     state
@@ -802,10 +800,8 @@ pub fn combo<V: ControlHost>(
 
     let display: SharedString = options
         .get(current_index)
-        .cloned()
-        .unwrap_or_default()
-        .into();
-    let options_owned: Vec<String> = options.to_vec();
+        .map(|option| SharedString::from(option.as_str()))
+        .unwrap_or_default();
     let count = options.len();
     // The list lies over the row that was current when it opened — that
     // rather than `current_index`, which a pick changes under a list still
@@ -833,6 +829,7 @@ pub fn combo<V: ControlHost>(
     let chevron_color: gpui::Hsla = crate::color::to_hsla(palette.control_label);
 
     div()
+        .id(Tag::new((id, "combo")).element_id())
         .relative()
         .when_some(width, |el, w| el.w(px(w)).flex_none())
         .when(width.is_none(), |el| el.w_full())
@@ -853,7 +850,7 @@ pub fn combo<V: ControlHost>(
         )
         .child(
             div()
-                .id(ElementId::Name(format!("{id}-toggle").into()))
+                .id("toggle")
                 .h(px(CONTROL_HEIGHT))
                 .w_full()
                 .pl(px(COMBO_PAD_L))
@@ -880,23 +877,18 @@ pub fn combo<V: ControlHost>(
                 // what a native pop-up does: the list is a view of the
                 // button's value, not a place the keyboard goes.
                 .child(
-                    keyboard::ring(
-                        ElementId::Name(format!("{id}-ring").into()),
-                        CONTROL_RADIUS,
-                        palette,
-                    )
-                    // Once `bind_keys` has run, Escape arrives as this action
-                    // and never as a key. With no list open it is the host's.
-                    .on_action(cx.listener(move |this, _: &Dismiss, _window, cx| {
-                        if !this.control_state().is_combo_open(id) {
-                            cx.propagate();
-                            return;
-                        }
-                        this.control_state_mut().close_combo();
-                        cx.notify();
-                    }))
-                    .on_key_down(cx.listener(
-                        move |this, event: &KeyDownEvent, window, cx| {
+                    keyboard::ring("ring", CONTROL_RADIUS, palette)
+                        // Once `bind_keys` has run, Escape arrives as this action
+                        // and never as a key. With no list open it is the host's.
+                        .on_action(cx.listener(move |this, _: &Dismiss, _window, cx| {
+                            if !this.control_state().is_combo_open(id) {
+                                cx.propagate();
+                                return;
+                            }
+                            this.control_state_mut().close_combo();
+                            cx.notify();
+                        }))
+                        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                             let Some(key) = keyboard::key(event) else {
                                 return;
                             };
@@ -922,7 +914,9 @@ pub fn combo<V: ControlHost>(
                                     let chosen =
                                         this.control_state().combo_highlight_or(current_index);
                                     this.control_state_mut().close_combo();
-                                    key_select(this, chosen, window, cx);
+                                    if chosen < count {
+                                        key_select(this, chosen, window, cx);
+                                    }
                                 }
                                 key => {
                                     let at = this.control_state().combo_highlight_or(current_index);
@@ -930,12 +924,12 @@ pub fn combo<V: ControlHost>(
                                         keyboard::step(key, Orientation::Vertical, at, count)
                                     {
                                         this.control_state_mut().highlight_combo(moved);
+                                        this.control_state().scroll(id).scroll_to_item(moved);
                                     }
                                 }
                             }
                             cx.notify();
-                        },
-                    )),
+                        })),
                 )
                 .child(display)
                 .child(chevron_chip(chip_fill, chevron_color, dark))
@@ -971,7 +965,7 @@ pub fn combo<V: ControlHost>(
                         .snap_to_window_with_margin(px(VIEWPORT_MARGIN))
                         .child(
                             div()
-                                .id(ElementId::Name(format!("{id}-popup").into()))
+                                .id("popup")
                                 .w(button.size.width)
                                 .opacity(reveal)
                                 .rounded(px(CONTROL_RADIUS + 1.0))
@@ -996,7 +990,7 @@ pub fn combo<V: ControlHost>(
                                 })
                                 .child(
                                     div()
-                                        .id(ElementId::Name(format!("{id}-popup-list").into()))
+                                        .id("popup-list")
                                         .max_h(px(COMBO_LIST_MAX_HEIGHT))
                                         .p(px(COMBO_LIST_PADDING))
                                         .flex()
@@ -1005,7 +999,7 @@ pub fn combo<V: ControlHost>(
                                         .overflow_y_scroll()
                                         .restrict_scroll_to_axis()
                                         .track_scroll(&list_scroll)
-                                        .children(options_owned.into_iter().enumerate().map(
+                                        .children(options.iter().enumerate().map(
                                             |(index, option)| {
                                                 let on_select = on_select.clone();
                                                 // While the list is open the highlight
@@ -1013,10 +1007,7 @@ pub fn combo<V: ControlHost>(
                                                 // time it marks what is chosen.
                                                 let highlighted = index == keyboard_at;
                                                 div()
-                                                    .id(ElementId::NamedInteger(
-                                                        format!("{id}-option").into(),
-                                                        index as u64,
-                                                    ))
+                                                    .id(("option", index))
                                                     .h(px(COMBO_ROW_HEIGHT))
                                                     .flex_none()
                                                     .w_full()
@@ -1166,8 +1157,10 @@ pub fn slider<V: ControlHost>(
     // The keyboard lives on the thumb, not on the box around it. The thumb
     // is the current value — the thing the arrows move — and it has a fill,
     // so the ring reads as a ring instead of washing through the control.
-    // There is exactly one of it per slider, so its own element state holds
-    // the handle perfectly well and no shared one is needed.
+    // The track needs the same handle so a press away from the thumb can
+    // hand the keyboard to it directly.
+    let focus = state.focus((id, "thumb"), cx);
+    let click_focus = focus.clone();
     let arrows = cx.listener(move |this, event: &KeyDownEvent, _window, cx| {
         let Some(key) = keyboard::key(event) else {
             return;
@@ -1178,7 +1171,7 @@ pub fn slider<V: ControlHost>(
         };
         if let Some(moved) = moved {
             cx.stop_propagation();
-            this.track_dragged(id, point(moved, 0.0), cx);
+            crate::state::update_track(this, id, point(moved, 0.0), cx);
             cx.notify();
         }
     });
@@ -1198,11 +1191,12 @@ pub fn slider<V: ControlHost>(
                 this.control_state_mut()
                     .begin_track_drag(id, TrackAxis::Horizontal, stops);
                 if let Some((_, at)) = this.control_state().track_ratio_at(event.position) {
-                    this.track_dragged(id, at, cx);
+                    crate::state::update_track(this, id, at, cx);
                 }
                 // Dragging hands the keyboard to the thumb, so the arrows
                 // carry on from wherever the pointer let go.
-                window.focus_next(cx);
+                window.focus(&click_focus, cx);
+                window.prevent_default();
                 cx.notify();
             }),
         )
@@ -1229,14 +1223,7 @@ pub fn slider<V: ControlHost>(
                 .child(
                     div()
                         .relative()
-                        .child(
-                            keyboard::ring(
-                                ElementId::Name(format!("{id}-thumb").into()),
-                                7.0,
-                                palette,
-                            )
-                            .on_key_down(arrows),
-                        )
+                        .child(keyboard::ring_for(&focus, 7.0, palette).on_key_down(arrows))
                         .absolute()
                         .top(px(-4.5))
                         .left(gpui::relative(shown))
@@ -1313,11 +1300,10 @@ pub fn checkbox<V: ControlHost>(
     let label: Option<SharedString> = label.map(std::convert::Into::into);
     let on_toggle = Rc::new(on_toggle);
     let id: ElementId = id.into();
-    let box_id = id.clone();
     // Noticed from the value, so a box ticked by a shortcut or by the host's
     // own code crosses over exactly as a click does. The well fills and
     // rises while the tick draws itself in; unticking runs it backwards.
-    let on = ctx.state().blend((&box_id, "state"), checked, SWITCH_SLIDE);
+    let on = ctx.state().blend((&id, "state"), checked, SWITCH_SLIDE);
     let cx: &mut Context<V> = &mut *ctx.cx;
     let fill = lighting::lit_mix(palette.field_surface, palette.control_fill, 0.1, on);
     let border = crate::color::lerp(
@@ -1394,12 +1380,7 @@ pub fn checkbox<V: ControlHost>(
                 .when(enabled, |el| {
                     let toggled = on_toggle.clone();
                     el.child(
-                        keyboard::ring(
-                            ElementId::Name(format!("{box_id}-ring").into()),
-                            4.0,
-                            palette,
-                        )
-                        .on_key_down(cx.listener(
+                        keyboard::ring("ring", 4.0, palette).on_key_down(cx.listener(
                             move |this, event: &KeyDownEvent, window, cx| {
                                 if keyboard::key(event) == Some(Key::Activate) {
                                     cx.stop_propagation();
@@ -1495,10 +1476,7 @@ pub fn segmented<V: ControlHost>(
         let segment_arrows = if active { arrows.take() } else { None };
         segments.push(
             div()
-                .id(ElementId::NamedInteger(
-                    format!("{id}-segment").into(),
-                    index as u64,
-                ))
+                .id(("segment", index))
                 .relative()
                 .child(slot_probe(id, index, weak.clone()))
                 .when(active && enabled, |el| {
@@ -1540,7 +1518,7 @@ pub fn segmented<V: ControlHost>(
                             cx.notify();
                         }))
                 })
-                .child(SharedString::from(option.clone()))
+                .child(SharedString::from(option))
                 .into_any_element(),
         );
     }
@@ -1670,7 +1648,6 @@ pub fn icon_button<V: ControlHost>(
     let dark = palette.is_dark;
     let on_click = Rc::new(on_click);
     let id: ElementId = id.into();
-    let icon_id = id.clone();
     let fill = if active {
         palette.control_fill
     } else {
@@ -1706,12 +1683,7 @@ pub fn icon_button<V: ControlHost>(
                 }))
                 .relative()
                 .child(
-                    keyboard::ring(
-                        ElementId::Name(format!("{icon_id}-ring").into()),
-                        CONTROL_RADIUS,
-                        palette,
-                    )
-                    .on_key_down(cx.listener(
+                    keyboard::ring("ring", CONTROL_RADIUS, palette).on_key_down(cx.listener(
                         move |this, event: &KeyDownEvent, window, cx| {
                             if keyboard::key(event) == Some(Key::Activate) {
                                 cx.stop_propagation();
@@ -1797,7 +1769,7 @@ pub fn scrollbar<V: ControlHost>(
 
     let drag_handle = handle.clone();
     let track = div()
-        .id(ElementId::Name(format!("scrollbar-{id}").into()))
+        .id(Tag::new((id, "scrollbar")).element_id())
         .absolute()
         .opacity(shown)
         // Block clicks and hover from bleeding into rows under the track,
@@ -1938,13 +1910,12 @@ pub fn chip<V: ControlHost>(
     let text: SharedString = SharedString::from(label);
     let on_click = Rc::new(on_click);
     let id: ElementId = id.into();
-    let chip_id = id.clone();
     // Selected takes the accent; the rest stay quiet, so one chip reads out
     // of a field of them at a glance. The accent washes in rather than
     // switching on, whoever toggled the chip.
     let on = view
         .control_state()
-        .blend((&chip_id, "state"), selected, SWITCH_SLIDE);
+        .blend((&id, "state"), selected, SWITCH_SLIDE);
     let mix = |a, b| crate::color::lerp(a, b, on);
     let fill = mix(palette.soft_fill, palette.control_fill);
     let fill_hover = mix(palette.soft_fill_hover, palette.control_fill);
@@ -1988,12 +1959,7 @@ pub fn chip<V: ControlHost>(
                 // one: chips toggle independently, so they are a row of
                 // checkboxes wearing a different coat, not a single choice.
                 .child(
-                    keyboard::ring(
-                        ElementId::Name(format!("{chip_id}-ring").into()),
-                        CONTROL_RADIUS,
-                        palette,
-                    )
-                    .on_key_down(cx.listener(
+                    keyboard::ring("ring", CONTROL_RADIUS, palette).on_key_down(cx.listener(
                         move |this, event: &KeyDownEvent, window, cx| {
                             if keyboard::key(event) == Some(Key::Activate) {
                                 cx.stop_propagation();
@@ -2028,7 +1994,7 @@ pub fn chip_group<V: ControlHost>(
         let on_select = on_select.clone();
         chips.push(
             chip(
-                ElementId::NamedInteger(format!("{id}-chip").into(), index as u64),
+                Tag::new((id, "chip", index)).element_id(),
                 option,
                 selected.holds(index),
                 enabled,
@@ -2079,6 +2045,16 @@ impl Choice {
     }
 }
 
+fn radio_tab_stop(choices: &[Choice], selected: usize, enabled: bool) -> Option<usize> {
+    if !enabled {
+        None
+    } else if choices.get(selected).is_some_and(|choice| choice.enabled) {
+        Some(selected)
+    } else {
+        choices.iter().position(|choice| choice.enabled)
+    }
+}
+
 /// Vertical list of mutually exclusive choices, each a dot and a label.
 ///
 /// Reach for it over [`segmented`] when the choices need explaining, or when
@@ -2111,6 +2087,9 @@ pub fn radio_group<V: ControlHost>(
         .filter(|(_, choice)| choice.enabled)
         .map(|(index, _)| index)
         .collect();
+    // A selected choice can become unavailable without changing the host's
+    // value. Keep the remaining choices reachable from the keyboard.
+    let keyboard_at = radio_tab_stop(choices, selected, enabled);
     let here = live
         .iter()
         .position(|index| *index == selected)
@@ -2121,7 +2100,12 @@ pub fn radio_group<V: ControlHost>(
             let Some(key) = keyboard::key(event) else {
                 return;
             };
-            if let Some(moved) = keyboard::step(key, Orientation::Vertical, here, live.len()) {
+            let moved = if key == Key::Activate {
+                Some(here)
+            } else {
+                keyboard::step(key, Orientation::Vertical, here, live.len())
+            };
+            if let Some(moved) = moved {
                 cx.stop_propagation();
                 on_select(this, live[moved], window, cx);
                 cx.notify();
@@ -2142,14 +2126,11 @@ pub fn radio_group<V: ControlHost>(
         let on = view
             .control_state()
             .blend((id, "choice-on", index), active, SWITCH_SLIDE);
-        // Only the current choice carries the handle and the arrow keys.
-        let dot_arrows = if active { arrows.take() } else { None };
+        let tab_stop = keyboard_at == Some(index);
+        let dot_arrows = if tab_stop { arrows.take() } else { None };
         rows.push(
             div()
-                .id(ElementId::NamedInteger(
-                    format!("{id}-choice").into(),
-                    index as u64,
-                ))
+                .id(("choice", index))
                 .flex()
                 .items_start()
                 .gap(px(8.0))
@@ -2172,17 +2153,8 @@ pub fn radio_group<V: ControlHost>(
                     // carries the ring: it *is* the option, and it has a
                     // fill for the ring to sit around.
                     div()
-                        .id(ElementId::NamedInteger(
-                            format!("{id}-dot").into(),
-                            index as u64,
-                        ))
+                        .id("dot")
                         .relative()
-                        .when(active, |el| {
-                            el.child(
-                                keyboard::ring_for(&focus, 7.5, palette)
-                                    .when_some(dot_arrows, |el, arrows| el.on_key_down(arrows)),
-                            )
-                        })
                         .mt(px(2.0))
                         .w(px(15.0))
                         .h(px(15.0))
@@ -2208,6 +2180,12 @@ pub fn radio_group<V: ControlHost>(
                                     .rounded_full()
                                     .opacity(on)
                                     .bg(lighting::lit(palette.control_fill, 0.12)),
+                            )
+                        })
+                        .when(tab_stop, |el| {
+                            el.child(
+                                keyboard::ring_for(&focus, 7.5, palette)
+                                    .when_some(dot_arrows, |el, arrows| el.on_key_down(arrows)),
                             )
                         }),
                 )
@@ -2327,19 +2305,17 @@ pub fn search_field<V: ControlHost>(
         .when(has_text, |el| {
             el.child(
                 div()
-                    .id(ElementId::Name(format!("{id}-clear").into()))
+                    .id(Tag::new((id, "search-clear")).element_id())
                     .relative()
                     .child(
-                        keyboard::ring(
-                            ElementId::Name(format!("{id}-clear-ring").into()),
-                            8.0,
-                            palette,
-                        )
-                        .on_key_down(cx.listener(
-                            move |_host, event: &KeyDownEvent, _window, cx| {
+                        keyboard::ring("ring", 8.0, palette).on_key_down(cx.listener(
+                            move |_host, event: &KeyDownEvent, window, cx| {
                                 if keyboard::key(event) == Some(Key::Activate) {
                                     cx.stop_propagation();
-                                    key_clear.update(cx, |input, cx| input.set_text("", cx));
+                                    key_clear.update(cx, |input, cx| {
+                                        window.focus(&input.focus_handle, cx);
+                                        input.set_text("", cx);
+                                    });
                                     cx.notify();
                                 }
                             },
@@ -2358,8 +2334,11 @@ pub fn search_field<V: ControlHost>(
                     .text_size(px(11.0))
                     .text_color(palette.text_secondary)
                     .hover(move |style| style.bg(palette.row_hover))
-                    .on_click(cx.listener(move |_host, _event, _window, cx| {
-                        clear_input.update(cx, |input, cx| input.set_text("", cx));
+                    .on_click(cx.listener(move |_host, _event, window, cx| {
+                        clear_input.update(cx, |input, cx| {
+                            window.focus(&input.focus_handle, cx);
+                            input.set_text("", cx);
+                        });
                         cx.notify();
                     }))
                     .child("\u{2715}"),
@@ -2382,24 +2361,32 @@ fn spinner_phase(since_epoch: std::time::Duration) -> f32 {
 
 /// Indeterminate busy indicator: an arc that turns once a second.
 ///
-/// It animates by being repainted, so a host must keep asking for frames
-/// while one is on screen. That is deliberate: a spinner nobody can see
-/// should not be holding the display link open.
+/// Requests its own frames while visible, stopping when clipped out of a
+/// scrolling container. It stays still when reduced motion is enabled.
 pub fn spinner(size: f32, palette: Palette) -> impl IntoElement {
     let color: gpui::Hsla = crate::color::to_hsla(palette.accent);
-    // A wall-clock phase, so several spinners on one screen turn together
-    // rather than each from its own start.
-    let phase = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(spinner_phase)
-        .unwrap_or(0.0);
-    let start = phase * std::f32::consts::TAU;
     let radius = size / 2.0 - 1.5;
 
     div().w(px(size)).h(px(size)).flex_none().child(
         canvas(
             |_bounds, _window, _cx| {},
-            move |bounds, _state, window, _cx| {
+            move |bounds, _state, window, cx| {
+                // A page can stay mounted while its spinner is scrolled
+                // out of sight. Only painting knows whether it is visible.
+                if bounds.intersect(&window.content_mask().bounds).is_empty() {
+                    return;
+                }
+                let phase = if cx.reduce_motion() {
+                    0.0
+                } else {
+                    window.request_animation_frame();
+                    // A wall-clock phase keeps separate spinners in step.
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(spinner_phase)
+                        .unwrap_or(0.0)
+                };
+                let start = phase * std::f32::consts::TAU;
                 let origin = bounds.origin;
                 let centre = point(origin.x + px(size / 2.0), origin.y + px(size / 2.0));
                 let mut builder = PathBuilder::stroke(px(1.8));
@@ -2540,5 +2527,29 @@ mod tests {
         let furthest = content - COMBO_LIST_MAX_HEIGHT;
         assert!(combo_placement(19, 20).scroll <= furthest);
         assert_eq!(combo_placement(40, 20).scroll, furthest);
+    }
+
+    #[test]
+    fn empty_combos_do_not_open_and_stale_selections_open_on_a_real_option() {
+        let mut state = ControlState::default();
+        open_list(&mut state, "empty", 0, 0);
+        assert!(!state.is_combo_open("empty"));
+        open_list(&mut state, "short", 20, 3);
+        assert_eq!(state.combo_highlight_or(20), 2);
+    }
+
+    #[test]
+    fn radio_focus_skips_unavailable_choices_and_disabled_groups() {
+        let choices = [
+            Choice::new("Unavailable").disabled(),
+            Choice::new("First"),
+            Choice::new("Second"),
+        ];
+        assert_eq!(radio_tab_stop(&choices, 2, true), Some(2));
+        assert_eq!(radio_tab_stop(&choices, 0, true), Some(1));
+        assert_eq!(radio_tab_stop(&choices, 99, true), Some(1));
+        assert_eq!(radio_tab_stop(&choices, 1, false), None);
+        assert_eq!(radio_tab_stop(&choices[..1], 0, true), None);
+        assert_eq!(radio_tab_stop(&[], 0, true), None);
     }
 }

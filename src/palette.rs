@@ -2,12 +2,25 @@
 //!
 //! [`Palette`] is deliberately small: roughly twenty colours, all of them
 //! things a control actually paints. A host with its own richer theme fills
-//! one in from that theme; a host without one calls [`Palette::from_hue`]
-//! and gets the whole set derived from a single hue.
+//! one in from that theme; a host without one calls
+//! [`Palette::from_hue_and_saturation`] with the app's chosen colours.
 
 use gpui::Rgba;
 
 use crate::color::{TRANSPARENT, WHITE, argb, oklch_to_color};
+
+/// The toolkit's original pastel chroma, unchanged by the saturation gain.
+pub const DEFAULT_SATURATION: f64 = 1.0;
+/// Twice the original chroma; colors outside sRGB are clipped into its gamut.
+pub const MAX_SATURATION: f64 = 2.0;
+
+pub(crate) fn normalized_saturation(saturation: f64) -> f64 {
+    if saturation.is_nan() {
+        DEFAULT_SATURATION
+    } else {
+        saturation.clamp(0.0, MAX_SATURATION)
+    }
+}
 
 /// Colours for one colour scheme at one hue.
 ///
@@ -78,14 +91,24 @@ impl Palette {
     /// Chroma stays inside a soft range, so every hue lands as a pastel of
     /// the same intensity and a hue slider never sends the UI garish.
     pub fn from_hue(hue: f64, dark: bool) -> Self {
-        let pastel = |l: f64, c: f64, dh: f64| oklch_to_color(l, c.clamp(0.0, 0.16), hue + dh);
+        Self::from_hue_and_saturation(hue, DEFAULT_SATURATION, dark)
+    }
+
+    /// The palette with a gain on every role's OKLCH chroma, including
+    /// destructive colors: `0` is grayscale, `1` the original pastels, and
+    /// `2` vivid. Lightness stays the same before sRGB gamut clipping.
+    /// Values outside `0..=2` are clamped; NaN uses [`DEFAULT_SATURATION`].
+    pub fn from_hue_and_saturation(hue: f64, saturation: f64, dark: bool) -> Self {
+        let saturation = normalized_saturation(saturation);
+        let color = |l: f64, c: f64, h: f64| oklch_to_color(l, c * saturation, h);
+        let pastel = |l: f64, c: f64, dh: f64| color(l, c.clamp(0.0, 0.16), hue + dh);
         let pick =
             |dark_color: Rgba, light_color: Rgba| if dark { dark_color } else { light_color };
 
         let accent = pick(pastel(0.78, 0.105, 0.0), pastel(0.62, 0.105, 0.0));
         let selection = pick(pastel(0.84, 0.125, 12.0), pastel(0.68, 0.125, 12.0));
-        let control_fill = pick(oklch_to_color(0.36, 0.06, hue), accent);
-        let control_fill_hover = pick(oklch_to_color(0.44, 0.08, hue + 4.0), selection);
+        let control_fill = pick(color(0.36, 0.06, hue), accent);
+        let control_fill_hover = pick(color(0.44, 0.08, hue + 4.0), selection);
         let control_label = pick(pastel(0.97, 0.006, 0.0), WHITE);
         let border = pick(pastel(0.33, 0.016, 0.0), pastel(0.86, 0.014, 0.0));
         let text_primary = pick(pastel(0.95, 0.010, 0.0), pastel(0.24, 0.018, 0.0));
@@ -93,17 +116,14 @@ impl Palette {
         Self {
             is_dark: dark,
             accent,
-            backdrop: pick(
-                oklch_to_color(0.285, 0.012, hue),
-                oklch_to_color(0.955, 0.012, hue),
-            ),
+            backdrop: pick(color(0.285, 0.012, hue), color(0.955, 0.012, hue)),
 
             text_primary,
             text_secondary: pick(pastel(0.86, 0.015, 0.0), pastel(0.36, 0.015, 0.0)),
 
             field_surface: pick(pastel(0.20, 0.014, -2.0), WHITE),
             field_border: pick(pastel(0.35, 0.016, 0.0), pastel(0.87, 0.014, 0.0)),
-            field_border_strong: pick(oklch_to_color(0.48, 0.060, hue), pastel(0.72, 0.065, 0.0)),
+            field_border_strong: pick(color(0.48, 0.060, hue), pastel(0.72, 0.065, 0.0)),
 
             area_surface: pick(pastel(0.26, 0.016, -2.0), WHITE),
             area_border: pick(border, pastel(0.84, 0.018, 0.0)),
@@ -113,26 +133,23 @@ impl Palette {
             control_fill,
             control_label,
 
-            soft_fill: pick(oklch_to_color(0.36, 0.06, hue), pastel(0.90, 0.048, 0.0)),
-            soft_fill_hover: pick(
-                oklch_to_color(0.44, 0.08, hue + 4.0),
-                pastel(0.84, 0.058, 0.0),
-            ),
+            soft_fill: pick(color(0.36, 0.06, hue), pastel(0.90, 0.048, 0.0)),
+            soft_fill_hover: pick(color(0.44, 0.08, hue + 4.0), pastel(0.84, 0.058, 0.0)),
             soft_label: pick(control_label, pastel(0.26, 0.040, 0.0)),
 
             primary_fill: pick(control_fill, pastel(0.70, 0.095, 0.0)),
             primary_fill_hover: pick(control_fill_hover, pastel(0.64, 0.105, 0.0)),
             primary_label: pick(control_label, WHITE),
 
-            danger_fill: pick(oklch_to_color(0.38, 0.07, 18.0), pastel(0.91, 0.042, 16.0)),
-            danger_fill_hover: pick(oklch_to_color(0.44, 0.09, 18.0), pastel(0.86, 0.052, 16.0)),
+            danger_fill: pick(color(0.38, 0.07, 18.0), pastel(0.91, 0.042, 16.0)),
+            danger_fill_hover: pick(color(0.44, 0.09, 18.0), pastel(0.86, 0.052, 16.0)),
             danger_label: pick(pastel(0.97, 0.006, 0.0), pastel(0.42, 0.085, 16.0)),
         }
     }
 
     /// Neutral grey palette for a host with no hue of its own.
     pub fn neutral(dark: bool) -> Self {
-        Self::from_hue(265.0, dark)
+        Self::from_hue_and_saturation(0.0, 0.0, dark)
     }
 
     /// The palette part way between two others, for a scheme or a hue that
@@ -198,7 +215,33 @@ impl Default for Palette {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::color::relative_luminance;
+    use crate::color::{channels, relative_luminance};
+
+    fn roles(palette: Palette) -> [Rgba; 21] {
+        [
+            palette.accent,
+            palette.backdrop,
+            palette.text_primary,
+            palette.text_secondary,
+            palette.field_surface,
+            palette.field_border,
+            palette.field_border_strong,
+            palette.area_surface,
+            palette.area_border,
+            palette.row_hover,
+            palette.control_fill,
+            palette.control_label,
+            palette.soft_fill,
+            palette.soft_fill_hover,
+            palette.soft_label,
+            palette.primary_fill,
+            palette.primary_fill_hover,
+            palette.primary_label,
+            palette.danger_fill,
+            palette.danger_fill_hover,
+            palette.danger_label,
+        ]
+    }
 
     #[test]
     fn schemes_run_in_opposite_directions() {
@@ -216,21 +259,89 @@ mod tests {
     fn every_hue_stays_in_gamut() {
         for hue in (0..360).step_by(15) {
             for dark in [true, false] {
-                let palette = Palette::from_hue(hue as f64, dark);
-                for color in [
-                    palette.accent,
-                    palette.backdrop,
-                    palette.control_fill,
-                    palette.primary_fill,
-                    palette.soft_fill,
-                    palette.danger_fill,
-                ] {
-                    for channel in crate::color::channels(color) {
-                        assert!(
-                            (0.0..=1.0).contains(&channel),
-                            "hue {hue} dark {dark} produced {channel}"
-                        );
+                for saturation in [0.0, 0.5, DEFAULT_SATURATION, MAX_SATURATION] {
+                    let palette = Palette::from_hue_and_saturation(hue as f64, saturation, dark);
+                    for color in roles(palette) {
+                        for channel in channels(color) {
+                            assert!(
+                                (0.0..=1.0).contains(&channel),
+                                "hue {hue} saturation {saturation} dark {dark} produced {channel}"
+                            );
+                        }
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_saturation_makes_every_role_neutral_including_danger() {
+        for dark in [false, true] {
+            let neutral = Palette::neutral(dark);
+            for hue in [0.0, 37.0, 180.0, 268.0, 359.9] {
+                let palette = Palette::from_hue_and_saturation(hue, 0.0, dark);
+                assert_eq!(palette, neutral);
+                for color in roles(palette) {
+                    let [r, g, b, a] = channels(color);
+                    assert_eq!(r, g);
+                    assert_eq!(g, b);
+                    assert_eq!(a, 1.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn saturation_is_chroma_gain_and_one_keeps_the_original_palette() {
+        for hue in [0.0, 87.0, 193.0, 268.0] {
+            for dark in [false, true] {
+                assert_eq!(
+                    Palette::from_hue(hue, dark),
+                    Palette::from_hue_and_saturation(hue, DEFAULT_SATURATION, dark)
+                );
+                for saturation in [0.5, 1.0, 2.0] {
+                    let palette = Palette::from_hue_and_saturation(hue, saturation, dark);
+                    let lightness = if dark { 0.78 } else { 0.62 };
+                    assert_eq!(
+                        palette.accent,
+                        oklch_to_color(lightness, 0.105 * saturation, hue)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_saturation_is_normalized_for_every_role() {
+        for (input, expected) in [
+            (f64::NAN, DEFAULT_SATURATION),
+            (f64::NEG_INFINITY, 0.0),
+            (-1.0, 0.0),
+            (0.5, 0.5),
+            (3.0, MAX_SATURATION),
+            (f64::INFINITY, MAX_SATURATION),
+        ] {
+            assert_eq!(normalized_saturation(input), expected);
+            for dark in [false, true] {
+                assert_eq!(
+                    Palette::from_hue_and_saturation(268.0, input, dark),
+                    Palette::from_hue_and_saturation(268.0, expected, dark)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vivid_secondary_surfaces_keep_readable_labels() {
+        for hue in (0..360).step_by(15) {
+            for dark in [false, true] {
+                let palette = Palette::from_hue_and_saturation(hue as f64, MAX_SATURATION, dark);
+                let foreground = relative_luminance(palette.soft_label);
+                for background in [palette.soft_fill, palette.soft_fill_hover] {
+                    let background = relative_luminance(background);
+                    let contrast =
+                        (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05);
+                    assert!(contrast >= 4.5, "hue {hue} dark {dark}: {contrast}");
                 }
             }
         }

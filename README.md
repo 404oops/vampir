@@ -17,7 +17,7 @@ A widget toolkit for <a href="https://www.gpui.rs">GPUI</a>.<br> Buttons, fields
 
 Vampir uses a simple physical-surface visual style: panels are lit from above, interactive controls look raised, and fields and tracks look recessed. The style is shared through a small set of lighting helpers so controls remain consistent. Nothing changes in a single frame: a state that flips slides between its looks, a thing that moves slides to where it is going, and a change of scheme crosses over — whoever made the change.
 
-Vampir is a library, not an application. It has no opinion about your app's windows, navigation or data model, and its only dependencies are `gpui` and `unicode-segmentation`.
+Vampir is a library, not an application. It has no opinion about your app's windows, navigation or data model. The core depends only on `gpui` and `unicode-segmentation`; the default `app-icon` feature adds platform-specific icon support.
 
 ## Add Vampir to a project
 
@@ -68,13 +68,13 @@ impl Render for Editor {
 
 Two calls make the keyboard and the mouse work everywhere: `vampir::bind_keys(cx)` once when the application starts binds Tab, Shift-Tab, Escape and the text-editing keys, and `vampir::root(element, self, cx)` on the view's root gives those keys somewhere to land, tracks the drags that outlive their control, and gives the keyboard somewhere to fall back to. Every control handles its own keys — Space on a button, arrows in a group — with no setup at all; see [Keyboard and focus](docs/keyboard.md).
 
-Every `ControlState` carries a theme: one hue, and a colour scheme that follows the desktop until someone picks one. `self.controls.palette()` is the palette it derives, crossing over rather than cutting when either changes. A host with a theme of its own builds a `Palette` from it instead:
+Every `ControlState` carries a theme: hue, saturation, and a colour scheme that can follow the desktop. `self.controls.palette()` derives the palette with smooth transitions. Choose the app's hue and saturation in code to suit its purpose and visual identity; the developer or coding agent makes those design choices without requiring the end user to configure a theme. A host with a theme of its own can build a `Palette` directly:
 
 ```rust
-let palette = Palette::from_hue(268.0, /* dark */ true);
+let palette = Palette::from_hue_and_saturation(210.0, 0.55, /* dark */ true);
 ```
 
-The same palette code supports light and dark schemes, and keeps generated colours within a restrained chroma range.
+Saturation runs from zero (greyscale) through one (the original colour strength) to two (more vivid), in both light and dark schemes. `Palette::from_hue` keeps saturation one, and `Palette::neutral` is greyscale. Add theme pickers only when appearance customization is part of the product; see [Hosting › Themes](docs/hosting.md#themes) for app defaults and optional controls.
 
 ## Try the gallery
 
@@ -82,7 +82,7 @@ The same palette code supports light and dark schemes, and keeps generated colou
 cargo run --example gallery
 ```
 
-The gallery puts every widget in one window and is the smallest complete example of hosting Vampir. It opens in the desktop's light or dark scheme and follows it until you pick one; its hue slider and scheme control rebuild the palette live.
+The gallery puts every widget in one window and is the smallest complete example of hosting Vampir. It opens in the desktop's light or dark scheme and follows it until you pick one. The Colour page's App theme section demonstrates hue and saturation controls that rebuild the palette live; the header's scheme control makes it easy to check both light and dark.
 
 It also demonstrates a macOS menu bar, keyboard shortcuts and app bundling. To build and open it as a macOS application:
 
@@ -97,7 +97,7 @@ See [Shipping a macOS app](docs/macos-apps.md) for details.
 | ![Text fields, a rich-text area and a shortcut recorder](docs/fields.png) | ![A tab bar, a tree, a table and a split](docs/data.png) |
 | **Fields.** A full text input: selection, IME, undo, clipboard, multi-line wrapping, and rich text through a `Highlighter` closure. | **Data.** A draggable tab bar, a flattened tree, a sortable table header and a split divider. |
 | ![The command palette open over the fields page](docs/overlays.png) | ![The colour page, with an Oklch chroma and lightness pad](docs/colour.png) |
-| **Overlays.** Command palette with fuzzy matching, context menus, tooltips and modal dialogs. | **Colour.** Hue slider, chroma-and-lightness pad and preset swatches, all Oklch. |
+| **Overlays.** Command palette with fuzzy matching, context menus, tooltips and modal dialogs. | **Colour.** Hue and saturation sliders, an Oklch chroma-and-lightness pad, and preset swatches. |
 
 The gallery supports both colour schemes:
 
@@ -113,9 +113,9 @@ The gallery supports both colour schemes:
 
 **Data** — `tree_row` with `flatten_tree`, `table_header` and `table_row` with `Column` and `SortDirection`.
 
-**Theme** — `Theme`, `Scheme`, `scheme_picker`, `hue_picker`: one hue and a scheme that follows the desktop, and the palette derived from them.
+**Theme** — `Theme`, `Scheme`, optional `scheme_picker`, `hue_picker` and `saturation_picker`: hue and saturation chosen by the app, a scheme that follows the desktop, and the palette derived from them.
 
-**Colour** — `Palette`, `hue_slider`, `color_pad`, `swatch_grid`, `hue_wheel`, and the `Oklch` type they all speak.
+**Colour** — `Palette`, `hue_slider`, `saturation_slider`, `color_pad`, `swatch_grid`, `hue_wheel`, and `Oklch` colour values. `DEFAULT_SATURATION` and `MAX_SATURATION` define the theme's original strength and upper limit.
 
 **Text** — `TextInput`, `InputStyle`, `Span` and `Highlighter`.
 

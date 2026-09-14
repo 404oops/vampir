@@ -16,6 +16,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, DefaultHasher, Hash, Hasher};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -23,7 +24,7 @@ use gpui::{
     MouseMoveEvent, Pixels, Point, ScrollHandle, SharedString, Window,
 };
 
-use crate::palette::Palette;
+use crate::palette::{Palette, normalized_saturation};
 pub use crate::scroll::{ScrollAxis, ScrollDrag, apply_scroll_drag};
 use crate::text_input::TextInput;
 use crate::theme::{Theme, system_dark};
@@ -83,6 +84,10 @@ impl Tag {
     /// to it.
     pub fn with(self, and: impl Hash) -> Self {
         Tag::new((self.0, and))
+    }
+
+    pub(crate) fn element_id(self) -> ElementId {
+        ("vampir", self.0).into()
     }
 }
 
@@ -248,6 +253,21 @@ fn micros(duration: Duration) -> u32 {
     u32::try_from(duration.as_micros()).unwrap_or(u32::MAX)
 }
 
+fn next_dialog_button(indices: &[usize], current: Option<usize>, backward: bool) -> Option<usize> {
+    let count = indices.len();
+    if count == 0 {
+        return None;
+    }
+    let here = current.and_then(|current| indices.iter().position(|&index| index == current));
+    let next = match (here, backward) {
+        (Some(here), true) => (here + count - 1) % count,
+        (Some(here), false) => (here + 1) % count,
+        (None, true) => count - 1,
+        (None, false) => 0,
+    };
+    Some(indices[next])
+}
+
 // ---- Overlays and gestures --------------------------------------------------
 
 /// Which way a drag reads its position out of a track.
@@ -371,7 +391,7 @@ const ROOT_FOCUS: &str = "vampir-root";
 /// Per-view control state. `Default` is the empty state, which is also the
 /// right starting point: nothing open, nothing animating, nothing dragged.
 pub struct ControlState {
-    /// The hue and scheme the palette is derived from, for a host with no
+    /// The hue, saturation and scheme the palette is derived from, for a host with no
     /// theme of its own. See [`crate::theme`].
     pub theme: Theme,
 
@@ -399,6 +419,7 @@ pub struct ControlState {
     /// render, from `&ControlState`: a control notices its own change while
     /// it renders. See [`ControlState::transition`].
     records: RefCell<TagMap<Entry>>,
+    color_pads: RefCell<crate::swatch::PadCache>,
     /// Sizes to remember after the thing measured has gone: a disclosure's
     /// body, so it can be shown growing to the height it will have rather
     /// than appearing at it. Written from paint, kept until overwritten,
@@ -456,12 +477,14 @@ pub struct ControlState {
     /// [`ControlState::dialog_button_focus`]. Set every frame the dialog
     /// renders and cleared when it does not. See
     /// [`crate::keyboard::move_focus`].
-    dialog_trap: Cell<Option<(ComboId, usize)>>,
+    dialog_trap: RefCell<Option<(ComboId, Vec<usize>)>>,
 
     /// The open command palette, if any.
     pub palette_overlay: Option<OpenPalette>,
     /// The shortcut recorder waiting for a key chord, if any.
     pub recording: Option<ComboId>,
+    pub(crate) recording_keys: Option<[gpui::Subscription; 2]>,
+    pub(crate) recording_activation: Option<&'static str>,
     /// True while the mouse is in charge and the focus ring is hidden. Any
     /// mouse press sets it and Tab clears it, and the first Tab after the
     /// mouse only shows where the keyboard is: see `keyboard::move_focus`.
@@ -485,6 +508,7 @@ impl ControlState {
             frame: Cell::new(0),
             time_scale: None,
             records: RefCell::default(),
+            color_pads: RefCell::default(),
             measured: TagMap::default(),
             focus_handles: RefCell::default(),
             scroll_handles: RefCell::default(),
@@ -495,9 +519,11 @@ impl ControlState {
             menu_return_focus: None,
             dialog: None,
             dialog_return_focus: None,
-            dialog_trap: Cell::new(None),
+            dialog_trap: RefCell::new(None),
             palette_overlay: None,
             recording: None,
+            recording_keys: None,
+            recording_activation: None,
             ring_hidden: false,
             drag: None,
         }
@@ -576,16 +602,14 @@ impl ControlState {
     pub fn combo_fade(&self, combo: ComboId) -> Option<(f32, bool)> {
         let open = self.combo.as_ref().filter(|open| open.id == combo)?;
         let reveal = self.scaled(COMBO_REVEAL);
-        match open.closing {
-            Some(since) => {
-                let t = crate::easing::progress(since, reveal);
-                (t < 1.0).then(|| (1.0 - crate::easing::ease_in_cubic(t), true))
-            }
-            None => {
-                let t = crate::easing::progress(open.opened_at, reveal);
-                Some((crate::easing::ease_out_cubic(t), t < 1.0))
-            }
-        }
+        let fade = crate::easing::modal_opacity_at(
+            Some(open.opened_at),
+            open.closing,
+            Instant::now(),
+            reveal,
+            reveal,
+        );
+        (open.closing.is_none() || fade.1).then_some(fade)
     }
 
     /// A press landed outside the open list of `combo`: closes it, and
@@ -612,7 +636,7 @@ impl ControlState {
     /// full speed the shutter is slower than the slide.
     /// [`ControlState::slow_motion_from_env`] reads it from the environment.
     pub fn set_time_scale(&mut self, scale: f32) {
-        self.time_scale = (scale > 0.0 && scale != 1.0).then_some(scale);
+        self.time_scale = (scale.is_finite() && scale > 0.0 && scale != 1.0).then_some(scale);
     }
 
     /// The time scale every animation is running at, when it is not one.
@@ -636,7 +660,8 @@ impl ControlState {
     /// A duration at the current time scale.
     pub fn scaled(&self, duration: Duration) -> Duration {
         match self.time_scale {
-            Some(scale) => duration.mul_f32(scale),
+            Some(scale) => Duration::try_from_secs_f64(duration.as_secs_f64() * f64::from(scale))
+                .unwrap_or(Duration::MAX),
             None => duration,
         }
     }
@@ -665,14 +690,15 @@ impl ControlState {
 
     /// The palette to hand every control this frame.
     ///
-    /// The theme's scheme and hue are the truth; this is what is shown, and
+    /// The theme's scheme, hue and saturation are the truth; this is what is shown, and
     /// it follows the truth rather than jumping to it. A scheme crosses over
     /// through [`Palette::mix`] over [`SCHEME_FADE`], so a change from a menu
     /// item, a shortcut, a command palette or the desktop switching to dark
     /// at sunset all arrive the same way: every colour on screen mixed
     /// between the palette it had and the one it is getting. A hue set from
-    /// anywhere but its own slider glides the short way round; while the
-    /// slider is held the colours sit under the hand.
+    /// anywhere but its own slider glides the short way round. Saturation
+    /// changes also glide; while either slider is held its value sits under
+    /// the hand.
     pub fn palette(&self) -> Palette {
         let theme = &self.theme;
         let darkness = self.tween(
@@ -688,14 +714,23 @@ impl ControlState {
         } else {
             self.tween_angle("vampir-scheme-hue", theme.hue as f32, MOVE)
         });
+        let saturation = normalized_saturation(theme.saturation) as f32;
+        let saturation_held = theme
+            .saturation_track()
+            .is_some_and(|track| self.is_dragging(track));
+        let saturation = f64::from(if saturation_held {
+            self.snap("vampir-scheme-saturation", saturation)
+        } else {
+            self.tween("vampir-scheme-saturation", saturation, MOVE)
+        });
         if darkness <= 0.0 {
-            Palette::from_hue(hue, false)
+            theme.palette_at(hue, saturation, false)
         } else if darkness >= 1.0 {
-            Palette::from_hue(hue, true)
+            theme.palette_at(hue, saturation, true)
         } else {
             Palette::mix(
-                Palette::from_hue(hue, false),
-                Palette::from_hue(hue, true),
+                theme.palette_at(hue, saturation, false),
+                theme.palette_at(hue, saturation, true),
                 darkness,
             )
         }
@@ -707,6 +742,7 @@ impl ControlState {
     /// first paints, and keeps Tab among its own buttons until it closes.
     pub fn open_dialog(&mut self, id: ComboId) {
         self.dismiss_popups();
+        *self.dialog_trap.get_mut() = None;
         self.dialog = Some(OpenDialog {
             id,
             opened_at: Instant::now(),
@@ -718,6 +754,7 @@ impl ControlState {
     /// until the exit finishes; a dialog closed twice leaves the first exit
     /// running rather than restarting it.
     pub fn close_dialog(&mut self) {
+        *self.dialog_trap.get_mut() = None;
         if let Some(dialog) = self.dialog.as_mut()
             && dialog.closing.is_none()
         {
@@ -737,19 +774,14 @@ impl ControlState {
     /// mid-entrance fades from wherever the entrance had got to.
     pub fn dialog_fade(&self, id: ComboId) -> Option<(f32, bool)> {
         let dialog = self.dialog.as_ref().filter(|dialog| dialog.id == id)?;
-        match dialog.closing {
-            Some(since) => {
-                let t = crate::easing::progress(since, self.scaled(crate::easing::MODAL_EXIT));
-                (t < 1.0).then(|| (1.0 - crate::easing::ease_in_cubic(t), true))
-            }
-            None => {
-                let t = crate::easing::progress(
-                    dialog.opened_at,
-                    self.scaled(crate::easing::MODAL_ENTER),
-                );
-                Some((crate::easing::ease_out_cubic(t), t < 1.0))
-            }
-        }
+        let fade = crate::easing::modal_opacity_at(
+            Some(dialog.opened_at),
+            dialog.closing,
+            Instant::now(),
+            self.scaled(crate::easing::MODAL_ENTER),
+            self.scaled(crate::easing::MODAL_EXIT),
+        );
+        (dialog.closing.is_none() || fade.1).then_some(fade)
     }
 
     // ---- Command palette ----
@@ -766,6 +798,7 @@ impl ControlState {
         cx: &mut App,
     ) {
         self.dismiss_popups();
+        self.restore_menu_focus(window, cx);
         let return_focus = self
             .palette_overlay
             .take()
@@ -929,8 +962,7 @@ impl ControlState {
     /// Notice it during render, so the host asks [`ControlState::animating`]
     /// after its controls have been built.
     pub fn blend(&self, tag: impl Into<Tag>, on: bool, duration: Duration) -> f32 {
-        let t = crate::easing::ease_out_cubic(self.transition(tag, u64::from(on), duration));
-        if on { t } else { 1.0 - t }
+        self.tween(tag, if on { 1.0 } else { 0.0 }, duration)
     }
 
     /// A continuous value on its way to `target`: the pill under a segmented
@@ -1092,9 +1124,11 @@ impl ControlState {
     pub fn animating(&self) -> bool {
         let frame = self.frame.get();
         self.frame.set(frame.wrapping_add(1));
+        self.color_pads.borrow_mut().retain_recent(frame);
         let now = self.now();
         let mut running = false;
-        self.records.borrow_mut().retain(|_, entry| {
+        let mut records = self.records.borrow_mut();
+        records.retain(|_, entry| {
             if frame.wrapping_sub(entry.touched) > 1 {
                 return false;
             }
@@ -1109,6 +1143,13 @@ impl ControlState {
             };
             true
         });
+        // Retain visits empty buckets too. A large list that disappeared
+        // must not leave every later frame scanning its peak allocation.
+        if records.capacity() > records.len().saturating_mul(4).max(64) {
+            let target = records.len().saturating_mul(2).max(32);
+            records.shrink_to(target);
+        }
+        drop(records);
         if running {
             return true;
         }
@@ -1139,6 +1180,12 @@ impl ControlState {
     }
 
     // ---- Geometry ----
+
+    pub(crate) fn color_pad_colors(&self, id: ComboId, hue: f64, rows: usize) -> Rc<[gpui::Rgba]> {
+        self.color_pads
+            .borrow_mut()
+            .colors(id, hue, rows, self.frame.get())
+    }
 
     /// Records where something painted this frame, under `tag`. Called from
     /// a paint probe; retired with everything else once the probe stops
@@ -1488,30 +1535,42 @@ impl ControlState {
     /// of, and how many buttons it has. Called by
     /// [`crate::containers::dialog`] each frame.
     pub fn set_dialog_trap(&self, trap: Option<(ComboId, usize)>) {
-        self.dialog_trap.set(trap);
+        *self.dialog_trap.borrow_mut() = trap.map(|(id, count)| (id, (0..count).collect()));
+    }
+
+    pub(crate) fn set_dialog_buttons(&self, id: ComboId, indices: Vec<usize>) {
+        *self.dialog_trap.borrow_mut() = Some((id, indices));
+    }
+
+    pub(crate) fn clear_dialog_trap(&self, id: ComboId) {
+        let mut trap = self.dialog_trap.borrow_mut();
+        if trap.as_ref().is_some_and(|(active, _)| *active == id) {
+            *trap = None;
+        }
     }
 
     /// Where Tab goes next while a modal dialog holds the keyboard, or `None`
     /// when none does.
     ///
-    /// Only answers while the keyboard is actually on one of the dialog's
-    /// buttons. If it is anywhere else the dialog has either not taken it
-    /// yet or has already gone, and in neither case is the press ours.
+    /// Skips disabled buttons and keeps focus on the panel when none are
+    /// enabled. Focus elsewhere in an open modal returns to its first or
+    /// last enabled button.
     pub fn trap_next(&self, window: &Window, backward: bool) -> Option<FocusHandle> {
-        let (id, count) = self.dialog_trap.get()?;
-        if count == 0 {
+        let trap = self.dialog_trap.borrow();
+        let (id, indices) = trap.as_ref()?;
+        if !self.is_dialog_open(id) {
             return None;
         }
         let handles = self.focus_handles.borrow();
+        if indices.is_empty() {
+            return handles.get(&Tag::new((*id, "panel"))).cloned();
+        }
         let button = |index: usize| handles.get(&Tag::new((id, "button", index)));
-        let here = (0..count)
-            .position(|index| button(index).is_some_and(|handle| handle.is_focused(window)))?;
-        let next = if backward {
-            (here + count - 1) % count
-        } else {
-            (here + 1) % count
-        };
-        button(next).cloned()
+        let here = indices
+            .iter()
+            .copied()
+            .find(|&index| button(index).is_some_and(|handle| handle.is_focused(window)));
+        button(next_dialog_button(indices, here, backward)?).cloned()
     }
 
     /// Hands the keyboard back to whatever had it before a dialog opened.
@@ -1531,6 +1590,19 @@ impl ControlState {
         self.menu_focus
             .get_or_insert_with(|| cx.focus_handle())
             .clone()
+    }
+
+    /// Returns the keyboard before removing a menu, unless its callback
+    /// already moved focus somewhere else.
+    pub fn restore_menu_focus(&mut self, window: &mut Window, cx: &mut App) {
+        let previous = self.menu_return_focus.take();
+        if self
+            .menu_focus
+            .as_ref()
+            .is_some_and(|focus| focus.is_focused(window))
+        {
+            self.return_focus_to(previous, window, cx);
+        }
     }
 
     /// Puts the keyboard on one row of the open menu.
@@ -1568,6 +1640,7 @@ impl ControlState {
             .is_some_and(|open| open.closing.is_none())
             || self.menu.is_some();
         self.dismiss_popups();
+        self.restore_menu_focus(window, cx);
         if self.palette_overlay.is_some() {
             self.close_palette(window, cx);
             return true;
@@ -1709,17 +1782,23 @@ pub fn continue_drags<V: ControlHost>(
         return true;
     }
     if let Some((id, at)) = host.control_state().track_ratio_at(position) {
-        // The theme's own hue slider is the toolkit's to read; every other
-        // track is the host's.
-        let theme = &mut host.control_state_mut().theme;
-        if theme.hue_track() == Some(id) {
-            theme.hue = Theme::hue_from_track(at.x);
-        } else {
-            host.track_dragged(id, at, cx);
-        }
+        update_track(host, id, at, cx);
         return true;
     }
     host.control_state_mut().drag_tab_to(position)
+}
+
+// Presses, keyboard nudges and continuing drags must all reach the same
+// binding, including the toolkit-owned theme tracks.
+pub(crate) fn update_track<V: ControlHost>(
+    host: &mut V,
+    id: ComboId,
+    at: Point<f32>,
+    cx: &mut Context<V>,
+) {
+    if !host.control_state_mut().theme.apply_track(id, at.x) {
+        host.track_dragged(id, at, cx);
+    }
 }
 
 /// Ends the in-flight control drag, applying a finished tab reorder. Call
@@ -1838,6 +1917,74 @@ mod tests {
         assert!((40.0..100.0).contains(&moving), "{moving}");
     }
 
+    #[test]
+    fn reversing_a_blend_starts_from_its_visible_value() {
+        let mut state = ControlState::new();
+        // Advance the clock instead of sleeping. A long duration keeps
+        // scheduler delays negligible next to the motion being tested.
+        let duration = std::time::Duration::from_secs(1000);
+        assert_eq!(state.blend("switch", false, duration), 0.0);
+        assert_eq!(state.blend("switch", true, duration), 0.0);
+        state.epoch -= std::time::Duration::from_secs(300);
+        let before = state.blend("switch", true, duration);
+        assert!((0.6..0.7).contains(&before), "{before}");
+        let reversing = state.blend("switch", false, duration);
+        assert!(
+            (reversing - before).abs() < 0.001,
+            "{before} -> {reversing}"
+        );
+        state.epoch -= std::time::Duration::from_secs(300);
+        let returning = state.blend("switch", false, duration);
+        assert!(returning < reversing, "{returning} < {reversing}");
+        let reversed_again = state.blend("switch", true, duration);
+        assert!((reversed_again - returning).abs() < 0.001);
+    }
+
+    #[test]
+    fn dialog_navigation_skips_disabled_buttons_and_wraps() {
+        let enabled = [0, 3, 5];
+        assert_eq!(super::next_dialog_button(&enabled, Some(0), false), Some(3));
+        assert_eq!(super::next_dialog_button(&enabled, Some(5), false), Some(0));
+        assert_eq!(super::next_dialog_button(&enabled, Some(0), true), Some(5));
+        assert_eq!(super::next_dialog_button(&enabled, Some(3), true), Some(0));
+        // A button can become disabled while it has focus; the next Tab
+        // still has to land inside the dialog.
+        assert_eq!(super::next_dialog_button(&enabled, Some(2), false), Some(0));
+        assert_eq!(super::next_dialog_button(&enabled, None, true), Some(5));
+        assert_eq!(super::next_dialog_button(&[], None, false), None);
+    }
+
+    #[test]
+    fn an_inactive_dialog_cannot_clear_the_active_dialogs_trap() {
+        let mut state = ControlState::new();
+        state.open_dialog("active");
+        state.set_dialog_buttons("active", vec![1, 3]);
+        state.clear_dialog_trap("inactive");
+        assert_eq!(*state.dialog_trap.borrow(), Some(("active", vec![1, 3])));
+        state.close_dialog();
+        assert_eq!(*state.dialog_trap.borrow(), None);
+
+        state.set_dialog_trap(Some(("active", 4)));
+        state.open_dialog("replacement");
+        assert_eq!(*state.dialog_trap.borrow(), None);
+    }
+
+    #[test]
+    fn invalid_or_extreme_time_scales_cannot_panic() {
+        let mut state = ControlState::new();
+        for scale in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -1.0] {
+            state.set_time_scale(scale);
+            assert_eq!(state.time_scale(), None);
+            assert_eq!(state.scaled(super::MOVE), super::MOVE);
+        }
+        state.set_time_scale(f32::MAX);
+        assert_eq!(state.scaled(super::MOVE), std::time::Duration::MAX);
+        assert_eq!(
+            state.scaled(std::time::Duration::ZERO),
+            std::time::Duration::ZERO
+        );
+    }
+
     /// `tween_from` is the exception, for rows joining a list: it starts at
     /// the given value and heads for the target.
     #[test]
@@ -1919,6 +2066,21 @@ mod tests {
         // First sight again: a different value starts no animation.
         let t = state.transition("check", 1, super::SWITCH_SLIDE);
         assert_eq!(t, 1.0);
+    }
+
+    #[test]
+    fn retired_records_release_excess_capacity() {
+        let state = ControlState::new();
+        for slot in 0..1024 {
+            state.snap(("rows", slot), 1.0);
+        }
+        assert!(state.records.borrow().capacity() >= 1024);
+        for _ in 0..3 {
+            state.snap(("rows", 0), 1.0);
+            state.animating();
+        }
+        assert_eq!(state.records.borrow().len(), 1);
+        assert!(state.records.borrow().capacity() <= 64);
     }
 
     /// Where things painted is a per-frame record like any other: a tab
