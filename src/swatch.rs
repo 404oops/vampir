@@ -7,8 +7,8 @@
 //! for chroma and `y` for lightness.
 
 use gpui::{
-    AnyElement, Context, ElementId, KeyDownEvent, MouseButton, MouseDownEvent, Window, div, point,
-    prelude::*, px,
+    AnyElement, Bounds, Context, ElementId, KeyDownEvent, MouseButton, MouseDownEvent, Pixels,
+    Rgba, Window, canvas, div, fill, point, prelude::*, px,
 };
 
 use crate::color::oklch_to_color;
@@ -65,12 +65,62 @@ pub fn hue_slider<V: ControlHost>(
     )
 }
 
+/// How many chroma steps the pad paints across. A step of a fortieth of
+/// the range is below what anyone can see.
+const PAD_COLUMNS: usize = 40;
+
+/// How many lightness steps a pad of `height` points paints: one per two
+/// points, so a step is under a hundredth of lightness at any size a pad is
+/// drawn at. Lightness is the axis the eye catches banding on, so it gets
+/// the finer grid.
+pub(crate) fn pad_rows(height: f32) -> usize {
+    ((height / 2.0).ceil().max(1.0) as usize).min(120)
+}
+
+/// Every cell of the pad: where it sits and what fills it. Column 0 is the
+/// least chroma and row 0 the most lightness, so the pad reads chroma left
+/// to right and lightness bottom to top. Neighbours share their edges
+/// exactly — the same expression on both sides — so snapping to device
+/// pixels can never open a seam between them.
+pub(crate) fn pad_cells(
+    bounds: Bounds<Pixels>,
+    hue: f64,
+    columns: usize,
+    rows: usize,
+) -> Vec<(Bounds<Pixels>, Rgba)> {
+    let xs: Vec<Pixels> = (0..=columns)
+        .map(|column| bounds.origin.x + bounds.size.width * (column as f32 / columns as f32))
+        .collect();
+    let ys: Vec<Pixels> = (0..=rows)
+        .map(|row| bounds.origin.y + bounds.size.height * (row as f32 / rows as f32))
+        .collect();
+    let mut cells = Vec::with_capacity(columns * rows);
+    for column in 0..columns {
+        let chroma = (column as f64 + 0.5) / columns as f64 * MAX_CHROMA;
+        for row in 0..rows {
+            let lightness = 1.0 - (row as f64 + 0.5) / rows as f64;
+            cells.push((
+                Bounds::from_corners(
+                    point(xs[column], ys[row]),
+                    point(xs[column + 1], ys[row + 1]),
+                ),
+                oklch_to_color(lightness, chroma, hue),
+            ));
+        }
+    }
+    cells
+}
+
 /// Saturation and lightness pad for one hue: chroma left to right, lightness
 /// bottom to top, with a ring on the current colour.
 ///
-/// Painted as a grid of cells rather than a true gradient, because gpui has
-/// no two-dimensional gradient. At this size the seams do not read, and a
-/// pad small enough to matter is small enough to be cheap.
+/// Painted as a grid of flat cells straight into the scene, because gpui has
+/// no two-dimensional gradient. Flat cells rather than gradient ones on
+/// purpose: gpui mixes gradients in Oklab on the GPU, and between two
+/// gamut-clipped stops that mix leaves the gamut and comes back as `NaN`,
+/// which paints black. Straight into the scene rather than as elements
+/// because a few thousand cells is nothing to the GPU and far too much for
+/// layout to do again on every pointer move.
 pub fn color_pad<V: ControlHost>(
     id: ComboId,
     color: Oklch,
@@ -78,8 +128,6 @@ pub fn color_pad<V: ControlHost>(
     ctx: WidgetContext<'_, '_, '_, V>,
 ) -> impl IntoElement {
     let WidgetContext { palette, view, cx } = ctx;
-    const COLUMNS: usize = 40;
-    const ROWS: usize = 12;
 
     let weak = cx.entity().downgrade();
     let state = view.control_state();
@@ -110,43 +158,19 @@ pub fn color_pad<V: ControlHost>(
         cx.notify();
     });
 
-    // Columns of stacked gradients rather than a grid of flat cells.
-    // Lightness is the axis the eye catches banding on, so it runs as a
-    // gradient inside each cell and the cells meet on shared stops, which
-    // leaves it continuous top to bottom. Chroma steps across, where a step
-    // of a fortieth of the range is below what anyone can see.
-    let mut columns: Vec<AnyElement> = Vec::with_capacity(COLUMNS);
-    for column in 0..COLUMNS {
-        let chroma = (column as f64 + 0.5) / COLUMNS as f64 * MAX_CHROMA;
-        let mut cells: Vec<AnyElement> = Vec::with_capacity(ROWS);
-        for row in 0..ROWS {
-            // Row 0 is the top, which is the lightest. Oklch lightness is
-            // not linear in sRGB, so the range is split into enough bands
-            // that interpolating inside one is faithful.
-            let top = 1.0 - row as f64 / ROWS as f64;
-            let bottom = 1.0 - (row + 1) as f64 / ROWS as f64;
-            cells.push(
-                div()
-                    .flex_1()
-                    .w_full()
-                    .bg(gpui::linear_gradient(
-                        180.0,
-                        gpui::linear_color_stop(oklch_to_color(top, chroma, hue), 0.0),
-                        gpui::linear_color_stop(oklch_to_color(bottom, chroma, hue), 1.0),
-                    ))
-                    .into_any_element(),
-            );
-        }
-        columns.push(
-            div()
-                .flex_1()
-                .h_full()
-                .flex()
-                .flex_col()
-                .children(cells)
-                .into_any_element(),
-        );
-    }
+    // The cells are sized from the bounds the canvas is actually given, so
+    // the grid follows the pad rather than the height it asked for.
+    let field = canvas(
+        |_bounds, _window, _cx| (),
+        move |bounds, _state, window, _cx| {
+            let rows = pad_rows(f32::from(bounds.size.height));
+            for (cell, fill_color) in pad_cells(bounds, hue, PAD_COLUMNS, rows) {
+                window.paint_quad(fill(cell, fill_color));
+            }
+        },
+    )
+    .absolute()
+    .inset_0();
 
     // The marker glides to a colour picked elsewhere — a preset, the hue
     // slider — and sits under the pointer while the pointer has it.
@@ -185,7 +209,7 @@ pub fn color_pad<V: ControlHost>(
             }),
         )
         .child(track_probe::<V>(id, weak))
-        .child(div().absolute().inset_0().flex().children(columns))
+        .child(field)
         .child(
             // A white ring with a dark inner edge, so the marker stays
             // visible over both ends of the pad. It is also the current
@@ -297,4 +321,77 @@ pub fn hue_wheel(lightness: f64, chroma: f64) -> Vec<Oklch> {
     (0..12)
         .map(|step| Oklch::new(step as f64 * 30.0, chroma, lightness))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PAD_COLUMNS, pad_cells, pad_rows};
+    use crate::color::{channels, relative_luminance};
+    use gpui::{Bounds, point, px, size};
+
+    fn pad() -> Bounds<gpui::Pixels> {
+        Bounds::new(point(px(10.0), px(20.0)), size(px(400.0), px(140.0)))
+    }
+
+    #[test]
+    fn cells_tile_the_pad_without_gaps_or_overlap() {
+        let bounds = pad();
+        let (columns, rows) = (PAD_COLUMNS, pad_rows(140.0));
+        let cells = pad_cells(bounds, 200.0, columns, rows);
+        assert_eq!(cells.len(), columns * rows);
+        for column in 0..columns {
+            for row in 0..rows {
+                let (cell, _) = cells[column * rows + row];
+                if row + 1 < rows {
+                    let (below, _) = cells[column * rows + row + 1];
+                    assert_eq!(cell.bottom(), below.top());
+                }
+                if column + 1 < columns {
+                    let (right, _) = cells[(column + 1) * rows + row];
+                    assert_eq!(cell.right(), right.left());
+                }
+            }
+        }
+        let (first, _) = cells[0];
+        let (last, _) = cells[cells.len() - 1];
+        assert_eq!(first.origin, bounds.origin);
+        assert_eq!(last.bottom_right(), bounds.bottom_right());
+    }
+
+    #[test]
+    fn lightness_runs_bottom_to_top_and_chroma_left_to_right() {
+        let rows = pad_rows(140.0);
+        let cells = pad_cells(pad(), 30.0, PAD_COLUMNS, rows);
+        let luminance =
+            |column: usize, row: usize| relative_luminance(cells[column * rows + row].1);
+        assert!(luminance(0, 0) > luminance(0, rows / 2));
+        assert!(luminance(0, rows / 2) > luminance(0, rows - 1));
+        // The leftmost column is a near grey, the rightmost is the hue in
+        // full: the spread of its channels is what chroma looks like in sRGB.
+        let spread = |column: usize| {
+            let [r, g, b, _] = channels(cells[column * rows + rows / 2].1);
+            r.max(g).max(b) - r.min(g).min(b)
+        };
+        assert!(spread(0) < 0.05);
+        assert!(spread(PAD_COLUMNS - 1) > 0.3);
+    }
+
+    #[test]
+    fn every_cell_is_a_displayable_colour() {
+        for hue in [0.0, 97.0, 180.0, 264.0, 350.0] {
+            for (_, color) in pad_cells(pad(), hue, PAD_COLUMNS, pad_rows(140.0)) {
+                for channel in channels(color) {
+                    assert!((0.0..=1.0).contains(&channel), "hue {hue}: {channel}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rows_follow_the_height_within_reason() {
+        assert_eq!(pad_rows(0.0), 1);
+        assert_eq!(pad_rows(140.0), 70);
+        assert_eq!(pad_rows(141.0), 71);
+        assert_eq!(pad_rows(2000.0), 120);
+    }
 }
