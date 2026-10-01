@@ -555,16 +555,9 @@ impl Render for Gallery {
         // is not a page change.
         let body = arriving("page", page as u64, &self.controls, body);
 
-        // Asked *after* the page is built, on purpose: a control notices its
-        // own state change while it renders. Fades and slides stop asking
-        // when they finish; the spinner requests its own frames while visible.
-        if self.controls.animating() {
-            window.request_animation_frame();
-        }
-
         // The toolkit's handlers first — Tab, Shift-Tab, Escape, the drags,
         // the mouse taking over — and the gallery's own actions after them.
-        vampir::root(div().id("root"), self, cx)
+        let root = vampir::root(div().id("root"), self, cx)
             .size_full()
             .flex()
             .flex_col()
@@ -645,7 +638,13 @@ impl Render for Gallery {
                     }
                     cx.notify();
                 },
-            ))
+            ));
+        // A control notices a transition as it renders, including the
+        // footer and overlays, so ask for another frame after all of them.
+        if self.controls.animating() {
+            window.request_animation_frame();
+        }
+        root
     }
 }
 
