@@ -29,12 +29,16 @@ use crate::controls::WidgetContext;
 use crate::keyboard::{self, Dismiss, Key, Orientation};
 use crate::lighting;
 use crate::palette::Palette;
-use crate::state::{ComboId, ControlHost, MenuBranch};
+use crate::state::{ComboId, ControlHost, ControlState, MenuBranch};
 
 /// Metrics chosen so a menu of ordinary items lines up with the pop-up list
 /// a [`crate::controls::combo`] drops, which is the same thing seen from a
 /// different angle.
 const ITEM_HEIGHT: f32 = 26.0;
+const HEADER_HEIGHT: f32 = 22.0;
+/// The space either side of a separator's hairline.
+const SEPARATOR_GAP: f32 = 3.0;
+const SEPARATOR_HEIGHT: f32 = 2.0 * SEPARATOR_GAP + 1.0;
 const MENU_PADDING: f32 = 5.0;
 const MENU_RADIUS: f32 = 7.0;
 const MENU_MIN_WIDTH: f32 = 168.0;
@@ -307,12 +311,16 @@ fn menu_height(items: &[MenuItem], nested: bool) -> f32 {
     let rows: f32 = items
         .iter()
         .map(|item| match item {
-            MenuItem::Separator => 7.0,
-            MenuItem::Header(_) => 22.0,
+            MenuItem::Separator => SEPARATOR_HEIGHT,
+            MenuItem::Header(_) => HEADER_HEIGHT,
             _ => ITEM_HEIGHT,
         })
         .sum();
-    let back = if nested { ITEM_HEIGHT + 7.0 } else { 0.0 };
+    let back = if nested {
+        ITEM_HEIGHT + SEPARATOR_HEIGHT
+    } else {
+        0.0
+    };
     (rows + back + 2.0 * (MENU_PADDING + 1.0)).min(MENU_MAX_HEIGHT)
 }
 
@@ -370,6 +378,7 @@ pub fn context_menu<V: ControlHost>(
         menu.highlight,
         menu.levels.clone(),
     );
+    let tree = items;
     let (level, title) = visible_level(items, &levels)?;
     let title = title.cloned();
     let items = level.to_vec();
@@ -392,11 +401,10 @@ pub fn context_menu<V: ControlHost>(
         .measured((id, "menu-window"))
         .map(|window| f32::from(window.size.height));
 
-    // A menu that would run off the window is flipped back over the
-    // pointer, which is what every desktop toolkit does and what the hand
-    // already expects. `anchored` measures the real panel to decide, so a
-    // long label is accounted for; this only has to say which corner sits
-    // at the pointer and how much room to leave at the edges.
+    // A menu that would run off the window is slid back inside it, the
+    // margin clear of the edge, rather than cut off. `anchored` measures
+    // the real panel to decide, so a long label is accounted for; this only
+    // has to say which corner sits at the pointer.
     let at = under
         .map(|under| under.bottom_left() + point(px(0.0), px(4.0)))
         .unwrap_or(anchor);
@@ -611,19 +619,48 @@ pub fn context_menu<V: ControlHost>(
             cx.listener(|_this, _event: &MouseDownEvent, _window, _cx| {}),
         )
         .child(
+            // The slide moves the rows further than the padding is wide, so
+            // the frame they slide in clips them: a lit row must not poke
+            // past the border on its way in.
             div()
-                .id(ElementId::Name(format!("{id}-menu-rows").into()))
-                .relative()
-                .left(px(level_offset))
-                .opacity(level_reveal)
                 .flex_1()
                 .min_h(px(0.0))
                 .flex()
                 .flex_col()
-                .overflow_y_scroll()
-                .restrict_scroll_to_axis()
-                .track_scroll(&scroll)
-                .children(rows),
+                .overflow_hidden()
+                .child(
+                    div()
+                        .id(ElementId::Name(format!("{id}-menu-rows").into()))
+                        .relative()
+                        .left(px(level_offset))
+                        .opacity(level_reveal)
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .flex()
+                        .flex_col()
+                        .overflow_y_scroll()
+                        .restrict_scroll_to_axis()
+                        .track_scroll(&scroll)
+                        .children(rows),
+                ),
+        )
+        // The panel is as wide as the widest level in the tree, not the one
+        // showing, so a level change never changes the width — nothing to
+        // jump, and nothing for the edge snap to shove sideways. Tweening
+        // the width instead would need last frame's measurement of the
+        // content, and a frame drawn at the wrong width before the slide
+        // could start. This way the layout engine works the width out from
+        // the items in the same pass, and the control stays a function of
+        // its data. The rows are laid out at no height, so they are never
+        // seen and never hit.
+        .child(
+            div()
+                .h(px(0.0))
+                .flex_none()
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .children(every_row(tree).into_iter().filter_map(sizing_row)),
         );
     // An occluding panel must keep an in-flight drag underneath it moving
     // and release it even if the pointer ends over the menu.
@@ -668,13 +705,71 @@ fn activate<V: ControlHost>(
     }
 }
 
+/// Every row of every level, depth first: what the panel's width is taken
+/// from.
+fn every_row(items: &[MenuItem]) -> Vec<&MenuItem> {
+    let mut rows = Vec::new();
+    let mut stack = vec![items];
+    while let Some(level) = stack.pop() {
+        for item in level {
+            rows.push(item);
+            if let MenuItem::Submenu { items, .. } = item {
+                stack.push(items);
+            }
+        }
+    }
+    rows
+}
+
+/// A row's content at the metrics `render_item` draws it with, and nothing
+/// else. A branch is set in the back row's heavier weight, so it holds the
+/// room for its title when the level it opens is showing.
+fn sizing_row(item: &MenuItem) -> Option<gpui::AnyElement> {
+    let row = div()
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .pr(px(8.0))
+        .whitespace_nowrap();
+    Some(match item {
+        MenuItem::Separator => return None,
+        MenuItem::Header(label) => row
+            .pl(px(8.0))
+            .text_size(px(11.0))
+            .font_weight(FontWeight::MEDIUM)
+            .child(label.clone())
+            .into_any_element(),
+        MenuItem::Submenu { label, .. } => row
+            .pl(px(8.0))
+            .text_size(px(12.5))
+            .font_weight(FontWeight::MEDIUM)
+            .child(label.clone())
+            .child(div().w(px(10.0)).flex_none())
+            .into_any_element(),
+        MenuItem::Action(action) => row
+            .pl(px(if action.checked { 6.0 } else { 8.0 }))
+            .text_size(px(12.5))
+            .when(action.checked, |row| {
+                row.child(div().w(px(12.0)).flex_none())
+            })
+            .child(action.label.clone())
+            .children(
+                action
+                    .shortcut
+                    .clone()
+                    .map(|shortcut| div().text_size(px(11.5)).child(shortcut)),
+            )
+            .into_any_element(),
+    })
+}
+
 /// Whether a click on a row should count. A row click must belong to this
 /// opening and to a level that has finished arriving; see
 /// `ControlState::menu_takes_click`. A click counted
 /// past one is the second half of a double-click whose first half changed
 /// the level, so the row under it now was never aimed at either.
-fn takes_click<V: ControlHost>(view: &V, opened_at: Instant, event: &ClickEvent) -> bool {
-    event.click_count() <= 1 && view.control_state().menu_takes_click(opened_at)
+fn takes_click(state: &ControlState, opened_at: Instant, click_count: usize) -> bool {
+    click_count <= 1 && state.menu_takes_click(opened_at)
 }
 
 /// The pointer lights the row it is over for the keyboard too. A disabled
@@ -740,7 +835,7 @@ fn render_back<V: ControlHost>(
             }
         }))
         .on_click(cx.listener(move |this, event: &ClickEvent, _window, cx| {
-            if takes_click(this, opened_at, event) {
+            if takes_click(this.control_state(), opened_at, event.click_count()) {
                 this.control_state_mut().back_menu();
                 cx.notify();
             }
@@ -767,7 +862,7 @@ fn render_item<V: ControlHost>(
             let mut color: gpui::Hsla = crate::color::to_hsla(palette.field_border);
             color.alpha = 0.8;
             div()
-                .my(px(3.0))
+                .my(px(SEPARATOR_GAP))
                 .h(px(1.0))
                 .w_full()
                 .flex_none()
@@ -775,7 +870,7 @@ fn render_item<V: ControlHost>(
                 .into_any_element()
         }
         MenuItem::Header(label) => div()
-            .h(px(22.0))
+            .h(px(HEADER_HEIGHT))
             .flex_none()
             .px(px(8.0))
             .flex()
@@ -820,7 +915,7 @@ fn render_item<V: ControlHost>(
                     el.cursor_pointer()
                         .hover(move |style| style.bg(lighting::lit(palette.control_fill, 0.08)))
                         .on_click(cx.listener(move |this, event: &ClickEvent, _window, cx| {
-                            if takes_click(this, opened_at, event)
+                            if takes_click(this.control_state(), opened_at, event.click_count())
                                 && let Some(at) = reachable_at
                             {
                                 this.control_state_mut()
@@ -892,7 +987,7 @@ fn render_item<V: ControlHost>(
                             ))
                         })
                         .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                            if takes_click(this, opened_at, event) {
+                            if takes_click(this.control_state(), opened_at, event.click_count()) {
                                 activate(this, id, opened_at, window, cx, &on_activate);
                                 cx.notify();
                             }
@@ -1093,9 +1188,11 @@ pub use crate::state::OpenMenu as ContextMenu;
 #[cfg(test)]
 mod tests {
     use super::{
-        MenuBranch, MenuCommand, MenuItem, fit_to_window, menu_command, menu_height,
-        reachable_indices, settle_levels, step_highlight, submenu_identity, visible_level,
+        MenuBranch, MenuCommand, MenuItem, every_row, fit_to_window, menu_command, menu_height,
+        reachable_indices, settle_levels, step_highlight, submenu_identity, takes_click,
+        visible_level,
     };
+    use crate::ControlState;
     use crate::keyboard::Key;
 
     fn branch(item: &MenuItem, index: usize, highlight: usize) -> MenuBranch {
@@ -1317,6 +1414,53 @@ mod tests {
         assert_eq!(menu_height(&short, true) - menu_height(&short, false), 33.0);
         let long: Vec<_> = (0..40).map(|_| MenuItem::header("Section")).collect();
         assert_eq!(menu_height(&long, false), super::MENU_MAX_HEIGHT);
+    }
+
+    /// The second click of a double-click is refused however late it comes,
+    /// and any click is refused while a level is still arriving.
+    #[test]
+    fn row_clicks_need_a_single_click_on_a_settled_level() {
+        let mut state = ControlState::new();
+        state.open_menu("row", gpui::point(gpui::px(0.0), gpui::px(0.0)), "");
+        let opening = state.menu_opened_at().expect("open");
+        assert!(takes_click(&state, opening, 1));
+        assert!(!takes_click(&state, opening, 2));
+
+        state.enter_menu(1, 1, 7, false);
+        assert!(!takes_click(&state, opening, 1));
+        state.set_time_scale(0.001);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert!(takes_click(&state, opening, 1));
+        assert!(!takes_click(&state, opening, 2));
+    }
+
+    /// The panel's height is worked out from the same constants the rows
+    /// are drawn at, so the two cannot drift apart.
+    #[test]
+    fn menu_height_counts_rows_at_their_drawn_heights() {
+        let chrome = 2.0 * (super::MENU_PADDING + 1.0);
+        let one = |item: MenuItem| menu_height(&[item], false) - chrome;
+        assert_eq!(one(MenuItem::separator()), 7.0);
+        assert_eq!(one(MenuItem::header("Recent")), 22.0);
+        assert_eq!(one(MenuItem::action("open", "Open")), super::ITEM_HEIGHT);
+        assert_eq!(super::SEPARATOR_HEIGHT, 2.0 * super::SEPARATOR_GAP + 1.0);
+    }
+
+    /// The panel takes its width from every level, so a row deep in a
+    /// branch the reader has not opened still counts.
+    #[test]
+    fn the_width_is_taken_from_every_level() {
+        let items = tree(&["inbox"], &["a-very-long-tag"]);
+        let ids: Vec<_> = every_row(&items)
+            .into_iter()
+            .filter_map(|item| match item {
+                MenuItem::Action(action) => Some(action.id),
+                _ => None,
+            })
+            .collect();
+        for id in ["open", "pin", "inbox", "a-very-long-tag"] {
+            assert!(ids.contains(&id), "{id} missing");
+        }
     }
 
     #[test]
