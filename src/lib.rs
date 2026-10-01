@@ -55,8 +55,8 @@ pub mod theme;
 pub mod typography;
 
 pub use containers::{
-    DialogButton, Tab, arriving, card, collapsible, column, dialog, labelled, reorder, row,
-    scroll_area, split_area, split_handle, tab_bar,
+    DialogButton, Tab, TabBarLayout, arriving, card, collapsible, column, dialog, labelled,
+    reorder, row, scroll_area, split_area, split_handle, tab_bar, tab_bar_layout,
 };
 pub use controls::{
     BadgeTone, ButtonVariant, CHIP_HEIGHT, CONTROL_HEIGHT, CONTROL_RADIUS, ChipSelection, Choice,

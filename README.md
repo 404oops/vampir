@@ -107,7 +107,7 @@ The gallery supports both colour schemes:
 
 **Controls** — `button`, `icon_button` (with `glyph`), `switch`, `checkbox`, `radio_group`, `segmented`, `chip` / `chip_group`, `spinbox`, `text_field`, `text_area`, `search_field`, `combo`, `slider`, `progress_bar`, `spinner`, `badge`, `separator`, `scrollbar`, `caption`, `fading_text`.
 
-**Containers** — `tab_bar` (drag to reorder, optional close buttons) with `reorder`, `split_handle` + `split_area`, `collapsible`, `dialog`, `card`, `labelled`, `row` / `column`, `scroll_area`, `arriving`.
+**Containers** — `tab_bar` and `tab_bar_layout` (natural, uniform-width horizontal, or vertical tabs; drag to reorder and optional close buttons) with `reorder`, `split_handle` + `split_area`, `collapsible`, `dialog`, `card`, `labelled`, `row` / `column`, `scroll_area`, `arriving`.
 
 **Menus and overlays** — `context_menu`, `menu_button`, `menu_target`, `Tooltip`, `command_palette` and `search_list` with `fuzzy_filter` / `fuzzy_score`.
 

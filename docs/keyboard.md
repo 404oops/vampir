@@ -55,7 +55,7 @@ The application's own keys — ⌘K, ⌘S — are still the host's to bind, afte
 | `button`, `icon_button`, `chip` | Space or Enter. |
 | `checkbox`, `switch` | Space or Enter toggles. The ring is on the box and on the track — the parts with a fill. Both take an optional label that is part of the hit target. |
 | `radio_group` | One tab stop. Up and down move the choice and wrap; Home and End reach the ends. Disabled choices are stepped over, never landed on. |
-| `segmented`, `tab_bar` | One tab stop. Left and right move the selection and wrap. |
+| `segmented`, `tab_bar`, `tab_bar_layout` | One tab stop. Horizontal choices use Left and Right; vertical tabs use Up and Down. Selection wraps, and an overflowed tab is scrolled into view when reached by arrow key. |
 | `combo` | Space, Enter or Down opens; moving the keyboard away closes it. Up and down move the highlight, Enter commits it, Escape closes and leaves the value alone — arrowing through a list is looking, not choosing. |
 | `slider` | Arrows move one step, Page ten, Home and End the ends. A stepped track moves one notch. |
 | `dialog` | Takes the keyboard when it opens, on the primary button or failing one the first. Tab cycles among its buttons. Enter is the default action, Escape dismisses, and closing hands the keyboard back where it was. |

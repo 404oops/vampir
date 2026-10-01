@@ -177,18 +177,20 @@ enum Kind {
     Streak,
     List,
     Bounds,
+    Reveal,
 }
 
 impl Kind {
     fn slot(self, tag: Tag) -> Tag {
         // XOR with a constant is a bijection, so a well-mixed tag stays
         // well-mixed for the table's sake.
-        const SALT: [u64; 5] = [
+        const SALT: [u64; 6] = [
             0x9E37_79B9_7F4A_7C15,
             0xD1B5_4A32_D192_ED03,
             0x8CB9_2BA7_2F3D_8DD7,
             0x5851_F42D_4C95_7F2D,
             0x2545_F491_4F6C_DD1D,
+            0xA24B_1CD7_95E8_6F03,
         ];
         Tag(tag.0 ^ SALT[self as usize])
     }
@@ -221,6 +223,14 @@ enum Record {
     List { highlight: usize, query: u64 },
     /// Where something painted last frame.
     Bounds(Bounds<Pixels>),
+    /// A selected tab needs one paint before its bounds can be scrolled into
+    /// view. Once acknowledged, manual scrolling must stay in the user's
+    /// control until the selection or layout changes again.
+    Reveal {
+        selection: Tag,
+        pending: bool,
+        retries: u8,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -294,6 +304,8 @@ pub struct TrackDrag {
 #[derive(Clone, Copy, Debug)]
 pub struct TabDrag {
     pub bar: ComboId,
+    /// The bar's direction; horizontal tabs read x, vertical tabs read y.
+    pub axis: TrackAxis,
     /// Where the tab started.
     pub from: usize,
     /// Where it would land if released now.
@@ -303,13 +315,27 @@ pub struct TabDrag {
     /// reorder: a real click almost always wobbles a pixel between press and
     /// release, and that must still select the tab.
     pub moved: bool,
-    /// How far into the tab the pointer took hold, in window x, so the tab
+    /// How far into the tab the pointer took hold, along the bar, so the tab
     /// rides under the hand where it was grabbed rather than by its edge.
     pub grab: f32,
-    /// Where the pointer was pressed, in window x.
+    /// Where the pointer was pressed, along the bar.
     pub pressed: f32,
-    /// Where the pointer is now, in window x.
+    /// Where the pointer is now, along the bar.
     pub pointer: f32,
+}
+
+fn tab_start(bounds: Bounds<Pixels>, axis: TrackAxis) -> f32 {
+    match axis {
+        TrackAxis::Vertical => f32::from(bounds.top()),
+        _ => f32::from(bounds.left()),
+    }
+}
+
+fn tab_end(bounds: Bounds<Pixels>, axis: TrackAxis) -> f32 {
+    match axis {
+        TrackAxis::Vertical => f32::from(bounds.bottom()),
+        _ => f32::from(bounds.right()),
+    }
 }
 
 /// How far a pressed tab has to travel before the press becomes a drag.
@@ -1112,8 +1138,66 @@ impl ControlState {
             .clone()
     }
 
-    /// True while a fade or slide still needs frames. A host folds this into
-    /// whatever decides to request the next frame.
+    /// Whether a selected tab still needs to be brought into view. Its first
+    /// render has no bounds to scroll to, so the request survives that frame.
+    /// A completed request stays completed through ordinary manual scrolls.
+    pub(crate) fn tab_reveal_pending(&self, bar: ComboId, selection: impl Hash) -> bool {
+        let selection = Tag::new(selection);
+        let frame = self.frame.get();
+        let mut records = self.records.borrow_mut();
+        let entry = records
+            .entry(Kind::Reveal.slot(Tag::new((bar, "selected-tab"))))
+            .or_insert(Entry {
+                touched: frame,
+                record: Record::Reveal {
+                    selection,
+                    pending: true,
+                    retries: 0,
+                },
+            });
+        entry.touched = frame;
+        let Record::Reveal {
+            selection: shown,
+            pending,
+            retries,
+        } = &mut entry.record
+        else {
+            return false;
+        };
+        if *shown != selection {
+            *shown = selection;
+            *pending = true;
+            *retries = 0;
+        }
+        if *pending {
+            *retries = retries.saturating_add(1);
+        }
+        *pending
+    }
+
+    /// A successful reveal is one shot: the selected tab can later be
+    /// scrolled away by hand without being pulled back on the next frame.
+    pub(crate) fn finish_tab_reveal(&self, bar: ComboId, selection: impl Hash) {
+        let selection = Tag::new(selection);
+        let mut records = self.records.borrow_mut();
+        if let Some(Entry {
+            record:
+                Record::Reveal {
+                    selection: shown,
+                    pending,
+                    ..
+                },
+            ..
+        }) = records.get_mut(&Kind::Reveal.slot(Tag::new((bar, "selected-tab"))))
+            && *shown == selection
+        {
+            *pending = false;
+        }
+    }
+
+    /// True while a fade or slide still needs frames, or a selected tab is
+    /// waiting for its first painted bounds. A host folds this into whatever
+    /// decides to request the next frame.
     ///
     /// Also the end of a frame's bookkeeping: it is called once per render,
     /// after everything has been built, so it counts frames, and retires the
@@ -1139,6 +1223,9 @@ impl ControlState {
                 | Record::Tween {
                     since, duration, ..
                 } => now.saturating_sub(since) < u64::from(duration),
+                Record::Reveal {
+                    pending, retries, ..
+                } => pending && retries <= 3,
                 _ => false,
             };
             true
@@ -1362,9 +1449,13 @@ impl ControlState {
     /// a fling that clears several tabs in one event lands where the hand
     /// stopped rather than one slot along.
     pub fn drag_tab_to(&mut self, position: Point<Pixels>) -> bool {
-        let pointer = f32::from(position.x);
         let Some(Drag::Tab(drag)) = &self.drag else {
             return false;
+        };
+        let axis = drag.axis;
+        let pointer = match axis {
+            TrackAxis::Vertical => f32::from(position.y),
+            _ => f32::from(position.x),
         };
         if !drag.moved && (pointer - drag.pressed).abs() < TAB_DRAG_THRESHOLD {
             return false;
@@ -1372,17 +1463,17 @@ impl ControlState {
         let (bar, mut to) = (drag.bar, drag.to);
         // Only walk one way: slots are last frame's geometry, and walking
         // back over ground just covered could otherwise loop for ever.
-        let leftwards = self
+        let backwards = self
             .slot(bar, to)
-            .is_some_and(|current| pointer < f32::from(current.left()));
+            .is_some_and(|current| pointer < tab_start(current, axis));
         while let Some(current) = self.slot(bar, to) {
-            let next = if leftwards {
-                if pointer >= f32::from(current.left()) || to == 0 {
+            let next = if backwards {
+                if pointer >= tab_start(current, axis) || to == 0 {
                     break;
                 }
                 to - 1
             } else {
-                if pointer <= f32::from(current.right()) {
+                if pointer <= tab_end(current, axis) {
                     break;
                 }
                 to + 1
@@ -1390,8 +1481,8 @@ impl ControlState {
             let Some(neighbour) = self.slot(bar, next) else {
                 break;
             };
-            let centre = f32::from(neighbour.center().x);
-            let past = if leftwards {
+            let centre = (tab_start(neighbour, axis) + tab_end(neighbour, axis)) / 2.0;
+            let past = if backwards {
                 pointer < centre
             } else {
                 pointer > centre
@@ -2222,6 +2313,7 @@ mod tests {
         assert!(state.is_dragging("volume") && state.track_dragging());
         state.begin_tab_drag(TabDrag {
             bar: "tabs",
+            axis: TrackAxis::Horizontal,
             from: 0,
             to: 0,
             moved: false,
@@ -2242,6 +2334,7 @@ mod tests {
         state.record_slot("tabs", 1, rect(82.0, 0.0, 80.0, 26.0));
         state.begin_tab_drag(TabDrag {
             bar: "tabs",
+            axis: TrackAxis::Horizontal,
             from: 0,
             to: 0,
             moved: false,
@@ -2279,6 +2372,7 @@ mod tests {
         }
         state.begin_tab_drag(TabDrag {
             bar: "tabs",
+            axis: TrackAxis::Horizontal,
             from: 0,
             to: 0,
             moved: false,
@@ -2296,6 +2390,68 @@ mod tests {
         state.drag_tab_to(at(50.0, 10.0));
         assert_eq!(state.tab_drag().map(|drag| drag.to), Some(1));
         assert_eq!(state.end_drag(), Some(("tabs", 0, 1)));
+    }
+
+    #[test]
+    fn a_vertical_tab_drag_uses_y_and_crosses_row_midpoints() {
+        let mut state = ControlState::new();
+        for slot in 0..3 {
+            state.record_slot("sidebar", slot, rect(20.0, slot as f32 * 30.0, 160.0, 28.0));
+        }
+        state.begin_tab_drag(TabDrag {
+            bar: "sidebar",
+            axis: TrackAxis::Vertical,
+            from: 0,
+            to: 0,
+            moved: false,
+            grab: 10.0,
+            pressed: 10.0,
+            pointer: 10.0,
+        });
+        assert!(
+            !state.drag_tab_to(at(140.0, 11.0)),
+            "x motion does not drag a vertical tab"
+        );
+        state.drag_tab_to(at(140.0, 80.0));
+        assert_eq!(state.tab_drag().map(|drag| drag.to), Some(2));
+        state.drag_tab_to(at(140.0, 34.0));
+        assert_eq!(state.tab_drag().map(|drag| drag.to), Some(1));
+        assert_eq!(state.end_drag(), Some(("sidebar", 0, 1)));
+    }
+
+    #[test]
+    fn selected_tab_reveal_waits_for_bounds_then_leaves_manual_scroll_alone() {
+        let state = ControlState::new();
+        assert!(state.tab_reveal_pending("tabs", ("first", false)));
+        assert!(state.animating(), "pending bounds request another frame");
+        assert!(state.tab_reveal_pending("tabs", ("first", false)));
+
+        state.finish_tab_reveal("tabs", ("first", false));
+        assert!(!state.tab_reveal_pending("tabs", ("first", false)));
+        assert!(
+            !state.animating(),
+            "completed reveal stops asking for frames"
+        );
+        assert!(!state.tab_reveal_pending("tabs", ("first", false)));
+
+        assert!(state.tab_reveal_pending("tabs", ("second", false)));
+        state.finish_tab_reveal("tabs", ("first", false));
+        assert!(state.tab_reveal_pending("tabs", ("second", false)));
+        state.finish_tab_reveal("tabs", ("second", false));
+        assert!(state.tab_reveal_pending("tabs", ("second", true)));
+    }
+
+    #[test]
+    fn an_unpainted_tab_does_not_request_frames_forever() {
+        let state = ControlState::new();
+        for _ in 0..3 {
+            assert!(state.tab_reveal_pending("tabs", ("hidden", false)));
+            assert!(state.animating());
+        }
+        assert!(state.tab_reveal_pending("tabs", ("hidden", false)));
+        assert!(!state.animating());
+        // The request remains pending for a later render when the tab paints.
+        assert!(state.tab_reveal_pending("tabs", ("hidden", false)));
     }
 
     /// A list's keyboard row survives frames while the query is the same,

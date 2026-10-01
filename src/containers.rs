@@ -73,6 +73,36 @@ impl Tab {
     }
 }
 
+/// How a tab bar uses the space its host gives it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TabBarLayout {
+    /// Tabs keep their natural width and the bar scrolls sideways if needed.
+    Horizontal,
+    /// Every tab has the same width, keeping close targets aligned while
+    /// siblings are removed. Long labels elide; the strip scrolls sideways.
+    HorizontalUniform { width: f32 },
+    /// Tabs fill the host's chosen width and stack vertically. Constrain the
+    /// returned element's height when the list should scroll.
+    Vertical,
+}
+
+impl TabBarLayout {
+    fn vertical(self) -> bool {
+        matches!(self, Self::Vertical)
+    }
+
+    fn tab_width(self) -> Option<f32> {
+        match self {
+            Self::HorizontalUniform { width } => Some(if width.is_finite() {
+                width.clamp(96.0, 320.0)
+            } else {
+                160.0
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// Horizontal tab bar with drag-to-reorder.
 ///
 /// Pressing a tab selects it; dragging one past the midpoint of its
@@ -89,10 +119,36 @@ pub fn tab_bar<V: ControlHost>(
     on_select: impl Fn(&mut V, usize, &mut Window, &mut Context<V>) + 'static,
     on_close: impl Fn(&mut V, usize, &mut Window, &mut Context<V>) + 'static,
 ) -> impl IntoElement {
+    tab_bar_layout(
+        id,
+        tabs,
+        selected,
+        TabBarLayout::Horizontal,
+        ctx,
+        on_select,
+        on_close,
+    )
+}
+
+/// The tab bar with a space policy. Keep the selected index and any reorder
+/// in the host exactly as for [`tab_bar`].
+#[allow(clippy::too_many_arguments)]
+pub fn tab_bar_layout<V: ControlHost>(
+    id: ComboId,
+    tabs: &[Tab],
+    selected: usize,
+    layout: TabBarLayout,
+    ctx: WidgetContext<'_, '_, '_, V>,
+    on_select: impl Fn(&mut V, usize, &mut Window, &mut Context<V>) + 'static,
+    on_close: impl Fn(&mut V, usize, &mut Window, &mut Context<V>) + 'static,
+) -> impl IntoElement {
     let WidgetContext { palette, view, cx } = ctx;
     let dark = palette.is_dark;
+    let vertical = layout.vertical();
+    let uniform_width = layout.tab_width();
     let on_select = Rc::new(on_select);
     let on_close = Rc::new(on_close);
+    let scroll = view.control_state().scroll((id, "tab-scroll"));
     // One tab stop for the bar, not one per tab: a tab bar is a single
     // choice, so Tab passes it in one press and the arrows move between
     // tabs — which is what stops a twenty-tab editor swallowing twenty
@@ -106,7 +162,12 @@ pub fn tab_bar<V: ControlHost>(
             let Some(key) = keyboard::key(event) else {
                 return;
             };
-            if let Some(moved) = keyboard::step(key, Orientation::Horizontal, selected, count) {
+            let orientation = if vertical {
+                Orientation::Vertical
+            } else {
+                Orientation::Horizontal
+            };
+            if let Some(moved) = keyboard::step(key, orientation, selected, count) {
                 cx.stop_propagation();
                 on_select(this, moved, window, cx);
                 cx.notify();
@@ -138,32 +199,53 @@ pub fn tab_bar<V: ControlHost>(
     const TAB_GAP: f32 = 2.0;
     const TAB_PAD: f32 = 2.0;
     let state = view.control_state();
-    // Where each tab will sit in this order, worked out from the widths they
+    // The first render has no tab bounds yet. Keep this reveal pending until
+    // a painted frame can supply them; then leave manual scrolling alone
+    // until the selection or layout changes.
+    if let Some(tab) = tabs.get(selected)
+        && state.tab_reveal_pending(
+            id,
+            (&tab.id, selected, vertical, uniform_width.map(f32::to_bits)),
+        )
+        && reveal_tab(state, id, &tab.id, &scroll, vertical)
+    {
+        state.finish_tab_reveal(
+            id,
+            (&tab.id, selected, vertical, uniform_width.map(f32::to_bits)),
+        );
+    }
+    // Where each tab will sit in this order, worked out from the sizes they
     // painted at last frame. Knowing it before layout is what lets a tab
     // slide to a new slot rather than appear in it, and lets the raised pill
     // under the active tab follow the same numbers: one pill that moves,
     // rather than a fill that goes out on one tab and comes on on another.
-    // Widths by tab id, and only once every tab on the bar has one: a tab
-    // that has never painted has no width to plan with.
-    let widths: Option<Vec<f32>> = tabs
+    // Sizes are measured by tab id. Uniform and vertical bars can plan from
+    // their requested size before the first paint; a natural-width tab must
+    // wait one paint before it can join the slide plan.
+    let sizes: Option<Vec<f32>> = tabs
         .iter()
         .map(|tab| {
             state
                 .bounds((id, "tab", &tab.id))
-                .map(|bounds| f32::from(bounds.size.width))
+                .map(|bounds| {
+                    if vertical {
+                        f32::from(bounds.size.height)
+                    } else {
+                        f32::from(bounds.size.width)
+                    }
+                })
+                .or({
+                    if vertical {
+                        Some(TAB_HEIGHT)
+                    } else {
+                        uniform_width
+                    }
+                })
         })
         .collect();
-    let places: Option<Vec<f32>> = widths.as_ref().map(|widths| {
-        let mut x = 0.0;
-        order
-            .iter()
-            .map(|&index| {
-                let here = x;
-                x += widths[index] + TAB_GAP;
-                here
-            })
-            .collect()
-    });
+    let places: Option<Vec<f32>> = sizes
+        .as_ref()
+        .map(|sizes| tab_places(sizes, &order, TAB_GAP));
     // The tab under the hand rides with the pointer, from the point where it
     // was grabbed, and the others slide out of its way; only on release does
     // it settle into its slot. Its offset from where it is laid out comes
@@ -176,34 +258,39 @@ pub fn tab_bar<V: ControlHost>(
     let held_offset = held_slot.and_then(|slot| {
         let drag = dragging_here.as_ref()?;
         let places = places.as_ref()?;
-        let widths = widths.as_ref()?;
+        let sizes = sizes.as_ref()?;
         let well = well?;
-        let width = *widths.get(*order.get(slot)?)?;
-        let laid_out = f32::from(well.origin.x) + TAB_PAD + places[slot];
-        let lowest = f32::from(well.origin.x) + TAB_PAD;
-        let highest = (f32::from(well.right()) - TAB_PAD - width).max(lowest);
+        let size = *sizes.get(*order.get(slot)?)?;
+        let (origin, end) = if vertical {
+            (f32::from(well.top()), f32::from(well.bottom()))
+        } else {
+            (f32::from(well.left()), f32::from(well.right()))
+        };
+        let laid_out = origin + TAB_PAD + places[slot];
+        let lowest = origin + TAB_PAD;
+        let highest = (end - TAB_PAD - size).max(lowest);
         let wanted = (drag.pointer - drag.grab).clamp(lowest, highest);
         Some(wanted - laid_out)
     });
     let pill = places
         .as_ref()
-        .zip(widths.as_ref())
-        .and_then(|(places, widths)| {
+        .zip(sizes.as_ref())
+        .and_then(|(places, sizes)| {
             let slot = order.iter().position(|&index| index == selected)?;
-            Some((slot, TAB_PAD + places[slot], *widths.get(selected)?))
+            Some((slot, TAB_PAD + places[slot], *sizes.get(selected)?))
         })
-        .map(|(slot, x, width)| {
+        .map(|(slot, pos, size)| {
             // Under a held active tab the pill is part of what is being
             // carried, so it goes where the hand goes and slides home from
             // there on release.
             match held_offset.filter(|_| held_slot == Some(slot)) {
                 Some(offset) => (
-                    state.snap((id, "pill-x"), x + offset),
-                    state.snap((id, "pill-w"), width),
+                    state.snap((id, "pill-pos"), pos + offset),
+                    state.snap((id, "pill-size"), size),
                 ),
                 None => (
-                    state.tween((id, "pill-x"), x, MOVE),
-                    state.tween((id, "pill-w"), width, MOVE),
+                    state.tween((id, "pill-pos"), pos, MOVE),
+                    state.tween((id, "pill-size"), size, MOVE),
                 ),
             }
         });
@@ -234,7 +321,7 @@ pub fn tab_bar<V: ControlHost>(
         let on = state.blend(key("tab-on"), active, SWITCH_SLIDE);
         // Laid out in its slot, drawn on its way there — or, for the tab in
         // hand, wherever the hand is.
-        let slide = key("tab-x");
+        let slide = key(if vertical { "tab-y" } else { "tab-x" });
         let offset = match (places.as_ref(), held_offset.filter(|_| held)) {
             (Some(places), Some(offset)) => state.snap(slide, places[slot] + offset) - places[slot],
             (Some(places), None) => {
@@ -244,11 +331,19 @@ pub fn tab_bar<V: ControlHost>(
             (None, _) => 0.0,
         };
         if held && let Some(places) = places.as_ref() {
+            let float = tab_face(tab, active, palette, layout)
+                .absolute()
+                .when(vertical, |el| {
+                    el.top(px(TAB_PAD + places[slot] + offset))
+                        .left(px(TAB_PAD))
+                        .right(px(TAB_PAD))
+                })
+                .when(!vertical, |el| {
+                    el.top(px(TAB_PAD))
+                        .left(px(TAB_PAD + places[slot] + offset))
+                });
             floating = Some(
-                tab_face(tab, active, palette)
-                    .absolute()
-                    .top(px(TAB_PAD))
-                    .left(px(TAB_PAD + places[slot] + offset))
+                float
                     .opacity(0.85)
                     .bg(lighting::lit(
                         if active { fill } else { palette.field_surface },
@@ -264,6 +359,8 @@ pub fn tab_bar<V: ControlHost>(
                 .id(element("tab"))
                 .h(px(TAB_HEIGHT))
                 .flex_none()
+                .when_some(uniform_width, |el, width| el.w(px(width)))
+                .when(vertical, |el| el.w_full())
                 .px(px(10.0))
                 .flex()
                 .items_center()
@@ -283,7 +380,8 @@ pub fn tab_bar<V: ControlHost>(
                 ))
                 .whitespace_nowrap()
                 .relative()
-                .left(px(offset))
+                .when(vertical, |el| el.top(px(offset)))
+                .when(!vertical, |el| el.left(px(offset)))
                 // Until the bar has painted once there is no pill to slide,
                 // so the active tab draws the fill the pill will take over.
                 .when(active && pill.is_none(), |el| {
@@ -317,7 +415,11 @@ pub fn tab_bar<V: ControlHost>(
                     canvas(
                         move |bounds, _window, cx| {
                             let mut laid_out = bounds;
-                            laid_out.origin.x -= px(offset);
+                            if vertical {
+                                laid_out.origin.y -= px(offset);
+                            } else {
+                                laid_out.origin.x -= px(offset);
+                            }
                             if let Some(host) = weak.upgrade() {
                                 host.update(cx, |host, _cx| {
                                     let state = host.control_state_mut();
@@ -337,16 +439,32 @@ pub fn tab_bar<V: ControlHost>(
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
-                        let pointer = f32::from(event.position.x);
+                        let pointer = if vertical {
+                            f32::from(event.position.y)
+                        } else {
+                            f32::from(event.position.x)
+                        };
                         // Where in the tab the hand took hold, so it rides
                         // there rather than jumping to sit by its edge.
                         let grab = this
                             .control_state()
                             .slot(id, slot)
-                            .map(|bounds| pointer - f32::from(bounds.left()))
+                            .map(|bounds| {
+                                pointer
+                                    - if vertical {
+                                        f32::from(bounds.top())
+                                    } else {
+                                        f32::from(bounds.left())
+                                    }
+                            })
                             .unwrap_or(0.0);
                         this.control_state_mut().begin_tab_drag(TabDrag {
                             bar: id,
+                            axis: if vertical {
+                                TrackAxis::Vertical
+                            } else {
+                                TrackAxis::Horizontal
+                            },
                             from: slot,
                             to: slot,
                             moved: false,
@@ -380,7 +498,13 @@ pub fn tab_bar<V: ControlHost>(
                         cx.notify();
                     }),
                 )
-                .child(tab.label.clone())
+                .child(
+                    div()
+                        .when(vertical || uniform_width.is_some(), |el| {
+                            el.flex_1().min_w(px(0.0)).overflow_hidden().text_ellipsis()
+                        })
+                        .child(tab.label.clone()),
+                )
                 .children(tab_badge(tab, palette))
                 .when(tab.closable, move |el| {
                     let on_close = on_close.clone();
@@ -422,51 +546,72 @@ pub fn tab_bar<V: ControlHost>(
         .bottom_0()
     };
 
-    // Two elements, because they want opposite widths. The outer one is the
-    // scroll container, so it has to fill its slot; the well inside it hugs
-    // the tabs, the way a `segmented` track does, so a bar of three tabs
-    // does not draw a recess across the whole window.
-    div().id(id).flex().overflow_x_scroll().child(
-        div()
-            .relative()
-            .flex()
-            .items_center()
-            .gap(px(TAB_GAP))
-            .p(px(TAB_PAD))
-            .rounded(px(CONTROL_RADIUS))
-            .bg(palette.field_surface)
-            .border_1()
-            .border_color(palette.field_border)
-            .shadow(lighting::recessed(dark))
-            // Where the well is, for a held tab to know where its slot is
-            // on screen.
-            .child(well_probe)
-            // Under the tabs, so the active label reads through it.
-            .when_some(pill, |el, (x, width)| {
-                el.child(
-                    div()
-                        .absolute()
-                        .top(px(TAB_PAD))
-                        .left(px(x))
-                        .w(px(width))
-                        .h(px(TAB_HEIGHT))
-                        .rounded(px(CONTROL_RADIUS))
-                        .bg(lighting::lit(palette.control_fill, 0.08))
-                        .shadow(lighting::raised(dark)),
-                )
-            })
-            .children(rendered)
-            // Last, so the tab in hand paints over every other.
-            .children(floating),
-    )
+    // The outer element owns the viewport. Horizontal wells hug their tabs;
+    // a vertical well fills the width the host gave it.
+    div()
+        .id(id)
+        .flex()
+        .when(vertical || uniform_width.is_some(), |el| {
+            el.w_full().min_w(px(0.0))
+        })
+        .when(vertical, |el| el.h_full().flex_col().overflow_y_scroll())
+        .when(!vertical, |el| el.overflow_x_scroll())
+        .restrict_scroll_to_axis()
+        .track_scroll(&scroll)
+        .child(
+            div()
+                .relative()
+                .flex()
+                // The well must keep its content height. If it stretches to
+                // the viewport's height, GPUI measures no overflow and the
+                // wheel event goes to the page behind the rail.
+                .when(vertical, |el| el.w_full().flex_col().flex_none())
+                .when(!vertical, |el| el.items_center())
+                .gap(px(TAB_GAP))
+                .p(px(TAB_PAD))
+                .rounded(px(CONTROL_RADIUS))
+                .bg(palette.field_surface)
+                .border_1()
+                .border_color(palette.field_border)
+                .shadow(lighting::recessed(dark))
+                // Where the well is, for a held tab to know where its slot is
+                // on screen.
+                .child(well_probe)
+                // Under the tabs, so the active label reads through it.
+                .when_some(pill, |el, (pos, size)| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .when(vertical, |el| {
+                                el.top(px(pos))
+                                    .left(px(TAB_PAD))
+                                    .right(px(TAB_PAD))
+                                    .h(px(size))
+                            })
+                            .when(!vertical, |el| {
+                                el.top(px(TAB_PAD))
+                                    .left(px(pos))
+                                    .w(px(size))
+                                    .h(px(TAB_HEIGHT))
+                            })
+                            .rounded(px(CONTROL_RADIUS))
+                            .bg(lighting::lit(palette.control_fill, 0.08))
+                            .shadow(lighting::raised(dark)),
+                    )
+                })
+                .children(rendered)
+                // Last, so the tab in hand paints over every other.
+                .children(floating),
+        )
 }
 
 /// A tab's face without its behaviour: what both the tab in the bar and the
 /// floating copy of a tab being dragged look like.
-fn tab_face(tab: &Tab, active: bool, palette: Palette) -> Div {
+fn tab_face(tab: &Tab, active: bool, palette: Palette, layout: TabBarLayout) -> Div {
     div()
         .h(px(26.0))
         .flex_none()
+        .when_some(layout.tab_width(), |el, width| el.w(px(width)))
         .px(px(10.0))
         .flex()
         .items_center()
@@ -484,7 +629,13 @@ fn tab_face(tab: &Tab, active: bool, palette: Palette) -> Div {
             palette.text_secondary
         })
         .whitespace_nowrap()
-        .child(tab.label.clone())
+        .child(
+            div()
+                .when(layout.vertical() || layout.tab_width().is_some(), |el| {
+                    el.flex_1().min_w(px(0.0)).overflow_hidden().text_ellipsis()
+                })
+                .child(tab.label.clone()),
+        )
         .children(tab_badge(tab, palette))
         .when(tab.closable, |el| el.child(tab_close_glyph()))
 }
@@ -492,6 +643,7 @@ fn tab_face(tab: &Tab, active: bool, palette: Palette) -> Div {
 fn tab_badge(tab: &Tab, palette: Palette) -> Option<Div> {
     tab.badge.clone().map(|badge| {
         div()
+            .flex_none()
             .text_size(px(10.5))
             .text_color(palette.text_secondary)
             .child(badge)
@@ -502,12 +654,76 @@ fn tab_close_glyph() -> Div {
     div()
         .w(px(14.0))
         .h(px(14.0))
+        .flex_none()
         .flex()
         .items_center()
         .justify_center()
         .rounded(px(3.0))
         .text_size(px(10.0))
         .child("\u{2715}")
+}
+
+fn tab_places(sizes: &[f32], order: &[usize], gap: f32) -> Vec<f32> {
+    let mut along = 0.0;
+    order
+        .iter()
+        .map(|&index| {
+            let here = along;
+            along += sizes[index] + gap;
+            here
+        })
+        .collect()
+}
+
+fn reveal_delta(view_start: f32, view_end: f32, tab_start: f32, tab_end: f32) -> f32 {
+    if tab_start < view_start {
+        view_start - tab_start
+    } else if tab_end > view_end {
+        view_end - tab_end
+    } else {
+        0.0
+    }
+}
+
+fn reveal_tab(
+    state: &ControlState,
+    bar: ComboId,
+    tab_id: &SharedString,
+    scroll: &ScrollHandle,
+    vertical: bool,
+) -> bool {
+    let Some(tab) = state.bounds((bar, "tab", tab_id)) else {
+        return false;
+    };
+    let view = scroll.bounds();
+    if view.size.width <= px(0.0) || view.size.height <= px(0.0) {
+        return false;
+    }
+    let delta = if vertical {
+        reveal_delta(
+            f32::from(view.top()),
+            f32::from(view.bottom()),
+            f32::from(tab.top()),
+            f32::from(tab.bottom()),
+        )
+    } else {
+        reveal_delta(
+            f32::from(view.left()),
+            f32::from(view.right()),
+            f32::from(tab.left()),
+            f32::from(tab.right()),
+        )
+    };
+    if delta != 0.0 {
+        let mut offset = scroll.offset();
+        if vertical {
+            offset.y += px(delta);
+        } else {
+            offset.x += px(delta);
+        }
+        scroll.set_offset(offset);
+    }
+    true
 }
 
 // ---- Split divider ----------------------------------------------------------
@@ -1205,7 +1421,45 @@ fn moved_selection(selected: usize, from: usize, to: usize) -> usize {
 
 #[cfg(test)]
 mod layout_tests {
-    use super::{ButtonVariant, dialog_default, moved_selection, reorder};
+    use super::{
+        ButtonVariant, TabBarLayout, dialog_default, moved_selection, reorder, reveal_delta,
+        tab_places,
+    };
+
+    #[test]
+    fn uniform_tabs_keep_the_next_close_target_in_the_closed_slot() {
+        let width = TabBarLayout::HorizontalUniform { width: 158.0 }
+            .tab_width()
+            .unwrap();
+        let before = tab_places(&[width; 4], &[0, 1, 2, 3], 2.0);
+        let after = tab_places(&[width; 3], &[0, 1, 2], 2.0);
+        assert_eq!(before[1], after[1]);
+        assert_eq!(before[1], 160.0);
+        assert_eq!(before[2] - before[1], width + 2.0);
+    }
+
+    #[test]
+    fn constrained_tab_widths_stay_usable() {
+        assert_eq!(
+            TabBarLayout::HorizontalUniform { width: 12.0 }.tab_width(),
+            Some(96.0)
+        );
+        assert_eq!(
+            TabBarLayout::HorizontalUniform { width: 900.0 }.tab_width(),
+            Some(320.0)
+        );
+        assert_eq!(
+            TabBarLayout::HorizontalUniform { width: f32::NAN }.tab_width(),
+            Some(160.0)
+        );
+    }
+
+    #[test]
+    fn arrow_selection_reveals_only_the_hidden_part_of_a_tab() {
+        assert_eq!(reveal_delta(20.0, 120.0, 40.0, 100.0), 0.0);
+        assert_eq!(reveal_delta(20.0, 120.0, 8.0, 68.0), 12.0);
+        assert_eq!(reveal_delta(20.0, 120.0, 75.0, 146.0), -26.0);
+    }
 
     #[test]
     fn a_dialog_only_defaults_to_an_enabled_button() {

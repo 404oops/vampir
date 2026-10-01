@@ -23,14 +23,14 @@ use vampir::{
     BadgeTone, ButtonVariant, CONTROL_HEIGHT, ChipSelection, Choice, Chord, Column, ComboId,
     Command, ControlHost, ControlState, DialogButton, Hint, InputStyle, MAX_CHROMA, MenuItem,
     Oklch, Palette, Scheme, ScrollAxis, SliderTrack, SortDirection, Span, TEXT_SIZE,
-    TITLE_TEXT_SIZE, Tab, TextInput, Theme, TreeRow, WidgetContext, arriving, badge, bind_keys,
-    button, caption, card, checkbox, chip_group, collapsible, color_pad, column, combo,
+    TITLE_TEXT_SIZE, Tab, TabBarLayout, TextInput, Theme, TreeRow, WidgetContext, arriving, badge,
+    bind_keys, button, caption, card, checkbox, chip_group, collapsible, color_pad, column, combo,
     command_palette, context_menu, dialog, edit_menu, fading_text, flatten_tree, glyph, ground,
     hue_picker, hue_slider, hue_wheel, icon_button, labelled, lit, menu_button, menu_target,
     progress_bar, radio_group, reorder, row, saturation_picker, scheme_picker, scroll_area,
     search_list, segmented, separator, shortcut_recorder, slider, spinbox, spinner, split_area,
-    split_handle, swatch_grid, switch, tab_bar, table_header, table_row, text_area, text_field,
-    tree_row, ui_font,
+    split_handle, swatch_grid, switch, tab_bar, tab_bar_layout, table_header, table_row, text_area,
+    text_field, tree_row, ui_font,
 };
 
 // The gallery is also the smallest complete *macOS* host, so it carries the
@@ -254,7 +254,7 @@ impl ControlHost for Gallery {
     fn tabs_reordered(&mut self, bar: ComboId, from: usize, to: usize, cx: &mut Context<Self>) {
         match bar {
             "pages" => reorder(&mut self.pages, &mut self.page, from, to),
-            "files" => reorder(&mut self.files, &mut self.file, from, to),
+            "files" | "files-vertical" => reorder(&mut self.files, &mut self.file, from, to),
             _ => return,
         }
         self.note(format!("Moved a tab from {from} to {to}"), cx);
@@ -352,7 +352,12 @@ impl Gallery {
             }),
             files: vec![
                 Tab::new("Overview").closable(),
-                Tab::new("Details").badge("3").closable(),
+                Tab::new("Release planning").closable(),
+                Tab::new("Design system notes").closable(),
+                Tab::new("User research").closable(),
+                Tab::new("Build output").badge("3").closable(),
+                Tab::new("Accessibility review").closable(),
+                Tab::new("Localizations").closable(),
                 Tab::new("History").closable(),
             ],
             file: 0,
@@ -505,6 +510,18 @@ impl Gallery {
     fn note(&mut self, what: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.last_action = what.into();
         cx.notify();
+    }
+
+    fn close_file_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.files.len() <= 1 || index >= self.files.len() {
+            return;
+        }
+        let label = self.files.remove(index).label;
+        if index < self.file {
+            self.file -= 1;
+        }
+        self.file = self.file.min(self.files.len() - 1);
+        self.note(format!("Closed {label}"), cx);
     }
 }
 
@@ -1187,27 +1204,47 @@ impl Gallery {
         column()
             .child(card(
                 palette,
-                "Tabs — drag one to reorder it",
-                tab_bar(
+                "Tabs — scroll sideways, close repeatedly, drag to reorder",
+                div().w_full().child(tab_bar_layout(
                     "files",
                     &self.files,
                     self.file,
+                    TabBarLayout::HorizontalUniform { width: 158.0 },
                     WidgetContext::new(palette, self, cx),
                     |this, index, _window, cx| {
                         this.file = index;
                         cx.notify();
                     },
-                    |this, index, _window, cx| {
-                        if this.files.len() > 1 {
-                            this.files.remove(index);
-                            if index < this.file {
-                                this.file -= 1;
-                            }
-                            this.file = this.file.min(this.files.len() - 1);
-                        }
-                        cx.notify();
-                    },
-                ),
+                    |this, index, _window, cx| this.close_file_tab(index, cx),
+                )),
+            ))
+            .child(card(
+                palette,
+                "Vertical tabs — scroll, select and reorder",
+                div()
+                    .flex()
+                    .items_start()
+                    .gap(px(16.0))
+                    .child(div().w(px(220.0)).h(px(166.0)).child(tab_bar_layout(
+                        "files-vertical",
+                        &self.files,
+                        self.file,
+                        TabBarLayout::Vertical,
+                        WidgetContext::new(palette, self, cx),
+                        |this, index, _window, cx| {
+                            this.file = index;
+                            cx.notify();
+                        },
+                        |this, index, _window, cx| this.close_file_tab(index, cx),
+                    )))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.0))
+                            .child(caption(palette, "Selected tab"))
+                            .child(self.files[self.file].label.clone()),
+                    ),
             ))
             .child(card(
                 palette,
