@@ -47,6 +47,7 @@ pub mod menu;
 pub mod overlay;
 pub mod palette;
 pub mod scroll;
+pub mod selection;
 pub mod shortcut;
 pub mod state;
 pub mod swatch;
@@ -84,6 +85,7 @@ pub use overlay::{
 };
 pub use palette::{DEFAULT_SATURATION, MAX_SATURATION, Palette};
 pub use scroll::{SCROLL_FADE, ScrollAxis, ScrollDrag, apply_scroll_drag, scroll_fades};
+pub use selection::{ListSelection, SelectionIntent, selectable_list, selectable_row};
 pub use shortcut::{Chord, display, display_keystroke, shortcut_recorder};
 pub use state::{
     COMBO_REVEAL, ComboId, ControlHost, ControlState, MOVE, OpenCombo, OpenDialog, OpenMenu,

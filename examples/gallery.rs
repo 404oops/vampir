@@ -10,6 +10,8 @@
 //! toolkit's. What is left here is the gallery's own data, its pages, and
 //! the menu bar and shortcuts a real application owns.
 
+use std::rc::Rc;
+
 use gpui::{
     App, Bounds, Context, Entity, KeyBinding, Menu, MenuItem as OsMenuItem, Point, ScrollHandle,
     SharedString, SystemMenuType, TitlebarOptions, Window, WindowBounds, WindowOptions, actions,
@@ -21,16 +23,16 @@ use gpui_ce_platform::application;
 use vampir::AppIcon;
 use vampir::{
     BadgeTone, ButtonVariant, CONTROL_HEIGHT, ChipSelection, Choice, Chord, Column, ComboId,
-    Command, ControlHost, ControlState, DialogButton, Hint, InputStyle, MAX_CHROMA, MenuItem,
-    Oklch, Palette, Scheme, ScrollAxis, SliderTrack, SortDirection, Span, TEXT_SIZE,
-    TITLE_TEXT_SIZE, Tab, TextInput, Theme, TreeRow, WidgetContext, arriving, badge, bind_keys,
-    button, caption, card, checkbox, chip_group, collapsible, color_pad, column, combo,
-    command_palette, context_menu, dialog, edit_menu, fading_text, flatten_tree, glyph, ground,
-    hue_picker, hue_slider, hue_wheel, icon_button, labelled, lit, menu_button, menu_target,
-    progress_bar, radio_group, reorder, row, saturation_picker, scheme_picker, scroll_area,
-    search_list, segmented, separator, shortcut_recorder, slider, spinbox, spinner, split_area,
-    split_handle, swatch_grid, switch, tab_bar, table_header, table_row, text_area, text_field,
-    tree_row, ui_font,
+    Command, ControlHost, ControlState, DialogButton, Hint, InputStyle, ListSelection, MAX_CHROMA,
+    MenuItem, Oklch, Palette, Scheme, ScrollAxis, SelectionIntent, SliderTrack, SortDirection,
+    Span, TEXT_SIZE, TITLE_TEXT_SIZE, Tab, TextInput, Theme, TreeRow, WidgetContext, arriving,
+    badge, bind_keys, button, caption, card, checkbox, chip_group, collapsible, color_pad, column,
+    combo, command_palette, context_menu, dialog, edit_menu, fading_text, flatten_tree, glyph,
+    ground, hue_picker, hue_slider, hue_wheel, icon_button, labelled, lit, menu_button,
+    menu_target, progress_bar, radio_group, reorder, row, saturation_picker, scheme_picker,
+    scroll_area, search_list, segmented, selectable_list, selectable_row, separator,
+    shortcut_recorder, slider, spinbox, spinner, split_area, split_handle, swatch_grid, switch,
+    tab_bar, table_header, table_row, text_area, text_field, tree_row, ui_font,
 };
 
 // The gallery is also the smallest complete *macOS* host, so it carries the
@@ -212,6 +214,7 @@ struct Gallery {
     sort: (SharedString, SortDirection),
     split: f32,
     details_open: bool,
+    selection: ListSelection,
     last_action: SharedString,
 
     // Colour page.
@@ -385,6 +388,7 @@ impl Gallery {
             sort: ("changed".into(), SortDirection::Descending),
             split: 0.42,
             details_open: true,
+            selection: ListSelection::new(),
             last_action: "—".into(),
             colour: Oklch::new(268.0, 0.11, 0.62),
             palette_query,
@@ -1184,6 +1188,57 @@ impl Gallery {
                 )
             }));
 
+        let selection_order: Rc<[SharedString]> = [
+            "Design notes",
+            "Budget",
+            "Launch plan",
+            "Research",
+            "Components",
+            "Typography",
+            "Motion study",
+            "Keyboard map",
+            "Accessibility",
+            "Integration tests",
+            "Screenshots",
+            "Translations",
+            "Release checklist",
+            "Archive",
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect::<Vec<_>>()
+        .into();
+        let selected_count = self.selection.selected_in(&selection_order).len();
+        let mut selection_rows = Vec::with_capacity(selection_order.len());
+        for (index, label) in selection_order.iter().enumerate() {
+            let order = selection_order.clone();
+            let content = div()
+                .h(px(34.0))
+                .px(px(10.0))
+                .flex()
+                .items_center()
+                .child(label.clone());
+            selection_rows.push(
+                selectable_row(
+                    "selectable-files",
+                    &selection_order,
+                    index,
+                    &self.selection,
+                    content,
+                    WidgetContext::new(palette, self, cx),
+                    move |this, intent, _window, cx| {
+                        if let SelectionIntent::Activate(id) = &intent {
+                            this.note(format!("Opened {id}"), cx);
+                        } else {
+                            this.selection.apply(&order, intent);
+                            cx.notify();
+                        }
+                    },
+                )
+                .into_any_element(),
+            );
+        }
+
         column()
             .child(card(
                 palette,
@@ -1251,6 +1306,20 @@ impl Gallery {
                     this.details_open = expanded;
                     cx.notify();
                 },
+            ))
+            .child(card(
+                palette,
+                "Selection — click, ⇧ range, ⌘ toggle, arrows, ⌘A, End",
+                column()
+                    .child(
+                        selectable_list(
+                            "selectable-files",
+                            selection_rows,
+                            WidgetContext::new(palette, self, cx),
+                        )
+                        .h(px(196.0)),
+                    )
+                    .child(caption(palette, &format!("{selected_count} selected"))),
             ))
             .into_any_element()
     }

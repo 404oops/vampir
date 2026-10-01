@@ -78,6 +78,8 @@ These are in-window menus drawn by the toolkit. The macOS menu bar is a differen
 
 `tree_row` renders one row of an already flattened tree, so it drops straight into a `uniform_list`. `table_header` with `Column` and `SortDirection`; `table_row` for a row of plain text on the header's grid, which slides to its new place when the sort changes, and `table_cell` for a row that is more than text.
 
+`selectable_row` wraps any row content with one list-wide keyboard stop, a focus ring on the active row, and standard click, modifier-click and arrow-key selection. The host owns `ListSelection` beside its data and applies the `SelectionIntent` reported by each row; stable item ids keep a selection attached to the same items when the list changes order. Put the rows directly inside `selectable_list` with the same id and give it a height to make a tracked scroll viewport: Up, Down, Home and End reveal the active row, with edge fades and an overlay scrollbar. The gallery's Data page demonstrates range selection, toggling, Select All and moving the keyboard past the visible rows.
+
 The tree stays the host's, and `flatten_tree` walks it into `TreeRow`s each frame, skipping the children of anything closed — the step that makes collapsing mean anything. Keeping the flattened list *as* the model is the tempting shortcut — it is what gets drawn, after all — but then closing a branch has nothing to hide, because its children were never underneath it. Sorting is the host's too: it compares keys, not the strings on screen, and only the host knows which is which.
 
 ## Colour — `vampir::swatch`

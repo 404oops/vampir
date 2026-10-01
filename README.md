@@ -111,7 +111,7 @@ The gallery supports both colour schemes:
 
 **Menus and overlays** — `context_menu`, `menu_button`, `menu_target`, `Tooltip`, `command_palette` and `search_list` with `fuzzy_filter` / `fuzzy_score`.
 
-**Data** — `tree_row` with `flatten_tree`, `table_header` and `table_row` with `Column` and `SortDirection`.
+**Data** — `tree_row` with `flatten_tree`, `selectable_row` and its tracked `selectable_list` viewport with host-owned `ListSelection`, `table_header` and `table_row` with `Column` and `SortDirection`.
 
 **Theme** — `Theme`, `Scheme`, optional `scheme_picker`, `hue_picker` and `saturation_picker`: hue and saturation chosen by the app, a scheme that follows the desktop, and the palette derived from them.
 
