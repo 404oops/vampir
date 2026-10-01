@@ -42,14 +42,15 @@ impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = self.controls.palette();
         let body = self.body(palette, window, cx);
-        if self.controls.animating() {
-            window.request_animation_frame();
-        }
-        vampir::root(div().id("root"), self, cx)
+        let root = vampir::root(div().id("root"), self, cx)
             .size_full()
             .font_family(vampir::ui_font())
             .bg(vampir::ground(palette.backdrop))
-            .child(body)
+            .child(body);
+        if self.controls.animating() {
+            window.request_animation_frame();
+        }
+        root
     }
 }
 ```
@@ -66,7 +67,7 @@ A host that tracks drags of its own at the root has two things to do. Call `vamp
 
 ## Request frames for animations
 
-Ask `ControlState::animating()` **after** your page has been built, not before. A switch or a disclosure notices its own state change while it renders — that is what lets a change made by a menu item or a shortcut slide exactly as a click does — so a check made before the controls run cannot see the slide one of them is about to start, and the frame that starts it never asks for the frame that would continue it.
+Ask `ControlState::animating()` **after** building the entire root, including its header, scroll area, footer and overlays. A switch, disclosure or menu notices its own state change while it renders — that is what lets a change made by a menu item or a shortcut slide exactly as a click does — so a check made before the controls run cannot see the slide one of them is about to start, and the frame that starts it never asks for the frame that would continue it.
 
 Fades and slides are `Instant`-driven, so they finish on their own and stop asking for frames. The theme crossing over, a dialog arriving or leaving, a menu or a palette revealing are all counted. Fold `ControlState::animating()` into whatever decides:
 
