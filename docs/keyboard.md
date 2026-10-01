@@ -62,7 +62,7 @@ The application's own keys — ⌘K, ⌘S — are still the host's to bind, afte
 | `command_palette`, `search_list` | The query field has the keyboard. Up and down move the highlight, Enter picks it; a new query puts the highlight back on the best match. The palette opens with the keyboard in its query, closes on Escape, and hands the keyboard back where it was. |
 | `collapsible` | Space toggles, Left closes, Right opens. |
 | `split_handle` | Arrows move the divider. A divider only the mouse can move is content a keyboard user cannot reach. |
-| `context_menu` | Takes focus when it opens. Up and down move over the enabled rows only, Enter runs one, Escape closes. Focus goes back where it was. |
+| `context_menu`, `menu_button` | The button opens with Space, Enter or Down; the menu takes focus. Up and down move over enabled rows, Right or Enter opens a submenu, Left or Escape returns one level, and Escape at the top closes the menu. Enter on a leaf runs it. Focus goes back where it was after closing. |
 | `table_header` | Sortable columns are tab stops; Space or Enter sorts. |
 | `tree_row` | One tab stop, on the selected row. Up and down walk the flattened rows without wrapping. Right opens a closed branch and then steps into it; left closes an open one and then steps out to the parent. |
 | `color_pad` | Left and right move chroma, up and down move lightness. |

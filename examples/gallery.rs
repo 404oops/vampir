@@ -621,7 +621,13 @@ impl Render for Gallery {
                 cx,
                 |this, action, _window, cx| {
                     let target = this.controls.menu_target().unwrap_or("").to_string();
-                    this.note(format!("{action} → {target}"), cx);
+                    let description = match action {
+                        "move-documents" => "Move to Documents",
+                        "move-images" => "Move to Images",
+                        "duplicate" => "Duplicate",
+                        _ => action,
+                    };
+                    this.note(format!("{description} → {target}"), cx);
                 },
             ))
             .children(context_menu(
@@ -632,9 +638,26 @@ impl Render for Gallery {
                 cx,
                 |this, action, window, cx| {
                     match action {
-                        "system" => this.set_scheme(Scheme::System, cx),
-                        "light" => this.set_scheme(Scheme::Light, cx),
-                        "dark" => this.set_scheme(Scheme::Dark, cx),
+                        "system" => {
+                            this.set_scheme(Scheme::System, cx);
+                            this.note("Following system appearance", cx);
+                        }
+                        "light" => {
+                            this.set_scheme(Scheme::Light, cx);
+                            this.note("Light appearance", cx);
+                        }
+                        "dark" => {
+                            this.set_scheme(Scheme::Dark, cx);
+                            this.note("Dark appearance", cx);
+                        }
+                        "violet" => {
+                            this.controls.theme.hue = 268.0;
+                            this.note("Violet accent", cx);
+                        }
+                        "teal" => {
+                            this.controls.theme.hue = 186.0;
+                            this.note("Teal accent", cx);
+                        }
                         "palette" => {
                             this.controls
                                 .open_palette("commands", &this.palette_query, window, cx)
@@ -1416,6 +1439,19 @@ impl Gallery {
             MenuItem::separator(),
             MenuItem::action("pin", "Pin to top").checked(true),
             MenuItem::action("reveal", "Show in folder").disabled(),
+            MenuItem::submenu(
+                "Organize",
+                vec![
+                    MenuItem::submenu(
+                        "Move to",
+                        vec![
+                            MenuItem::action("move-documents", "Documents"),
+                            MenuItem::action("move-images", "Images"),
+                        ],
+                    ),
+                    MenuItem::action("duplicate", "Duplicate"),
+                ],
+            ),
             MenuItem::separator(),
             MenuItem::action("delete", "Delete").shortcut("⌫").danger(),
         ]
@@ -1424,10 +1460,22 @@ impl Gallery {
     fn view_menu(&self) -> Vec<MenuItem> {
         let scheme = self.controls.theme.scheme;
         vec![
-            MenuItem::header("Colour scheme"),
-            MenuItem::action("system", "System").checked(scheme == Scheme::System),
-            MenuItem::action("light", "Light").checked(scheme == Scheme::Light),
-            MenuItem::action("dark", "Dark").checked(scheme == Scheme::Dark),
+            MenuItem::submenu(
+                "Appearance",
+                vec![
+                    MenuItem::submenu(
+                        "Colour scheme",
+                        vec![
+                            MenuItem::action("system", "System").checked(scheme == Scheme::System),
+                            MenuItem::action("light", "Light").checked(scheme == Scheme::Light),
+                            MenuItem::action("dark", "Dark").checked(scheme == Scheme::Dark),
+                        ],
+                    ),
+                    MenuItem::separator(),
+                    MenuItem::action("violet", "Violet accent"),
+                    MenuItem::action("teal", "Teal accent"),
+                ],
+            ),
             MenuItem::separator(),
             MenuItem::action("palette", "Command palette…")
                 .shortcut(vampir::display("secondary-k")),

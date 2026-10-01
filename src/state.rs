@@ -361,6 +361,16 @@ pub struct OpenMenu {
     /// activated — headers and separators are passed over rather than landed
     /// on, because arrowing onto something inert reads as a stuck key.
     pub highlight: Option<usize>,
+    /// The submenu rows taken from the root to the visible level. Each one
+    /// retains its reachable-row position so Back restores the cursor to the
+    /// row that opened that level.
+    pub(crate) levels: Vec<MenuBranch>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct MenuBranch {
+    pub index: usize,
+    pub highlight: usize,
 }
 
 /// A modal dialog that is open, or on its way out.
@@ -1452,6 +1462,7 @@ impl ControlState {
             target: target.into(),
             opened_at: Instant::now(),
             highlight: None,
+            levels: Vec::new(),
         });
     }
 
@@ -1471,6 +1482,7 @@ impl ControlState {
             target: target.into(),
             opened_at: Instant::now(),
             highlight: None,
+            levels: Vec::new(),
         });
     }
 
@@ -1615,6 +1627,28 @@ impl ControlState {
     /// Which row of the open menu the keyboard is on.
     pub fn menu_highlight(&self) -> Option<usize> {
         self.menu.as_ref().and_then(|menu| menu.highlight)
+    }
+
+    /// Enters an enabled submenu. The menu opening, target and focus handle
+    /// stay put; only the visible level and its keyboard row change.
+    pub(crate) fn enter_menu(&mut self, index: usize, highlight: usize) {
+        if let Some(menu) = self.menu.as_mut() {
+            menu.levels.push(MenuBranch { index, highlight });
+            menu.highlight = None;
+        }
+    }
+
+    /// Returns to the parent level, restoring the row that opened it.
+    /// Returns false when the menu is already at its root.
+    pub(crate) fn back_menu(&mut self) -> bool {
+        let Some(menu) = self.menu.as_mut() else {
+            return false;
+        };
+        let Some(branch) = menu.levels.pop() else {
+            return false;
+        };
+        menu.highlight = Some(branch.highlight);
+        true
     }
 
     /// Closes whatever is showing over the view: a pop-up list, a context
@@ -1894,6 +1928,27 @@ mod tests {
         state.close_menu();
         assert_eq!(state.menu_target(), None);
         assert_eq!(state.menu_opened_at(), None);
+    }
+
+    #[test]
+    fn submenu_navigation_keeps_the_opening_and_restores_its_parent_row() {
+        let mut state = ControlState::new();
+        state.open_menu("row", at(10.0, 20.0), "budget.csv");
+        let opening = state.menu_opened_at();
+
+        state.enter_menu(3, 1);
+        state.highlight_menu(Some(2));
+        state.enter_menu(4, 2);
+        assert_eq!(state.menu_target(), Some("budget.csv"));
+        assert_eq!(state.menu_opened_at(), opening);
+        assert_eq!(state.menu_highlight(), None);
+
+        assert!(state.back_menu());
+        assert_eq!(state.menu_highlight(), Some(2));
+        assert!(state.back_menu());
+        assert_eq!(state.menu_highlight(), Some(1));
+        assert!(!state.back_menu());
+        assert_eq!(state.menu_target(), Some("budget.csv"));
     }
 
     /// Reopening replaces the target rather than keeping the first one, so a

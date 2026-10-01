@@ -42,7 +42,7 @@ The page itself is laid out with the same vocabulary: `card` is the lit panel wi
 
 ## Menus — `vampir::menu`
 
-`context_menu` renders the open menu; `MenuItem::action(..).shortcut(..) .checked(..).danger().disabled()` builds the rows, and `MenuItem::header` and `MenuItem::separator` break them up. Open it from wherever the press happened:
+`context_menu` renders the open menu; `MenuItem::action(..).shortcut(..).checked(..).danger().disabled()` builds action rows, `MenuItem::submenu(label, items)` nests a menu to any depth, and `MenuItem::header` and `MenuItem::separator` break rows up. A submenu can also be disabled. Open the menu from wherever the press happened:
 
 ```rust
 .on_mouse_down(MouseButton::Right, cx.listener(|this, event: &MouseDownEvent, _w, cx| {
@@ -59,6 +59,8 @@ and render it once, near the root:
 ```
 
 The `target` string is yours and comes back unchanged through `ControlState::menu_target()` while the callback runs. Build the item list from it each frame so it reflects what was clicked. `menu_target` is that right-click listener as a wrapper — `menu_target("row", row.id, cx, select_on_the_way, tree_row(..))` — for a row that should open a menu about itself. `menu_button` opens the same menu beneath a button, and pressing the button again closes it.
+
+Submenus drill into the same panel. Click a submenu row, or press Right or Enter on it, to see its children; the back row, Left and Escape return one level, while Escape at the top closes the menu. Only a leaf action calls `on_activate`, with its original id and target. The gallery's Data page has **Organize › Move to › Documents** in a row's context menu; the header's **View › Appearance › Colour scheme** is reachable from the keyboard.
 
 These are in-window menus drawn by the toolkit. The macOS menu bar is a different thing entirely and belongs to GPUI — see [Shipping a macOS app](macos-apps.md).
 
