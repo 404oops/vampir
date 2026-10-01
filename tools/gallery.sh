@@ -118,6 +118,7 @@ key() {
 	escape) code=53 ;; tab) code=48 ;; enter | return) code=36 ;; space) code=49 ;;
 	up) code=126 ;; down) code=125 ;; left) code=123 ;; right) code=124 ;;
 	backspace | delete) code=51 ;; home) code=115 ;; end) code=119 ;;
+	pageup) code=116 ;; pagedown) code=121 ;;
 	esac
 	if [ -n "$code" ]; then
 		as "tell application \"System Events\" to key code $code$using"

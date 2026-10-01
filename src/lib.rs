@@ -80,7 +80,8 @@ pub use lighting::{
 };
 pub use menu::{ContextMenu, MenuAction, MenuItem, context_menu, menu_button, menu_target};
 pub use overlay::{
-    Command, Hint, Tooltip, command_list, command_palette, fuzzy_filter, fuzzy_score, search_list,
+    Command, Hint, SearchResult, Tooltip, command_list, command_palette, fuzzy_filter, fuzzy_score,
+    ranked_command_palette, ranked_search_list, search_list,
 };
 pub use palette::{DEFAULT_SATURATION, MAX_SATURATION, Palette};
 pub use scroll::{SCROLL_FADE, ScrollAxis, ScrollDrag, apply_scroll_drag, scroll_fades};

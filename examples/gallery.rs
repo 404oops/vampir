@@ -22,15 +22,15 @@ use vampir::AppIcon;
 use vampir::{
     BadgeTone, ButtonVariant, CONTROL_HEIGHT, ChipSelection, Choice, Chord, Column, ComboId,
     Command, ControlHost, ControlState, DialogButton, Hint, InputStyle, MAX_CHROMA, MenuItem,
-    Oklch, Palette, Scheme, ScrollAxis, SliderTrack, SortDirection, Span, TEXT_SIZE,
+    Oklch, Palette, Scheme, ScrollAxis, SearchResult, SliderTrack, SortDirection, Span, TEXT_SIZE,
     TITLE_TEXT_SIZE, Tab, TextInput, Theme, TreeRow, WidgetContext, arriving, badge, bind_keys,
     button, caption, card, checkbox, chip_group, collapsible, color_pad, column, combo,
-    command_palette, context_menu, dialog, edit_menu, fading_text, flatten_tree, glyph, ground,
-    hue_picker, hue_slider, hue_wheel, icon_button, labelled, lit, menu_button, menu_target,
-    progress_bar, radio_group, reorder, row, saturation_picker, scheme_picker, scroll_area,
-    search_list, segmented, separator, shortcut_recorder, slider, spinbox, spinner, split_area,
-    split_handle, swatch_grid, switch, tab_bar, table_header, table_row, text_area, text_field,
-    tree_row, ui_font,
+    command_palette, context_menu, dialog, edit_menu, fading_text, flatten_tree, fuzzy_score,
+    glyph, ground, hue_picker, hue_slider, hue_wheel, icon_button, labelled, lit, menu_button,
+    menu_target, progress_bar, radio_group, ranked_command_palette, ranked_search_list, reorder,
+    row, saturation_picker, scheme_picker, scroll_area, search_list, segmented, separator,
+    shortcut_recorder, slider, spinbox, spinner, split_area, split_handle, swatch_grid, switch,
+    tab_bar, table_header, table_row, text_area, text_field, tree_row, ui_font,
 };
 
 // The gallery is also the smallest complete *macOS* host, so it carries the
@@ -48,6 +48,7 @@ actions!(
         HideOthers,
         ShowAll,
         TogglePalette,
+        ToggleRankedPalette,
         UseSystemScheme,
         UseLight,
         UseDark,
@@ -201,6 +202,10 @@ struct Gallery {
     query: Entity<TextInput>,
     /// What the search field searches.
     search_items: Vec<Command>,
+    ranked_query: Entity<TextInput>,
+    ranked_palette_query: Entity<TextInput>,
+    ranked_items: Vec<SearchResult>,
+    history_loaded: bool,
     takes_edit: Entity<TextInput>,
     chord: Option<Chord>,
 
@@ -307,6 +312,16 @@ impl Gallery {
             input
         });
         let query = cx.new(|cx| TextInput::new(cx, "Search", false, style(TEXT_SIZE)));
+        let ranked_query =
+            cx.new(|cx| TextInput::new(cx, "Search across sources", false, style(TEXT_SIZE)));
+        let ranked_palette_query = cx.new(|cx| {
+            TextInput::new(
+                cx,
+                "Search tabs, bookmarks and actions",
+                false,
+                style(TITLE_TEXT_SIZE),
+            )
+        });
         let takes_edit = cx.new(|cx| {
             let mut input = TextInput::new(cx, "", false, style(TEXT_SIZE));
             input.content = "24".into();
@@ -345,6 +360,71 @@ impl Gallery {
                 Command::new("keys", "Keyboard shortcuts").group("Settings"),
                 Command::new("notify", "Notifications").group("Settings"),
             ],
+            ranked_query,
+            ranked_palette_query,
+            ranked_items: vec![
+                SearchResult::new("tab-design", "Design review")
+                    .section("Open tabs")
+                    .detail("Project board · 2 minutes ago")
+                    .leading(|palette| glyph("▣").text_color(palette.accent)),
+                SearchResult::new("tab-release", "Release checklist")
+                    .section("Open tabs")
+                    .detail("Draft · Current window")
+                    .leading(|palette| glyph("▣").text_color(palette.accent)),
+                SearchResult::new("tab-insights", "Traffic insights")
+                    .section("Open tabs")
+                    .detail("Analytics · Current window")
+                    .leading(|palette| glyph("▣").text_color(palette.accent)),
+                SearchResult::new("tab-issues", "Issue tracker")
+                    .section("Open tabs")
+                    .detail("42 open tasks")
+                    .leading(|palette| glyph("▣").text_color(palette.accent)),
+                SearchResult::new("bookmark-system", "Design system")
+                    .section("Bookmarks")
+                    .detail("Components and colour recipes")
+                    .leading(|palette| glyph("★").text_color(palette.text_secondary)),
+                SearchResult::new("bookmark-keys", "Keyboard shortcuts")
+                    .section("Bookmarks")
+                    .detail("Reference · Documentation")
+                    .leading(|palette| glyph("★").text_color(palette.text_secondary)),
+                SearchResult::new("bookmark-api", "API reference")
+                    .section("Bookmarks")
+                    .detail("Framework documentation")
+                    .leading(|palette| glyph("★").text_color(palette.text_secondary)),
+                SearchResult::new("bookmark-roadmap", "Project roadmap")
+                    .section("Bookmarks")
+                    .detail("Milestones and plans")
+                    .leading(|palette| glyph("★").text_color(palette.text_secondary)),
+                SearchResult::new("file-budget", "Quarterly budget")
+                    .section("Files")
+                    .detail("Shared documents · Updated today")
+                    .leading(|palette| glyph("▤").text_color(palette.text_secondary)),
+                SearchResult::new("file-summary", "Meeting summary")
+                    .section("Files")
+                    .detail("Notes · Updated yesterday")
+                    .leading(|palette| glyph("▤").text_color(palette.text_secondary)),
+                SearchResult::new("history-notes", "Design notes")
+                    .section("History")
+                    .detail("Visited this morning")
+                    .leading(|palette| glyph("↶").text_color(palette.text_secondary)),
+                SearchResult::new("history-changelog", "Release notes")
+                    .section("History")
+                    .detail("Visited yesterday")
+                    .leading(|palette| glyph("↶").text_color(palette.text_secondary)),
+                SearchResult::new("action-settings", "Open settings")
+                    .section("Actions")
+                    .shortcut(vampir::display("secondary-,"))
+                    .leading(|palette| glyph("⚙").text_color(palette.text_secondary)),
+                SearchResult::new("action-invite", "Invite teammate")
+                    .section("Actions")
+                    .detail("Share this workspace")
+                    .leading(|palette| glyph("⚙").text_color(palette.text_secondary)),
+                SearchResult::new("action-export", "Export report")
+                    .section("Actions")
+                    .detail("Save a local copy")
+                    .leading(|palette| glyph("⚙").text_color(palette.text_secondary)),
+            ],
+            history_loaded: false,
             takes_edit,
             chord: Some(Chord {
                 keystroke: "secondary-shift-s".into(),
@@ -422,6 +502,17 @@ impl Gallery {
         cx.notify();
     }
 
+    fn toggle_ranked_palette(
+        &mut self,
+        _: &ToggleRankedPalette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.controls
+            .toggle_palette("ranked-commands", &self.ranked_palette_query, window, cx);
+        cx.notify();
+    }
+
     fn use_system_scheme(&mut self, _: &UseSystemScheme, _: &mut Window, cx: &mut Context<Self>) {
         self.set_scheme(Scheme::System, cx);
     }
@@ -490,6 +581,38 @@ impl Gallery {
         self.note(format!("Opened {label}"), cx);
     }
 
+    fn ranked_results(&self, query: &str) -> Vec<SearchResult> {
+        let query = query.trim();
+        let mut scored: Vec<(i32, &SearchResult)> = self
+            .ranked_items
+            .iter()
+            .filter(|result| self.history_loaded || result.section.as_deref() != Some("History"))
+            .filter_map(|result| {
+                let score = if query.is_empty() {
+                    0
+                } else {
+                    fuzzy_score(
+                        query,
+                        &format!(
+                            "{} {} {}",
+                            result.label,
+                            result.detail.as_deref().unwrap_or(""),
+                            result.section.as_deref().unwrap_or("")
+                        ),
+                    )?
+                };
+                Some((score, result))
+            })
+            .collect();
+        if !query.is_empty() {
+            scored.sort_by_key(|item| std::cmp::Reverse(item.0));
+        }
+        scored
+            .into_iter()
+            .map(|(_, result)| result.clone())
+            .collect()
+    }
+
     fn minimize(&mut self, _: &MinimizeWindow, window: &mut Window, _cx: &mut Context<Self>) {
         window.minimize_window();
     }
@@ -552,17 +675,15 @@ impl Render for Gallery {
         // Keyed by the page, not the tab's position, so reordering the tabs
         // is not a page change.
         let body = arriving("page", page as u64, &self.controls, body);
-
-        // Asked *after* the page is built, on purpose: a control notices its
-        // own state change while it renders. Fades and slides stop asking
-        // when they finish; the spinner requests its own frames while visible.
-        if self.controls.animating() {
-            window.request_animation_frame();
-        }
+        let ranked_palette_results = if self.controls.is_palette_open("ranked-commands") {
+            self.ranked_results(&self.ranked_palette_query.read(cx).text())
+        } else {
+            Vec::new()
+        };
 
         // The toolkit's handlers first — Tab, Shift-Tab, Escape, the drags,
         // the mouse taking over — and the gallery's own actions after them.
-        vampir::root(div().id("root"), self, cx)
+        let root = vampir::root(div().id("root"), self, cx)
             .size_full()
             .flex()
             .flex_col()
@@ -571,6 +692,7 @@ impl Render for Gallery {
             .bg(ground(palette.backdrop))
             .text_color(palette.text_primary)
             .on_action(cx.listener(Self::toggle_palette))
+            .on_action(cx.listener(Self::toggle_ranked_palette))
             .on_action(cx.listener(Self::use_system_scheme))
             .on_action(cx.listener(Self::use_light))
             .on_action(cx.listener(Self::use_dark))
@@ -613,6 +735,14 @@ impl Render for Gallery {
                 window,
                 |this, id, _window, cx| this.run_command(id, cx),
             ))
+            .children(ranked_command_palette(
+                "ranked-commands",
+                &self.ranked_palette_query,
+                &ranked_palette_results,
+                WidgetContext::new(palette, self, cx),
+                window,
+                |this, id, _window, cx| this.note(format!("Opened {id}"), cx),
+            ))
             .children(context_menu(
                 "row",
                 &self.row_menu(),
@@ -643,7 +773,13 @@ impl Render for Gallery {
                     }
                     cx.notify();
                 },
-            ))
+            ));
+        // The footer and overlays animate too, so ask for the next frame
+        // only after every control has reported its transition.
+        if self.controls.animating() {
+            window.request_animation_frame();
+        }
+        root
     }
 }
 
@@ -1001,6 +1137,8 @@ impl Gallery {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let ranked_query = self.ranked_query.read(cx).text();
+        let ranked_results = self.ranked_results(&ranked_query);
         column()
             .child(card(
                 palette,
@@ -1028,6 +1166,39 @@ impl Gallery {
                             |this, id, _window, cx| this.open_result(id, cx),
                         ),
                     )),
+            ))
+            .child(card(
+                palette,
+                "Ranked results",
+                column()
+                    .child(labelled(
+                        palette,
+                        "Empty query: click the field, press Down to scroll results, then Enter. Try ‘design’ + Add history to rerank.",
+                        ranked_search_list(
+                            "ranked-search",
+                            &self.ranked_query,
+                            &ranked_results,
+                            WidgetContext::new(palette, self, cx),
+                            window,
+                            |this, id, _window, cx| this.note(format!("Opened {id}"), cx),
+                        ),
+                    ))
+                    .child(div().w(px(150.0)).child(button(
+                        "history-source",
+                        if self.history_loaded {
+                            "Remove history"
+                        } else {
+                            "Add history"
+                        },
+                        ButtonVariant::Soft,
+                        true,
+                        palette,
+                        cx,
+                        |this, _window, cx| {
+                            this.history_loaded = !this.history_loaded;
+                            cx.notify();
+                        },
+                    ))),
             ))
             .child(card(
                 palette,
@@ -1071,6 +1242,23 @@ impl Gallery {
                                     this.controls.open_palette(
                                         "commands",
                                         &this.palette_query,
+                                        window,
+                                        cx,
+                                    );
+                                    cx.notify();
+                                },
+                            )))
+                            .child(div().w(px(160.0)).child(button(
+                                "open-ranked-palette",
+                                "Results palette",
+                                ButtonVariant::Soft,
+                                true,
+                                palette,
+                                cx,
+                                |this, window, cx| {
+                                    this.controls.open_palette(
+                                        "ranked-commands",
+                                        &this.ranked_palette_query,
                                         window,
                                         cx,
                                     );
@@ -1511,6 +1699,7 @@ fn app_menus() -> Vec<Menu> {
             OsMenuItem::action("Dark", UseDark),
             OsMenuItem::separator(),
             OsMenuItem::action("Command Palette\u{2026}", TogglePalette),
+            OsMenuItem::action("Results Palette\u{2026}", ToggleRankedPalette),
         ]),
         // GPUI hands a menu named exactly "Window" to macOS as the windows
         // menu, which is what fills it with the window list.
@@ -1540,6 +1729,7 @@ fn main() {
             KeyBinding::new("secondary-q", Quit, None),
             KeyBinding::new("secondary-w", CloseWindow, None),
             KeyBinding::new("secondary-k", TogglePalette, None),
+            KeyBinding::new("secondary-shift-k", ToggleRankedPalette, None),
             KeyBinding::new("secondary-1", ShowControls, None),
             KeyBinding::new("secondary-2", ShowFields, None),
             KeyBinding::new("secondary-3", ShowData, None),

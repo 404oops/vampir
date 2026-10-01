@@ -109,7 +109,7 @@ The gallery supports both colour schemes:
 
 **Containers** — `tab_bar` (drag to reorder, optional close buttons) with `reorder`, `split_handle` + `split_area`, `collapsible`, `dialog`, `card`, `labelled`, `row` / `column`, `scroll_area`, `arriving`.
 
-**Menus and overlays** — `context_menu`, `menu_button`, `menu_target`, `Tooltip`, `command_palette` and `search_list` with `fuzzy_filter` / `fuzzy_score`.
+**Menus and overlays** — `context_menu`, `menu_button`, `menu_target`, `Tooltip`, fuzzy `command_palette` and `search_list`, and `ranked_command_palette` / `ranked_search_list` for host-ranked results with sections, details and leading visuals.
 
 **Data** — `tree_row` with `flatten_tree`, `table_header` and `table_row` with `Column` and `SortDirection`.
 

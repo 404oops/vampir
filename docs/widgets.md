@@ -72,6 +72,8 @@ These are in-window menus drawn by the toolkit. The macOS menu bar is a differen
 
 `search_list` is the same field-and-rows without the overlay: a search field with the matching rows underneath and the same keys between them, for a filter over a list in the page. The gallery's Fields page shows one filtering as you type. `command_list` is the rows on their own, for a host that filters and moves the highlight itself; `fuzzy_score` is the ranking.
 
+`ranked_search_list` and `ranked_command_palette` take `SearchResult`s in the order the host supplies, for results assembled from tabs, files, history, remote suggestions or other sources. The host filters, ranks and refreshes the slice; the toolkit draws section headings, optional detail and shortcut text, a palette-aware leading visual from `SearchResult::leading`, and emphasized query matches, and handles Up, Down, Enter, click, focus and dismissal. Both keep the query field above a bounded result viewport, reveal offscreen highlighted rows during keyboard navigation, and return the viewport to the first row when the query or result order changes. Stable, unique result ids keep row motion attached to the same item, so a late source update cannot silently make Enter choose another item. The gallery's Ranked results card filters and stably sorts matches with `fuzzy_score`: type `design`, then add History to see its result take the top rank. The Results palette shows the same host-ranked source collection. Existing `Command`, `search_list` and `command_palette` retain their fuzzy filtering behavior.
+
 ## Data — `vampir::data`
 
 ![A tab bar, a tree, a table and a split](data.png)

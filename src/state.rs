@@ -103,6 +103,12 @@ impl From<String> for Tag {
     }
 }
 
+impl From<&String> for Tag {
+    fn from(text: &String) -> Self {
+        Tag::new(text.as_str())
+    }
+}
+
 impl From<SharedString> for Tag {
     fn from(text: SharedString) -> Self {
         Tag::new(text.as_ref())
@@ -810,6 +816,8 @@ impl ControlState {
             return_focus,
         });
         self.highlight_list(id, 0);
+        let scroll = self.scroll((id, "list"));
+        scroll.set_offset(Point::default());
         query.update(cx, |input, cx| input.set_text("", cx));
         let focus = query.read(cx).focus_handle.clone();
         window.focus(&focus, cx);
@@ -848,32 +856,43 @@ impl ControlState {
 
     // ---- Filtering lists ----
 
-    /// Which row the keyboard is on in list `list`, given the query the
-    /// list is currently filtered by. A changed query puts it back on the
-    /// first row: the rows have been re-ranked, and the best match is the
-    /// one the person most likely means.
-    pub fn list_highlight(&self, list: impl Into<Tag>, query: &str) -> usize {
-        let hash = Tag::new(query).0;
+    /// Which row the keyboard is on in list `list`, given the query or
+    /// result-set identity it is currently filtered by. A changed identity
+    /// puts it back on the first row, so asynchronous re-ranking never
+    /// leaves the keyboard pointing at a different result by accident.
+    pub fn list_highlight(&self, list: impl Into<Tag>, query: impl Into<Tag>) -> usize {
+        self.list_highlight_with_change(list, query).0
+    }
+
+    /// Also reports whether the query or result identity changed, so a
+    /// tracked result viewport can return to its new first row.
+    pub(crate) fn list_highlight_with_change(
+        &self,
+        list: impl Into<Tag>,
+        query: impl Into<Tag>,
+    ) -> (usize, bool) {
+        let hash = query.into().0;
         let frame = self.frame.get();
         let mut records = self.records.borrow_mut();
-        let entry = records
-            .entry(Kind::List.slot(list.into()))
-            .or_insert(Entry {
-                touched: frame,
-                record: Record::List {
-                    highlight: 0,
-                    query: hash,
-                },
-            });
+        let slot = Kind::List.slot(list.into());
+        let fresh = !records.contains_key(&slot);
+        let entry = records.entry(slot).or_insert(Entry {
+            touched: frame,
+            record: Record::List {
+                highlight: 0,
+                query: hash,
+            },
+        });
         entry.touched = frame;
         let Record::List { highlight, query } = &mut entry.record else {
-            return 0;
+            return (0, false);
         };
-        if *query != hash {
+        let changed = fresh || *query != hash;
+        if changed {
             *query = hash;
             *highlight = 0;
         }
-        *highlight
+        (*highlight, changed)
     }
 
     /// The keyboard's row in list `list` as last set, whatever the query.
@@ -2312,6 +2331,26 @@ mod tests {
         state.highlight_list("commands", 4);
         assert_eq!(state.list_highlight("results", "rep"), 0);
         assert_eq!(state.list_position("commands"), 4);
+    }
+
+    #[test]
+    fn re_ranked_results_do_not_leave_the_keyboard_on_another_item() {
+        let state = ControlState::new();
+        let original = ["tab", "bookmark", "history"];
+        let updated = ["history", "tab", "bookmark"];
+        assert_eq!(
+            state.list_highlight_with_change("results", ("des", original)),
+            (0, true)
+        );
+        state.highlight_list("results", 1);
+        assert_eq!(
+            state.list_highlight_with_change("results", ("des", original)),
+            (1, false)
+        );
+        assert_eq!(
+            state.list_highlight_with_change("results", ("des", updated)),
+            (0, true)
+        );
     }
 
     /// The theme's palette follows the truth rather than jumping to it,
