@@ -32,11 +32,11 @@ use crate::state::{
 #[derive(Clone, Debug)]
 pub struct Tab {
     /// What this tab *is*, as opposed to where it currently sits. Everything
-    /// the bar remembers about a tab between frames — its width, how far
-    /// along its slide it is, whether its label has crossed over — is keyed
-    /// by this, so a reorder, which renumbers every tab, moves the records
-    /// with the tabs. Defaults to the label; set it when two tabs could
-    /// share one.
+    /// the bar remembers about a tab between frames — its size along the
+    /// bar, how far along its slide it is, whether its label has crossed
+    /// over — is keyed by this, so a reorder, which renumbers every tab,
+    /// moves the records with the tabs. Defaults to the label; set it when
+    /// two tabs could share one.
     pub id: SharedString,
     pub label: SharedString,
     /// Drawn to the right of the label, for a count or a modified dot.
@@ -80,6 +80,10 @@ pub enum TabBarLayout {
     Horizontal,
     /// Every tab has the same width, keeping close targets aligned while
     /// siblings are removed. Long labels elide; the strip scrolls sideways.
+    ///
+    /// `width` is clamped to 96..=320: narrower leaves no room for a label
+    /// beside the close target, wider stops reading as a tab. A width that
+    /// is not finite falls back to 160.
     HorizontalUniform { width: f32 },
     /// Tabs fill the host's chosen width and stack vertically. Constrain the
     /// returned element's height when the list should scroll.
@@ -102,6 +106,10 @@ impl TabBarLayout {
         }
     }
 }
+
+const TAB_HEIGHT: f32 = 26.0;
+const TAB_GAP: f32 = 2.0;
+const TAB_PAD: f32 = 2.0;
 
 /// Horizontal tab bar with drag-to-reorder.
 ///
@@ -195,9 +203,6 @@ pub fn tab_bar_layout<V: ControlHost>(
         _ => (0..tabs.len()).collect(),
     };
 
-    const TAB_HEIGHT: f32 = 26.0;
-    const TAB_GAP: f32 = 2.0;
-    const TAB_PAD: f32 = 2.0;
     let state = view.control_state();
     // The first render has no tab bounds yet. Keep this reveal pending until
     // a painted frame can supply them; then leave manual scrolling alone
@@ -609,7 +614,7 @@ pub fn tab_bar_layout<V: ControlHost>(
 /// floating copy of a tab being dragged look like.
 fn tab_face(tab: &Tab, active: bool, palette: Palette, layout: TabBarLayout) -> Div {
     div()
-        .h(px(26.0))
+        .h(px(TAB_HEIGHT))
         .flex_none()
         .when_some(layout.tab_width(), |el, width| el.w(px(width)))
         .px(px(10.0))
