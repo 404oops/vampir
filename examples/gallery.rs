@@ -20,17 +20,18 @@ use gpui_ce_platform::application;
 #[cfg(feature = "app-icon")]
 use vampir::AppIcon;
 use vampir::{
-    BadgeTone, ButtonVariant, CONTROL_HEIGHT, ChipSelection, Choice, Chord, Column, ComboId,
-    Command, ControlHost, ControlState, DialogButton, Hint, InputStyle, MAX_CHROMA, MenuItem,
-    Oklch, Palette, Scheme, ScrollAxis, SliderTrack, SortDirection, Span, TEXT_SIZE,
-    TITLE_TEXT_SIZE, Tab, TabBarLayout, TextInput, Theme, TreeRow, WidgetContext, arriving, badge,
-    bind_keys, button, caption, card, checkbox, chip_group, collapsible, color_pad, column, combo,
-    command_palette, context_menu, dialog, edit_menu, fading_text, flatten_tree, glyph, ground,
-    hue_picker, hue_slider, hue_wheel, icon_button, labelled, lit, menu_button, menu_target,
-    progress_bar, radio_group, reorder, row, saturation_picker, scheme_picker, scroll_area,
-    search_list, segmented, separator, shortcut_recorder, slider, spinbox, spinner, split_area,
-    split_handle, swatch_grid, switch, tab_bar, tab_bar_layout, table_header, table_row, text_area,
-    text_field, tree_row, ui_font,
+    BadgeTone, ButtonVariant, CARD_LIFT, CONTROL_HEIGHT, ChipSelection, Choice, Chord, Column,
+    ComboId, Command, ControlHost, ControlState, DialogButton, Hint, InputStyle, ListSelection,
+    MAX_CHROMA, MenuItem, Oklch, Palette, Scheme, ScrollAxis, SelectionIntent, SliderTrack,
+    SortDirection, Span, TEXT_SIZE, TITLE_TEXT_SIZE, Tab, TabBarLayout, TextInput, Theme, TreeRow,
+    WidgetContext, arriving, badge, bind_keys, button, caption, card, checkbox, chip_group,
+    collapsible, color_pad, column, combo, command_palette, context_menu, dialog, edit_menu,
+    fading_text, flatten_tree, glyph, ground, hue_picker, hue_slider, hue_wheel, icon_button,
+    labelled, lit, lit_stops, menu_button, menu_target, progress_bar, radio_group, reorder, row,
+    saturation_picker, scheme_picker, scroll_area, search_list, segmented, selectable_list,
+    separator, shortcut_recorder, slider, spinbox, spinner, split_area, split_handle, swatch_grid,
+    switch, tab_bar, tab_bar_layout, table_header, table_row, text_area, text_field, tree_row,
+    ui_font,
 };
 
 // The gallery is also the smallest complete *macOS* host, so it carries the
@@ -212,6 +213,7 @@ struct Gallery {
     sort: (SharedString, SortDirection),
     split: f32,
     details_open: bool,
+    selection: ListSelection,
     last_action: SharedString,
 
     // Colour page.
@@ -390,6 +392,7 @@ impl Gallery {
             sort: ("changed".into(), SortDirection::Descending),
             split: 0.42,
             details_open: true,
+            selection: ListSelection::new(),
             last_action: "—".into(),
             colour: Oklch::new(268.0, 0.11, 0.62),
             palette_query,
@@ -563,7 +566,7 @@ impl Render for Gallery {
         let body = match page {
             Page::Controls => self.page_controls(palette, cx),
             Page::Fields => self.page_fields(palette, window, cx),
-            Page::Data => self.page_data(palette, cx),
+            Page::Data => self.page_data(palette, window, cx),
             Page::Colour => self.page_colour(palette, cx),
         };
         // Keyed by the page, not the tab's position, so reordering the tabs
@@ -631,7 +634,13 @@ impl Render for Gallery {
                 cx,
                 |this, action, _window, cx| {
                     let target = this.controls.menu_target().unwrap_or("").to_string();
-                    this.note(format!("{action} → {target}"), cx);
+                    let description = match action {
+                        "move-documents" => "Move to Documents",
+                        "move-images" => "Move to Images",
+                        "duplicate" => "Duplicate",
+                        _ => action,
+                    };
+                    this.note(format!("{description} → {target}"), cx);
                 },
             ))
             .children(context_menu(
@@ -642,9 +651,26 @@ impl Render for Gallery {
                 cx,
                 |this, action, window, cx| {
                     match action {
-                        "system" => this.set_scheme(Scheme::System, cx),
-                        "light" => this.set_scheme(Scheme::Light, cx),
-                        "dark" => this.set_scheme(Scheme::Dark, cx),
+                        "system" => {
+                            this.set_scheme(Scheme::System, cx);
+                            this.note("Following system appearance", cx);
+                        }
+                        "light" => {
+                            this.set_scheme(Scheme::Light, cx);
+                            this.note("Light appearance", cx);
+                        }
+                        "dark" => {
+                            this.set_scheme(Scheme::Dark, cx);
+                            this.note("Dark appearance", cx);
+                        }
+                        "violet" => {
+                            this.controls.theme.hue = 268.0;
+                            this.note("Violet accent", cx);
+                        }
+                        "teal" => {
+                            this.controls.theme.hue = 186.0;
+                            this.note("Teal accent", cx);
+                        }
                         "palette" => {
                             this.controls
                                 .open_palette("commands", &this.palette_query, window, cx)
@@ -654,9 +680,8 @@ impl Render for Gallery {
                     cx.notify();
                 },
             ));
-
-        // Header, footer and overlays notice their own state changes while
-        // they are built too. End the frame only after all of them have run.
+        // A control notices a transition as it renders, including the
+        // footer and overlays, so ask for another frame after all of them.
         if self.controls.animating() {
             window.request_animation_frame();
         }
@@ -1101,7 +1126,12 @@ impl Gallery {
 }
 
 impl Gallery {
-    fn page_data(&mut self, palette: Palette, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn page_data(
+        &mut self,
+        palette: Palette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let columns = [
             Column::new("name", "Name"),
             Column::new("size", "Size").width(80.0).numeric(),
@@ -1201,6 +1231,51 @@ impl Gallery {
                 )
             }));
 
+        let selection_order: Vec<SharedString> = [
+            "Design notes",
+            "Budget",
+            "Launch plan",
+            "Research",
+            "Components",
+            "Typography",
+            "Motion study",
+            "Keyboard map",
+            "Accessibility",
+            "Integration tests",
+            "Screenshots",
+            "Translations",
+            "Release checklist",
+            "Archive",
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        // The fades land near enough on the card the list sits in; a flat
+        // surface colour would show as a band against its lit gradient.
+        let (card_top, card_bottom) = lit_stops(palette.area_surface, CARD_LIFT);
+        let selection_list = selectable_list(
+            "selectable-files",
+            &selection_order,
+            &self.selection,
+            card_top,
+            card_bottom,
+            WidgetContext::new(palette, self, cx),
+            window,
+            selection_order.iter().map(|label| {
+                div()
+                    .h(px(34.0))
+                    .px(px(10.0))
+                    .flex()
+                    .items_center()
+                    .child(label.clone())
+            }),
+            |this, order, intent, _window, cx| match intent {
+                SelectionIntent::Activate(id) => this.note(format!("Opened {id}"), cx),
+                intent => this.selection.apply(order, intent),
+            },
+        )
+        .h(px(196.0));
+
         column()
             .child(card(
                 palette,
@@ -1288,6 +1363,14 @@ impl Gallery {
                     this.details_open = expanded;
                     cx.notify();
                 },
+            ))
+            .child(card(
+                palette,
+                "Selection — click, ⇧ range, ⌘ toggle, arrows, ⌘A, End",
+                column().child(selection_list).child(caption(
+                    palette,
+                    &format!("{} selected", self.selection.len()),
+                )),
             ))
             .into_any_element()
     }
@@ -1453,6 +1536,19 @@ impl Gallery {
             MenuItem::separator(),
             MenuItem::action("pin", "Pin to top").checked(true),
             MenuItem::action("reveal", "Show in folder").disabled(),
+            MenuItem::submenu(
+                "Organize",
+                vec![
+                    MenuItem::submenu(
+                        "Move to",
+                        vec![
+                            MenuItem::action("move-documents", "Documents"),
+                            MenuItem::action("move-images", "Images"),
+                        ],
+                    ),
+                    MenuItem::action("duplicate", "Duplicate"),
+                ],
+            ),
             MenuItem::separator(),
             MenuItem::action("delete", "Delete").shortcut("⌫").danger(),
         ]
@@ -1461,10 +1557,22 @@ impl Gallery {
     fn view_menu(&self) -> Vec<MenuItem> {
         let scheme = self.controls.theme.scheme;
         vec![
-            MenuItem::header("Colour scheme"),
-            MenuItem::action("system", "System").checked(scheme == Scheme::System),
-            MenuItem::action("light", "Light").checked(scheme == Scheme::Light),
-            MenuItem::action("dark", "Dark").checked(scheme == Scheme::Dark),
+            MenuItem::submenu(
+                "Appearance",
+                vec![
+                    MenuItem::submenu(
+                        "Colour scheme",
+                        vec![
+                            MenuItem::action("system", "System").checked(scheme == Scheme::System),
+                            MenuItem::action("light", "Light").checked(scheme == Scheme::Light),
+                            MenuItem::action("dark", "Dark").checked(scheme == Scheme::Dark),
+                        ],
+                    ),
+                    MenuItem::separator(),
+                    MenuItem::action("violet", "Violet accent"),
+                    MenuItem::action("teal", "Teal accent"),
+                ],
+            ),
             MenuItem::separator(),
             MenuItem::action("palette", "Command palette…")
                 .shortcut(vampir::display("secondary-k")),

@@ -109,9 +109,9 @@ The gallery supports both colour schemes:
 
 **Containers** — `tab_bar` and `tab_bar_layout` (natural, uniform-width horizontal, or vertical tabs; drag to reorder and optional close buttons) with `reorder`, `split_handle` + `split_area`, `collapsible`, `dialog`, `card`, `labelled`, `row` / `column`, `scroll_area`, `arriving`.
 
-**Menus and overlays** — `context_menu`, `menu_button`, `menu_target`, `Tooltip`, `command_palette` and `search_list` with `fuzzy_filter` / `fuzzy_score`.
+**Menus and overlays** — `context_menu` with nested `MenuItem::submenu` levels, `menu_button`, `menu_target`, `Tooltip`, `command_palette` and `search_list` with `fuzzy_filter` / `fuzzy_score`.
 
-**Data** — `tree_row` with `flatten_tree`, `table_header` and `table_row` with `Column` and `SortDirection`.
+**Data** — `tree_row` with `flatten_tree`, `selectable_list` with host-owned `ListSelection`, `table_header` and `table_row` with `Column` and `SortDirection`.
 
 **Theme** — `Theme`, `Scheme`, optional `scheme_picker`, `hue_picker` and `saturation_picker`: hue and saturation chosen by the app, a scheme that follows the desktop, and the palette derived from them.
 

@@ -1440,6 +1440,10 @@ pub const DIALOG_EXIT: Duration = crate::easing::MODAL_EXIT;
 
 // ---- Surfaces and layout ----------------------------------------------------
 
+/// How much a [`card`] is lit, for anything that has to land on its
+/// surface exactly: `lit_stops(palette.area_surface, CARD_LIFT)`.
+pub const CARD_LIFT: f32 = 0.04;
+
 /// A card: the lit panel everything else sits on, with a caption naming
 /// what is in it. One level of these on the window's ground is the whole
 /// hierarchy a page needs; cards inside cards are on the list of patterns
@@ -1452,7 +1456,7 @@ pub fn card(palette: Palette, title: &str, body: impl IntoElement) -> Div {
         .flex_none()
         .p(px(16.0))
         .rounded(px(10.0))
-        .bg(lighting::lit(palette.area_surface, 0.04))
+        .bg(lighting::lit(palette.area_surface, CARD_LIFT))
         .border_1()
         .border_color(palette.area_border)
         .shadow(lighting::panel(palette.is_dark))
