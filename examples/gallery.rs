@@ -206,6 +206,9 @@ struct Gallery {
     ranked_palette_query: Entity<TextInput>,
     ranked_items: Vec<SearchResult>,
     history_loaded: bool,
+    /// Where the Ranked results card painted: a scroll handle records the
+    /// bounds of whatever tracks it, scrolling or not.
+    ranked_card: ScrollHandle,
     takes_edit: Entity<TextInput>,
     chord: Option<Chord>,
 
@@ -425,6 +428,7 @@ impl Gallery {
                     .leading(|palette| glyph("⚙").text_color(palette.text_secondary)),
             ],
             history_loaded: false,
+            ranked_card: ScrollHandle::new(),
             takes_edit,
             chord: Some(Chord {
                 keystroke: "secondary-shift-s".into(),
@@ -1119,6 +1123,18 @@ impl Gallery {
     ) -> gpui::AnyElement {
         let ranked_query = self.ranked_query.read(cx).text();
         let ranked_results = self.ranked_results(&ranked_query);
+        // The card is a gradient, so each of the list's edge fades takes the
+        // card's colour at that edge, from where both painted last frame.
+        let on_card = {
+            let card = self.ranked_card.bounds();
+            move |y: gpui::Pixels| {
+                card_at(
+                    palette,
+                    f32::from(y - card.top()) / f32::from(card.size.height).max(1.0),
+                )
+            }
+        };
+        let list = self.controls.scroll(("ranked-search", "list")).bounds();
         column()
             .child(card(
                 palette,
@@ -1147,42 +1163,45 @@ impl Gallery {
                         ),
                     )),
             ))
-            .child(card(
-                palette,
-                "Ranked results",
-                column()
-                    .child(labelled(
-                        palette,
-                        "Several sources, ranked as you type — history arrives late",
-                        ranked_search_list(
-                            "ranked-search",
-                            &self.ranked_query,
-                            &ranked_results,
-                            // The card is a gradient; this is its colour
-                            // about where the list's fades sit.
-                            card_at(palette, 0.75),
-                            WidgetContext::new(palette, self, cx),
-                            window,
-                            |this, id, _window, cx| this.note(format!("Opened {id}"), cx),
-                        ),
-                    ))
-                    .child(div().w(px(150.0)).child(button(
-                        "history-source",
-                        if self.history_loaded {
-                            "Remove history"
-                        } else {
-                            "Add history"
-                        },
-                        ButtonVariant::Soft,
-                        true,
-                        palette,
-                        cx,
-                        |this, _window, cx| {
-                            this.history_loaded = !this.history_loaded;
-                            cx.notify();
-                        },
-                    ))),
-            ))
+            .child(
+                card(
+                    palette,
+                    "Ranked results",
+                    column()
+                        .child(labelled(
+                            palette,
+                            "Several sources, ranked as you type — history arrives late",
+                            ranked_search_list(
+                                "ranked-search",
+                                &self.ranked_query,
+                                &ranked_results,
+                                on_card(list.top()),
+                                on_card(list.bottom()),
+                                WidgetContext::new(palette, self, cx),
+                                window,
+                                |this, id, _window, cx| this.note(format!("Opened {id}"), cx),
+                            ),
+                        ))
+                        .child(div().w(px(150.0)).child(button(
+                            "history-source",
+                            if self.history_loaded {
+                                "Remove history"
+                            } else {
+                                "Add history"
+                            },
+                            ButtonVariant::Soft,
+                            true,
+                            palette,
+                            cx,
+                            |this, _window, cx| {
+                                this.history_loaded = !this.history_loaded;
+                                cx.notify();
+                            },
+                        ))),
+                )
+                .id("ranked-card")
+                .track_scroll(&self.ranked_card),
+            )
             .child(card(
                 palette,
                 "Shortcut",

@@ -153,7 +153,8 @@ impl Render for Tooltip {
 /// One entry in a [`command_palette`].
 #[derive(Clone, Debug)]
 pub struct Command {
-    /// Comes back to the activation callback.
+    /// Comes back to the activation callback. Unique within one list: it
+    /// names the row's element and the record its motion is kept under.
     pub id: SharedString,
     pub label: SharedString,
     /// Where the command lives, shown quietly before the label.
@@ -188,11 +189,12 @@ impl Command {
 /// toolkit's fuzzy ranking rather than its own.
 ///
 /// The host may replace the slice at any time, as each source finishes
-/// loading. Ids must be unique within one list and stable across updates:
-/// the keyboard's highlight stays on a result by its id, so a source that
-/// lands after the person has arrowed down takes the highlight along with
-/// the result it was on, rather than leaving Enter on whatever now fills
-/// that row.
+/// loading. Ids must be unique within one list and stable across updates.
+/// Until the person moves the highlight it stays on the first row, so a
+/// better match arriving takes it. Once they have moved it, it stays on the
+/// result they moved it to, found by its id, so a source that lands after
+/// they have arrowed down never leaves Enter on whatever now fills that
+/// row. A new query puts it back on the first row either way.
 #[derive(Clone, Debug)]
 pub struct SearchResult {
     pub id: SharedString,
@@ -319,59 +321,102 @@ pub fn fuzzy_score(query: &str, candidate: &str) -> Option<i32> {
     Some(score - (candidate.chars().count() as i32 / 8))
 }
 
-/// Items whose text matches a query, best first. The sort is stable, so
-/// ties keep their original order and a host's own ranking survives where
-/// the score cannot separate two — and an empty query, which scores
-/// everything alike, leaves the list exactly as it was.
-fn fuzzy_rank<T: Clone>(query: &str, items: &[T], text: impl Fn(&T) -> String) -> Vec<T> {
-    let mut scored: Vec<(i32, &T)> = items
-        .iter()
-        .filter_map(|item| fuzzy_score(query, &text(item)).map(|score| (score, item)))
-        .collect();
-    scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
-    scored.into_iter().map(|(_, item)| item.clone()).collect()
-}
-
 /// Commands matching a query, best first. Ties keep their original order,
 /// so a host's own ranking survives where the score cannot separate two.
 pub fn fuzzy_filter(query: &str, commands: &[Command]) -> Vec<Command> {
-    fuzzy_rank(query, commands, |command| match &command.group {
-        Some(group) => format!("{group} {}", command.label),
-        None => command.label.to_string(),
-    })
+    let mut scored: Vec<(i32, usize, Command)> = commands
+        .iter()
+        .enumerate()
+        .filter_map(|(index, command)| {
+            let haystack = match &command.group {
+                Some(group) => format!("{group} {}", command.label),
+                None => command.label.to_string(),
+            };
+            fuzzy_score(query, &haystack).map(|score| (score, index, command.clone()))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored.into_iter().map(|(_, _, command)| command).collect()
 }
 
-/// Results matching a query, best first, for a host that would rather rank
-/// with [`fuzzy_score`] than with its own measure before handing them to
-/// [`ranked_search_list`] or [`ranked_command_palette`]. The label, the
-/// detail and the section are all searched, so "book" finds everything
-/// under Bookmarks. Ties keep the order the sources were assembled in, and
-/// an empty query keeps everything as it was.
+/// Results matching a query, best first within each section, for a host
+/// that would rather rank with [`fuzzy_score`] than with its own measure
+/// before handing them to [`ranked_search_list`] or
+/// [`ranked_command_palette`].
+///
+/// Each section appears once, its results together under one heading, and
+/// sections are ordered by their best result: ranking across every source
+/// at once would scatter them into a heading per row. The label, the detail
+/// and the section are all searched, so "book" finds everything under
+/// Bookmarks. Ties keep the order the sources were assembled in, and an
+/// empty query keeps everything as it was.
 pub fn rank_results(query: &str, results: &[SearchResult]) -> Vec<SearchResult> {
-    fuzzy_rank(query, results, |result| {
+    // Scored on the label alone: it is what the person reads and
+    // abbreviates, and the score's length penalty would otherwise let a
+    // long detail line push a result down. A result that matches only
+    // through its detail or section still qualifies, after every result
+    // whose label matched, in the order it came.
+    let rank = |result: &SearchResult| -> Option<Option<i32>> {
+        if let Some(score) = fuzzy_score(query, &result.label) {
+            return Some(Some(score));
+        }
         let mut text = result.label.to_string();
         for part in [&result.detail, &result.section].into_iter().flatten() {
             text.push(' ');
             text.push_str(part);
         }
-        text
-    })
+        fuzzy_score(query, &text).map(|_| None)
+    };
+    type Run<'a> = Vec<(Option<i32>, &'a SearchResult)>;
+    let mut sections: Vec<(Option<&str>, Run)> = Vec::new();
+    for result in results {
+        let Some(rank) = rank(result) else {
+            continue;
+        };
+        let section = result.section.as_deref();
+        match sections.iter_mut().find(|(name, _)| *name == section) {
+            Some((_, run)) => run.push((rank, result)),
+            None => sections.push((section, vec![(rank, result)])),
+        }
+    }
+    // Stable sorts, so ties keep the order the sources were assembled in.
+    for (_, run) in &mut sections {
+        run.sort_by_key(|(rank, _)| std::cmp::Reverse(*rank));
+    }
+    sections.sort_by_key(|(_, run)| std::cmp::Reverse(run[0].0));
+    sections
+        .into_iter()
+        .flat_map(|(_, run)| run)
+        .map(|(_, result)| result.clone())
+        .collect()
 }
 
-/// Byte ranges to emphasise in displayed text. A whole word match reads
-/// best. Failing one, `scattered` marks the letters of a fuzzy abbreviation
-/// wherever they fall — right for a label, which is what the person was
-/// abbreviating, but on a detail line it only picks out stray letters that
-/// happened to come in the right order.
-fn matched_ranges(text: &str, query: &str, scattered: bool) -> Vec<Range<usize>> {
+/// Which line of a row is being emphasised.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Line {
+    Label,
+    Detail,
+}
+
+/// Byte ranges to emphasise in displayed text, for each word of the query.
+///
+/// In a label, a contiguous run of the word anywhere reads best, and
+/// failing one the letters of a fuzzy abbreviation are marked wherever they
+/// fall: the label is what the person was abbreviating. A detail line is
+/// not, so there only a contiguous run that starts a word counts — "in"
+/// picks out "in" but not the middle of "morning", and scattered letters
+/// that happen to come in the right order are not a match at all.
+fn matched_ranges(text: &str, query: &str, line: Line) -> Vec<Range<usize>> {
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     let same = |a: char, b: char| a.to_lowercase().eq(b.to_lowercase());
     let mut ranges = Vec::new();
     for word in query.split_whitespace() {
         let needle: Vec<char> = word.chars().collect();
+        let starts_word = |start: usize| start == 0 || !chars[start - 1].1.is_alphanumeric();
         let whole = (0..=chars.len().saturating_sub(needle.len()))
             .find(|&start| {
                 start + needle.len() <= chars.len()
+                    && (line == Line::Label || starts_word(start))
                     && needle
                         .iter()
                         .enumerate()
@@ -379,7 +424,7 @@ fn matched_ranges(text: &str, query: &str, scattered: bool) -> Vec<Range<usize>>
             })
             .map(|start| (start..start + needle.len()).collect::<Vec<_>>());
         let positions = whole.or_else(|| {
-            if !scattered {
+            if line == Line::Detail {
                 return None;
             }
             let mut found = Vec::new();
@@ -411,9 +456,9 @@ fn matched_ranges(text: &str, query: &str, scattered: bool) -> Vec<Range<usize>>
     merged
 }
 
-fn emphasised(text: &SharedString, query: &str, scattered: bool) -> StyledText {
+fn emphasised(text: &SharedString, query: &str, line: Line) -> StyledText {
     StyledText::new(text.to_string()).with_highlights(
-        matched_ranges(text, query, scattered)
+        matched_ranges(text, query, line)
             .into_iter()
             .map(|range| (range, FontWeight::SEMIBOLD.into())),
     )
@@ -502,12 +547,31 @@ fn result_rows<V: ControlHost>(
     let has_leading = results.iter().any(|result| result.leading.is_some());
     let mut elements: Vec<AnyElement> = Vec::with_capacity(results.len());
     let mut extents = Vec::with_capacity(results.len());
+    let mut headed: Vec<&str> = Vec::new();
     for (index, (result, placement)) in results.iter().zip(row_layout(results)).enumerate() {
         if placement.heading
             && let Some(section) = &result.section
         {
-            let shown = arrival(state, Tag::new((id, "section-shown", &result.id)), fresh);
-            elements.push(section_heading(section, has_leading, shown, palette));
+            // Keyed by the section, and by which of its runs this is should
+            // a host split one, rather than by the result under it: whichever
+            // result leads the run, it is the same heading, and it fades in
+            // once and slides with the rows.
+            let run = headed
+                .iter()
+                .filter(|&&name| name == section.as_ref())
+                .count();
+            headed.push(section);
+            let key = |part: &'static str| Tag::new((id, part, section, run));
+            let shown = arrival(state, key("section-shown"), fresh);
+            let top = placement.top - SECTION_HEIGHT - ROW_GAP;
+            let offset = state.tween(key("section-place"), top, MOVE) - top;
+            elements.push(section_heading(
+                section,
+                has_leading,
+                shown,
+                offset,
+                palette,
+            ));
         }
         let cx: &mut Context<V> = &mut *cx;
         let look = RowLook {
@@ -535,6 +599,7 @@ fn section_heading(
     section: &SharedString,
     has_leading: bool,
     shown: f32,
+    offset: f32,
     palette: Palette,
 ) -> AnyElement {
     // Over the labels rather than the icons, so a heading reads as the
@@ -545,6 +610,8 @@ fn section_heading(
         ROW_INSET
     };
     div()
+        .relative()
+        .top(px(offset))
         .h(px(SECTION_HEIGHT))
         .flex_none()
         .px(px(inset))
@@ -652,14 +719,14 @@ fn result_row<V: ControlHost>(
                 .child(
                     div()
                         .truncate()
-                        .child(emphasised(&result.label, emphasis, true)),
+                        .child(emphasised(&result.label, emphasis, Line::Label)),
                 )
                 .children(result.detail.as_ref().map(|detail| {
                     div()
                         .truncate()
                         .text_size(px(11.5))
                         .text_color(secondary)
-                        .child(emphasised(detail, emphasis, false))
+                        .child(emphasised(detail, emphasis, Line::Detail))
                 })),
         )
         .children(result.shortcut.clone().map(|shortcut| {
@@ -756,18 +823,24 @@ pub fn search_list<V: ControlHost>(
 /// and the highlighted row is kept in view.
 ///
 /// The host may replace `results` at any time. A new query puts the
-/// highlight back on the first result and the list back at its top; results
-/// that change under the same query keep the highlight on the result it was
-/// on, by id, and scroll to keep it in view — see [`SearchResult`].
-/// `backdrop` is the surface the list sits on, which its edge fades land on,
-/// as for [`scroll_fades`](crate::scroll_fades). `id` identifies the list in
+/// highlight back on the first result and the list back at its top. Results
+/// that change under the same query leave an untouched highlight on the
+/// first row, and keep one the person has moved on the result they moved it
+/// to, by id, scrolling to keep it in view — see [`SearchResult`].
+///
+/// `start` and `end` are the colours of the surface under the list's top
+/// and bottom edges, which its edge fades land on, as for
+/// [`scroll_fades`](crate::scroll_fades); the list's viewport is
+/// [`ControlState::scroll`](crate::ControlState::scroll)`((id, "list"))`,
+/// whose bounds say where those edges are. `id` identifies the list in
 /// [`ControlState`](crate::ControlState), as for [`search_list`].
 #[allow(clippy::too_many_arguments)]
 pub fn ranked_search_list<V: ControlHost>(
     id: &'static str,
     query: &Entity<TextInput>,
     results: &[SearchResult],
-    backdrop: Rgba,
+    start: Rgba,
+    end: Rgba,
     mut ctx: WidgetContext<'_, '_, '_, V>,
     window: &Window,
     on_activate: impl Fn(&mut V, SharedString, &mut Window, &mut Context<V>) + 'static,
@@ -796,7 +869,7 @@ pub fn ranked_search_list<V: ControlHost>(
             list.elements,
             &list.navigation,
             "No results",
-            backdrop,
+            (start, end),
             palette,
             state,
         ));
@@ -859,7 +932,7 @@ fn result_viewport(
     rows: Vec<AnyElement>,
     navigation: &ResultNavigation,
     empty_message: &'static str,
-    backdrop: Rgba,
+    (start, end): (Rgba, Rgba),
     palette: Palette,
     state: &ControlState,
 ) -> Div {
@@ -898,8 +971,8 @@ fn result_viewport(
             id,
             &navigation.scroll,
             crate::scroll::ScrollAxis::Vertical,
-            backdrop,
-            backdrop,
+            start,
+            end,
         ))
 }
 
@@ -1221,7 +1294,7 @@ fn palette_with_results<V: ControlHost>(
             list.elements,
             &list.navigation,
             empty_message,
-            fill,
+            (fill, fill),
             palette,
             state,
         ));
@@ -1299,50 +1372,192 @@ mod tests {
     #[test]
     fn emphasis_prefers_a_whole_match_and_merges_overlapping_words() {
         assert_eq!(
-            matched_ranges("Design system", "sign des", true),
+            matched_ranges("Design system", "sign des", Line::Label),
             vec![0..6]
         );
-        assert_eq!(matched_ranges("Open File", "opf", true), vec![0..2, 5..6]);
+        assert_eq!(
+            matched_ranges("Open File", "opf", Line::Label),
+            vec![0..2, 5..6]
+        );
     }
 
     #[test]
     fn emphasis_uses_valid_unicode_byte_boundaries() {
         assert_eq!(
-            matched_ranges("Café résumé", "fé su", true),
+            matched_ranges("Café résumé", "fé su", Line::Label),
             vec![2..5, 9..11]
         );
-        assert!(matched_ranges("Café", "", true).is_empty());
+        assert!(matched_ranges("Café", "", Line::Label).is_empty());
     }
 
     /// A detail line is not what the person abbreviated, so scattered
-    /// letters there are coincidence, not a match.
+    /// letters there are coincidence, and so is a run inside a word.
     #[test]
-    fn a_detail_line_emphasises_whole_words_only() {
+    fn a_detail_line_emphasises_only_runs_that_start_a_word() {
         let detail = "Project board · 2 minutes ago";
-        assert!(matched_ranges(detail, "de", false).is_empty());
-        assert_eq!(matched_ranges(detail, "board", false), vec![8..13]);
-        assert_eq!(matched_ranges("Design review", "de", true), vec![0..2]);
+        assert!(matched_ranges(detail, "de", Line::Detail).is_empty());
+        assert_eq!(matched_ranges(detail, "boa", Line::Detail), vec![8..11]);
+        assert!(matched_ranges("Visited this morning", "in", Line::Detail).is_empty());
+        assert_eq!(
+            matched_ranges("Visited this morning", "mor", Line::Detail),
+            vec![13..16]
+        );
+        assert_eq!(
+            matched_ranges("Design review", "de", Line::Label),
+            vec![0..2]
+        );
+        assert_eq!(matched_ranges("Morning", "in", Line::Label), vec![4..6]);
+    }
+
+    /// The gallery's sources, in the order it assembles them.
+    fn sources() -> Vec<SearchResult> {
+        [
+            (
+                "tab-design",
+                "Design review",
+                "Project board · 2 minutes ago",
+                "Open tabs",
+            ),
+            (
+                "tab-release",
+                "Release checklist",
+                "Draft · Current window",
+                "Open tabs",
+            ),
+            (
+                "tab-insights",
+                "Traffic insights",
+                "Analytics · Current window",
+                "Open tabs",
+            ),
+            ("tab-issues", "Issue tracker", "42 open tasks", "Open tabs"),
+            (
+                "bookmark-system",
+                "Design system",
+                "Components and colour recipes",
+                "Bookmarks",
+            ),
+            (
+                "bookmark-keys",
+                "Keyboard shortcuts",
+                "Reference · Documentation",
+                "Bookmarks",
+            ),
+            (
+                "bookmark-api",
+                "API reference",
+                "Framework documentation",
+                "Bookmarks",
+            ),
+            (
+                "bookmark-roadmap",
+                "Project roadmap",
+                "Milestones and plans",
+                "Bookmarks",
+            ),
+            (
+                "file-budget",
+                "Quarterly budget",
+                "Shared documents · Updated today",
+                "Files",
+            ),
+            (
+                "file-summary",
+                "Meeting summary",
+                "Notes · Updated yesterday",
+                "Files",
+            ),
+            (
+                "history-notes",
+                "Design notes",
+                "Visited this morning",
+                "History",
+            ),
+            (
+                "history-changelog",
+                "Release notes",
+                "Visited yesterday",
+                "History",
+            ),
+            (
+                "action-invite",
+                "Invite teammate",
+                "Share this workspace",
+                "Actions",
+            ),
+            (
+                "action-export",
+                "Export report",
+                "Save a local copy",
+                "Actions",
+            ),
+        ]
+        .into_iter()
+        .map(|(id, label, detail, section)| {
+            SearchResult::new(id, label).detail(detail).section(section)
+        })
+        .collect()
     }
 
     #[test]
-    fn ranked_results_are_best_first_and_keep_their_order_on_ties() {
-        let results = [
-            SearchResult::new("notes", "Design notes").section("History"),
-            SearchResult::new("budget", "Quarterly budget").detail("Shared documents"),
-            SearchResult::new("system", "Design system").section("Bookmarks"),
-            SearchResult::new("review", "Design review").section("Open tabs"),
-        ];
+    fn ranking_keeps_each_section_together() {
+        let sources = sources();
+        for query in ["", "de", "re", "design", "no", "book"] {
+            let ranked = rank_results(query, &sources);
+            let mut seen: Vec<&str> = Vec::new();
+            for result in &ranked {
+                let section = result
+                    .section
+                    .as_deref()
+                    .expect("every source has a section");
+                if seen.last() != Some(&section) {
+                    assert!(
+                        !seen.contains(&section),
+                        "{section} heads two runs for {query:?}"
+                    );
+                    seen.push(section);
+                }
+            }
+        }
         let ids = |query: &str| -> Vec<SharedString> {
-            rank_results(query, &results)
+            rank_results(query, &sources)
                 .into_iter()
                 .map(|result| result.id)
                 .collect()
         };
-        assert_eq!(ids(""), ["notes", "budget", "system", "review"]);
-        assert_eq!(ids("design"), ["notes", "system", "review"]);
-        assert_eq!(ids("book"), ["system"]);
-        assert_eq!(ids("shared"), ["budget"]);
+        let all: Vec<SharedString> = sources.iter().map(|result| result.id.clone()).collect();
+        assert_eq!(ids(""), all);
+        // Equal scores, so the sections keep the order they came in.
+        assert_eq!(
+            ids("design"),
+            ["tab-design", "bookmark-system", "history-notes"]
+        );
+        // Through the section alone, in source order.
+        assert_eq!(
+            ids("book"),
+            [
+                "bookmark-system",
+                "bookmark-keys",
+                "bookmark-api",
+                "bookmark-roadmap"
+            ]
+        );
         assert!(ids("zzz").is_empty());
+    }
+
+    #[test]
+    fn ranking_scores_the_label_not_the_length_of_the_detail() {
+        let results = [
+            SearchResult::new("long", "Design review")
+                .detail("A detail line long enough to cost several points of length"),
+            SearchResult::new("short", "Design notes").detail("Brief"),
+            SearchResult::new("detail-only", "Weekly sync").detail("Design"),
+        ];
+        let ranked: Vec<SharedString> = rank_results("design", &results)
+            .into_iter()
+            .map(|result| result.id)
+            .collect();
+        assert_eq!(ranked, ["long", "short", "detail-only"]);
     }
 
     #[test]
