@@ -217,12 +217,14 @@ enum Record {
     /// A group of rows: the frame its current run of frames began in.
     Streak { started: u32 },
     /// The keyboard's row in a filtering list, a hash of the query the row
-    /// belongs to, and the tag of the result it was on when the list was
-    /// last drawn, or zero before it has been drawn with ids.
+    /// belongs to, the tag of the result it was on when the list was last
+    /// drawn (zero before it has been drawn with ids), and whether anyone
+    /// has moved it since the query last changed.
     List {
         highlight: usize,
         query: u64,
         item: u64,
+        chosen: bool,
     },
     /// Where something painted last frame.
     Bounds(Bounds<Pixels>),
@@ -827,7 +829,7 @@ impl ControlState {
             opened_at: Instant::now(),
             return_focus,
         });
-        self.highlight_list(id, 0);
+        self.set_list_highlight(id.into(), 0, 0, false);
         let scroll = self.scroll((id, "list"));
         scroll.set_offset(Point::default());
         query.update(cx, |input, cx| input.set_text("", cx));
@@ -884,6 +886,7 @@ impl ControlState {
                     highlight: 0,
                     query: hash,
                     item: 0,
+                    chosen: false,
                 },
             });
         entry.touched = frame;
@@ -891,6 +894,7 @@ impl ControlState {
             highlight,
             query,
             item,
+            chosen,
         } = &mut entry.record
         else {
             return 0;
@@ -899,17 +903,20 @@ impl ControlState {
             *query = hash;
             *highlight = 0;
             *item = 0;
+            *chosen = false;
         }
         *highlight
     }
 
     /// [`list_highlight`](Self::list_highlight) for a list that knows its
-    /// rows' ids, which keeps the keyboard on a result rather than on a
-    /// row. A new query still goes back to the first row. Results that
-    /// change under the same query — a slow source arriving, a host
-    /// re-ranking — take the highlight with the result it was on, so Enter
-    /// never picks something the person did not arrow to; only if that
-    /// result has gone does it fall back to the first row.
+    /// rows' ids. A new query goes back to the first row. Until the
+    /// highlight is moved it stays on the first row as results change under
+    /// the same query, so the best match is still the one Enter picks when
+    /// a better one arrives. Once it has been moved — by the keys, or by
+    /// [`highlight_list`](Self::highlight_list) — it stays on the result it
+    /// was moved to as results arrive or re-rank, so Enter never picks
+    /// something the person did not choose; only if that result has gone
+    /// does it fall back to the first row.
     pub(crate) fn follow_list(
         &self,
         list: impl Into<Tag>,
@@ -930,6 +937,7 @@ impl ControlState {
                 highlight: 0,
                 query: hash,
                 item: 0,
+                chosen: false,
             },
         });
         entry.touched = frame;
@@ -937,6 +945,7 @@ impl ControlState {
             highlight,
             query,
             item,
+            chosen,
         } = &mut entry.record
         else {
             return (0, ListChange::Same);
@@ -944,8 +953,9 @@ impl ControlState {
         let change = if fresh || *query != hash {
             *query = hash;
             *highlight = 0;
+            *chosen = false;
             ListChange::Reset
-        } else if *item != 0 && ids.get(*highlight).map(tag) != Some(*item) {
+        } else if *chosen && *item != 0 && ids.get(*highlight).map(tag) != Some(*item) {
             match ids.iter().position(|id| tag(id) == *item) {
                 Some(index) => {
                     *highlight = index;
@@ -953,6 +963,7 @@ impl ControlState {
                 }
                 None => {
                     *highlight = 0;
+                    *chosen = false;
                     ListChange::Reset
                 }
             }
@@ -977,7 +988,7 @@ impl ControlState {
 
     /// Puts the keyboard on row `index` of list `list`.
     pub fn highlight_list(&self, list: impl Into<Tag>, index: usize) {
-        self.set_list_highlight(list.into(), index, 0);
+        self.set_list_highlight(list.into(), index, 0, true);
     }
 
     /// Puts the keyboard on row `index` of list `list`, which shows result
@@ -990,10 +1001,10 @@ impl ControlState {
         index: usize,
         id: &SharedString,
     ) {
-        self.set_list_highlight(list.into(), index, Tag::from(id).0);
+        self.set_list_highlight(list.into(), index, Tag::from(id).0, true);
     }
 
-    fn set_list_highlight(&self, list: Tag, index: usize, to: u64) {
+    fn set_list_highlight(&self, list: Tag, index: usize, to: u64, moved: bool) {
         let frame = self.frame.get();
         let mut records = self.records.borrow_mut();
         let entry = records.entry(Kind::List.slot(list)).or_insert(Entry {
@@ -1002,15 +1013,20 @@ impl ControlState {
                 highlight: index,
                 query: Tag::new("").0,
                 item: to,
+                chosen: moved,
             },
         });
         entry.touched = frame;
         if let Record::List {
-            highlight, item, ..
+            highlight,
+            item,
+            chosen,
+            ..
         } = &mut entry.record
         {
             *highlight = index;
             *item = to;
+            *chosen = moved;
         }
     }
 
@@ -2462,6 +2478,20 @@ mod tests {
         );
     }
 
+    /// Until someone moves the highlight it belongs to the best match, so
+    /// a better result arriving takes it, the way a launcher's top hit does.
+    #[test]
+    fn an_untouched_highlight_stays_on_the_first_row_as_results_arrive() {
+        let state = ControlState::new();
+        let first = ids(&["review", "system"]);
+        state.follow_list("results", "design", &first);
+        let better = ids(&["notes", "review", "system"]);
+        assert_eq!(
+            state.follow_list("results", "design", &better),
+            (0, ListChange::Same)
+        );
+    }
+
     #[test]
     fn a_new_query_puts_a_followed_list_back_on_its_first_row() {
         let state = ControlState::new();
@@ -2471,6 +2501,11 @@ mod tests {
         assert_eq!(
             state.follow_list("results", "des", &results),
             (0, ListChange::Reset)
+        );
+        let better = ids(&["notes", "tab", "bookmark", "file"]);
+        assert_eq!(
+            state.follow_list("results", "des", &better),
+            (0, ListChange::Same)
         );
     }
 
