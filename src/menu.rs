@@ -15,6 +15,8 @@
 //!     |host, item, _window, cx| host.run_menu_item(item, cx)))
 //! ```
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -139,8 +141,38 @@ impl MenuItem {
     }
 }
 
-/// The host supplies the whole tree each frame. A branch that vanished or
-/// became disabled is no longer a valid place to leave the keyboard.
+/// Identity uses the labels of nested branches and the ids of leaf actions.
+/// Checked state, disabled descendants and displayed action text can change
+/// while the menu is open without turning it into a different branch.
+fn submenu_identity(label: &SharedString, children: &[MenuItem]) -> u64 {
+    fn hash_items(items: &[MenuItem], hasher: &mut impl Hasher) {
+        items.len().hash(hasher);
+        for item in items {
+            match item {
+                MenuItem::Action(action) => {
+                    0_u8.hash(hasher);
+                    action.id.hash(hasher);
+                }
+                MenuItem::Submenu { label, items, .. } => {
+                    1_u8.hash(hasher);
+                    label.hash(hasher);
+                    hash_items(items, hasher);
+                }
+                MenuItem::Separator => 2_u8.hash(hasher),
+                MenuItem::Header(_) => 3_u8.hash(hasher),
+            }
+        }
+    }
+
+    let mut hasher = DefaultHasher::new();
+    label.hash(&mut hasher);
+    hash_items(children, &mut hasher);
+    hasher.finish()
+}
+
+/// The host supplies the whole tree each frame. A branch that vanished,
+/// moved, changed identity or became disabled is no longer a valid place to
+/// leave the keyboard.
 fn visible_level<'a>(
     mut items: &'a [MenuItem],
     levels: &[MenuBranch],
@@ -155,6 +187,9 @@ fn visible_level<'a>(
         else {
             return None;
         };
+        if submenu_identity(label, children) != branch.identity {
+            return None;
+        }
         items = children;
         title = Some(label);
     }
@@ -409,8 +444,16 @@ pub fn context_menu<V: ControlHost>(
                             MenuItem::Action(action) if key == Key::Activate => {
                                 activate(this, action.id, opened_at, window, cx, &on_key_activate);
                             }
-                            MenuItem::Submenu { enabled: true, .. } => {
-                                this.control_state_mut().enter_menu(row, at);
+                            MenuItem::Submenu {
+                                label,
+                                items,
+                                enabled: true,
+                            } => {
+                                this.control_state_mut().enter_menu(
+                                    row,
+                                    at,
+                                    submenu_identity(label, items),
+                                );
                             }
                             _ => {}
                         }
@@ -609,49 +652,57 @@ fn render_item<V: ControlHost>(
             .whitespace_nowrap()
             .child(label)
             .into_any_element(),
-        MenuItem::Submenu { label, enabled, .. } => div()
-            .id(ElementId::NamedInteger(
-                format!("{menu_id}-submenu").into(),
-                index as u64,
-            ))
-            .h(px(ITEM_HEIGHT))
-            .flex_none()
-            .w_full()
-            .px(px(8.0))
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .rounded(px(MENU_RADIUS - 3.0))
-            .text_size(px(12.5))
-            .text_color(palette.text_primary)
-            .whitespace_nowrap()
-            .overflow_hidden()
-            .when(!enabled, |el| el.opacity(0.45))
-            .when(lit > 0.01, |el| {
-                el.bg(lighting::lit_at(palette.control_fill, 0.08, lit))
-            })
-            .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _window, cx| {
-                if this.control_state().menu_highlight() != reachable_at {
-                    this.control_state_mut().highlight_menu(reachable_at);
-                    cx.notify();
-                }
-            }))
-            .when(enabled, |el| {
-                el.cursor_pointer()
-                    .hover(move |style| style.bg(lighting::lit(palette.control_fill, 0.08)))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        if this.control_state().menu_opened_at() == Some(opened_at) {
-                            this.control_state_mut().enter_menu(
-                                index,
-                                reachable_at.expect("enabled submenu is reachable"),
-                            );
-                            cx.notify();
-                        }
-                    }))
-            })
-            .child(div().flex_1().overflow_hidden().child(label))
-            .child(chevron(true, palette))
-            .into_any_element(),
+        MenuItem::Submenu {
+            label,
+            items,
+            enabled,
+        } => {
+            let identity = submenu_identity(&label, &items);
+            div()
+                .id(ElementId::NamedInteger(
+                    format!("{menu_id}-submenu").into(),
+                    index as u64,
+                ))
+                .h(px(ITEM_HEIGHT))
+                .flex_none()
+                .w_full()
+                .px(px(8.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .rounded(px(MENU_RADIUS - 3.0))
+                .text_size(px(12.5))
+                .text_color(palette.text_primary)
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .when(!enabled, |el| el.opacity(0.45))
+                .when(lit > 0.01, |el| {
+                    el.bg(lighting::lit_at(palette.control_fill, 0.08, lit))
+                })
+                .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _window, cx| {
+                    if this.control_state().menu_highlight() != reachable_at {
+                        this.control_state_mut().highlight_menu(reachable_at);
+                        cx.notify();
+                    }
+                }))
+                .when(enabled, |el| {
+                    el.cursor_pointer()
+                        .hover(move |style| style.bg(lighting::lit(palette.control_fill, 0.08)))
+                        .on_click(cx.listener(move |this, _event, _window, cx| {
+                            if this.control_state().menu_opened_at() == Some(opened_at) {
+                                this.control_state_mut().enter_menu(
+                                    index,
+                                    reachable_at.expect("enabled submenu is reachable"),
+                                    identity,
+                                );
+                                cx.notify();
+                            }
+                        }))
+                })
+                .child(div().flex_1().overflow_hidden().child(label))
+                .child(chevron(true, palette))
+                .into_any_element()
+        }
         MenuItem::Action(action) => {
             let on_activate = on_activate.clone();
             let id = action.id;
@@ -912,7 +963,20 @@ pub use crate::state::OpenMenu as ContextMenu;
 
 #[cfg(test)]
 mod tests {
-    use super::{MenuBranch, MenuItem, menu_height, reachable_indices, visible_level};
+    use super::{
+        MenuBranch, MenuItem, menu_height, reachable_indices, submenu_identity, visible_level,
+    };
+
+    fn branch(item: &MenuItem, index: usize, highlight: usize) -> MenuBranch {
+        let MenuItem::Submenu { label, items, .. } = item else {
+            panic!("expected submenu");
+        };
+        MenuBranch {
+            index,
+            highlight,
+            identity: submenu_identity(label, items),
+        }
+    }
 
     #[test]
     fn nested_levels_find_the_leaf_and_reject_a_removed_branch() {
@@ -923,22 +987,43 @@ mod tests {
                 vec![MenuItem::action("inbox", "Inbox")],
             )],
         )];
-        let path = [
-            MenuBranch {
-                index: 0,
-                highlight: 0,
-            },
-            MenuBranch {
-                index: 0,
-                highlight: 0,
-            },
-        ];
+        let MenuItem::Submenu {
+            items: children, ..
+        } = &items[0]
+        else {
+            unreachable!();
+        };
+        let path = [branch(&items[0], 0, 0), branch(&children[0], 0, 0)];
         let (level, title) = visible_level(&items, &path).expect("nested level");
         assert_eq!(title.map(|title| title.as_ref()), Some("Move to"));
         assert!(matches!(level, [MenuItem::Action(action)] if action.id == "inbox"));
 
         let disabled = vec![MenuItem::submenu("Organize", vec![]).disabled()];
         assert!(visible_level(&disabled, &path[..1]).is_none());
+    }
+
+    #[test]
+    fn a_reordered_or_replaced_branch_cannot_show_another_submenu() {
+        let original = vec![
+            MenuItem::submenu("Organize", vec![MenuItem::action("inbox", "Inbox")]),
+            MenuItem::submenu("Other", vec![MenuItem::action("settings", "Settings")]),
+        ];
+        let path = [branch(&original[0], 0, 0)];
+        assert!(visible_level(&original, &path).is_some());
+
+        let reordered = vec![original[1].clone(), original[0].clone()];
+        assert!(visible_level(&reordered, &path).is_none());
+        let replaced = vec![MenuItem::submenu(
+            "Organize",
+            vec![MenuItem::action("archive", "Archive")],
+        )];
+        assert!(visible_level(&replaced, &path).is_none());
+
+        let relabelled = vec![MenuItem::submenu(
+            "Organize",
+            vec![MenuItem::action("inbox", "Move to Inbox")],
+        )];
+        assert!(visible_level(&relabelled, &path).is_some());
     }
 
     #[test]

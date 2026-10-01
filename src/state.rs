@@ -371,6 +371,9 @@ pub struct OpenMenu {
 pub(crate) struct MenuBranch {
     pub index: usize,
     pub highlight: usize,
+    /// Fingerprint of this branch's labels and action ids. An index alone
+    /// could point into a different submenu after the host rebuilds rows.
+    pub identity: u64,
 }
 
 /// A modal dialog that is open, or on its way out.
@@ -1631,9 +1634,13 @@ impl ControlState {
 
     /// Enters an enabled submenu. The menu opening, target and focus handle
     /// stay put; only the visible level and its keyboard row change.
-    pub(crate) fn enter_menu(&mut self, index: usize, highlight: usize) {
+    pub(crate) fn enter_menu(&mut self, index: usize, highlight: usize, identity: u64) {
         if let Some(menu) = self.menu.as_mut() {
-            menu.levels.push(MenuBranch { index, highlight });
+            menu.levels.push(MenuBranch {
+                index,
+                highlight,
+                identity,
+            });
             menu.highlight = None;
         }
     }
@@ -1936,9 +1943,9 @@ mod tests {
         state.open_menu("row", at(10.0, 20.0), "budget.csv");
         let opening = state.menu_opened_at();
 
-        state.enter_menu(3, 1);
+        state.enter_menu(3, 1, 11);
         state.highlight_menu(Some(2));
-        state.enter_menu(4, 2);
+        state.enter_menu(4, 2, 22);
         assert_eq!(state.menu_target(), Some("budget.csv"));
         assert_eq!(state.menu_opened_at(), opening);
         assert_eq!(state.menu_highlight(), None);
