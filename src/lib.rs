@@ -56,8 +56,8 @@ pub mod theme;
 pub mod typography;
 
 pub use containers::{
-    DialogButton, Tab, arriving, card, collapsible, column, dialog, labelled, reorder, row,
-    scroll_area, split_area, split_handle, tab_bar,
+    CARD_LIFT, DialogButton, Tab, arriving, card, collapsible, column, dialog, labelled, reorder,
+    row, scroll_area, split_area, split_handle, tab_bar,
 };
 pub use controls::{
     BadgeTone, ButtonVariant, CHIP_HEIGHT, CONTROL_HEIGHT, CONTROL_RADIUS, ChipSelection, Choice,
@@ -85,7 +85,7 @@ pub use overlay::{
 };
 pub use palette::{DEFAULT_SATURATION, MAX_SATURATION, Palette};
 pub use scroll::{SCROLL_FADE, ScrollAxis, ScrollDrag, apply_scroll_drag, scroll_fades};
-pub use selection::{ListSelection, SelectionIntent, selectable_list, selectable_row};
+pub use selection::{ListSelection, SelectionIntent, selectable_list};
 pub use shortcut::{Chord, display, display_keystroke, shortcut_recorder};
 pub use state::{
     COMBO_REVEAL, ComboId, ControlHost, ControlState, MOVE, OpenCombo, OpenDialog, OpenMenu,

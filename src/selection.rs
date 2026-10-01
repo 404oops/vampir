@@ -1,4 +1,4 @@
-//! A selectable list row and the host-owned selection it edits.
+//! A selectable list and the host-owned selection it edits.
 //!
 //! The toolkit handles the same mouse and keyboard gestures in every list;
 //! the host keeps the chosen ids alongside the data they describe.
@@ -8,8 +8,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, ClickEvent, Context, Div, ElementId, KeyDownEvent, Modifiers, SharedString, Window,
-    div, prelude::*, px,
+    ClickEvent, Context, Div, ElementId, KeyDownEvent, Modifiers, Rgba, SharedString, Window, div,
+    prelude::*, px,
 };
 
 use crate::controls::{WidgetContext, scrollbar};
@@ -31,16 +31,27 @@ pub enum SelectionIntent {
     Activate(SharedString),
 }
 
-fn primary_modifier(modifiers: &Modifiers) -> bool {
-    if cfg!(target_os = "macos") {
-        modifiers.platform && !modifiers.control
-    } else {
-        modifiers.control && !modifiers.platform
-    }
+type OnIntent<V> =
+    Rc<dyn Fn(&mut V, &[SharedString], SelectionIntent, &mut Window, &mut Context<V>)>;
+
+/// Cmd on macOS, Ctrl elsewhere, with nothing but Shift beside it. Gpui's
+/// `Modifiers::secondary` alone would also take Cmd-Ctrl or Cmd-Option,
+/// which are someone else's shortcuts rather than a toggle.
+fn secondary_only(modifiers: &Modifiers) -> bool {
+    Modifiers {
+        shift: false,
+        ..*modifiers
+    } == Modifiers::secondary_key()
 }
 
-fn active_row(order: &[SharedString], index: usize, active: Option<&SharedString>) -> bool {
-    active == order.get(index) || (index == 0 && active.is_none_or(|id| !order.contains(id)))
+fn position(order: &[SharedString], id: &SharedString) -> Option<usize> {
+    order.iter().position(|candidate| candidate == id)
+}
+
+/// The row the ring is drawn on: the active one, or the first while no
+/// active row is in view, so a fresh or filtered list is still one Tab away.
+fn active_index(order: &[SharedString], active: Option<&SharedString>) -> usize {
+    active.and_then(|id| position(order, id)).unwrap_or(0)
 }
 
 fn navigation_target(key: Key, index: usize, count: usize) -> Option<usize> {
@@ -53,43 +64,83 @@ fn navigation_target(key: Key, index: usize, count: usize) -> Option<usize> {
     }
 }
 
-/// A vertically scrolling viewport for [`selectable_row`]s with the same id.
+/// A vertically scrolling list of selectable rows, one for each id in
+/// `order`, with `rows` as their content in the same order.
 ///
-/// Pass the rows as direct children, in the same order used to build each
-/// row. The tracked scroll handle then brings an arrow-key target into view
-/// without the host routing keys or keeping a second scroll model. Give the
-/// returned element a height so a long list has a viewport to scroll in.
-pub fn selectable_list<V: ControlHost>(
+/// Only the active row gets the list's focus handle, so Tab crosses even a
+/// very long list in one step. Click, Cmd/Ctrl-click and Shift-click are
+/// reported as selection intents; Up/Down/Home/End, Shift-arrows,
+/// Cmd/Ctrl+A, Enter and Escape use the same callback, and the arrows
+/// scroll their target into view. `on_intent` is handed the order the rows
+/// were drawn in, so the host applies the intent to its [`ListSelection`]
+/// without keeping a copy for the listener, and decides what activating an
+/// item does. Escape with nothing selected goes on to the root.
+///
+/// `start` and `end` are the colours behind the list at its top and bottom
+/// edges, as for [`scroll_fades`]: the fades have to land on them exactly.
+/// Give the returned element a height so a long list has a viewport to
+/// scroll in.
+///
+/// ```ignore
+/// let (top, bottom) = lit_stops(palette.area_surface, CARD_LIFT);
+/// selectable_list(
+///     "files", &order, &self.selection, top, bottom,
+///     WidgetContext::new(palette, self, cx),
+///     order.iter().map(|name| div().child(name.clone())),
+///     |this, order, intent, _window, _cx| this.selection.apply(order, intent),
+/// )
+/// .h(px(200.0))
+/// ```
+#[allow(clippy::too_many_arguments)]
+pub fn selectable_list<V: ControlHost, E: IntoElement>(
     id: ComboId,
-    rows: impl IntoIterator<Item = AnyElement>,
+    order: &[SharedString],
+    selection: &ListSelection,
+    start: Rgba,
+    end: Rgba,
     mut ctx: WidgetContext<'_, '_, '_, V>,
+    rows: impl IntoIterator<Item = E>,
+    on_intent: impl Fn(&mut V, &[SharedString], SelectionIntent, &mut Window, &mut Context<V>) + 'static,
 ) -> Div {
-    let palette = ctx.palette;
     let scroll = ctx.state().scroll((id, "selection-scroll"));
+    // One copy of the order per frame, shared by every row's listeners.
+    let order: Rc<[SharedString]> = order.into();
+    let on_intent: OnIntent<V> = Rc::new(on_intent);
+    let active = active_index(&order, selection.active());
+    let mut list = div()
+        .id(ElementId::Name(format!("{id}-selection-scroll").into()))
+        .size_full()
+        .flex()
+        .flex_col()
+        .gap(px(3.0))
+        .overflow_y_scroll()
+        .restrict_scroll_to_axis()
+        .track_scroll(&scroll);
+    for (index, content) in rows.into_iter().take(order.len()).enumerate() {
+        list = list.child(selectable_row(
+            id,
+            &order,
+            index,
+            index == active,
+            selection,
+            content,
+            ctx.reborrow(),
+            on_intent.clone(),
+        ));
+    }
     div()
         .relative()
         .overflow_hidden()
-        .child(
-            div()
-                .id(ElementId::Name(format!("{id}-selection-scroll").into()))
-                .size_full()
-                .flex()
-                .flex_col()
-                .gap(px(3.0))
-                .overflow_y_scroll()
-                .restrict_scroll_to_axis()
-                .track_scroll(&scroll)
-                .children(rows),
-        )
+        .child(list)
         .children(scroll_fades(
             ctx.state(),
             id,
             &scroll,
             ScrollAxis::Vertical,
-            palette.area_surface,
-            palette.area_surface,
+            start,
+            end,
         ))
-        .child(scrollbar(id, &scroll, ScrollAxis::Vertical, ctx.reborrow()))
+        .child(scrollbar(id, &scroll, ScrollAxis::Vertical, ctx))
 }
 
 /// The host-owned selection for a list of stable ids.
@@ -110,6 +161,16 @@ impl ListSelection {
 
     pub fn contains(&self, id: &str) -> bool {
         self.selected.contains(id)
+    }
+
+    /// How many ids are selected, including any no longer shown until
+    /// [`retain_visible`](Self::retain_visible) drops them.
+    pub fn len(&self) -> usize {
+        self.selected.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.selected.is_empty()
     }
 
     pub fn active(&self) -> Option<&SharedString> {
@@ -139,24 +200,26 @@ impl ListSelection {
     pub fn apply(&mut self, order: &[SharedString], intent: SelectionIntent) {
         match intent {
             SelectionIntent::Choose { id, extend, toggle } => {
-                let Some(at) = order.iter().position(|candidate| candidate == &id) else {
+                let Some(at) = position(order, &id) else {
                     return;
                 };
                 if extend {
+                    // Without an anchor — a fresh list, or after Escape — a
+                    // range starts from the row the ring is on, which is
+                    // where the reader's eye already is. Starting from the
+                    // target instead would make Shift-Down select one row.
                     let start = self
                         .anchor
                         .as_ref()
-                        .and_then(|anchor| order.iter().position(|candidate| candidate == anchor))
-                        .unwrap_or(at);
+                        .and_then(|anchor| position(order, anchor))
+                        .unwrap_or_else(|| active_index(order, self.active.as_ref()));
                     if !toggle {
                         self.selected.clear();
                     }
                     for row in &order[start.min(at)..=start.max(at)] {
                         self.selected.insert(row.clone());
                     }
-                    if self.anchor.is_none() {
-                        self.anchor = Some(id.clone());
-                    }
+                    self.anchor = Some(order[start].clone());
                 } else if toggle {
                     if !self.selected.insert(id.clone()) {
                         self.selected.remove(&id);
@@ -185,42 +248,31 @@ impl ListSelection {
     }
 }
 
-/// One row of a host-owned list, with an arbitrary element as its content.
-///
-/// Only the active row gets the list's focus handle, so Tab crosses even a
-/// very long list in one step. Click, Cmd/Ctrl-click and Shift-click are
-/// reported as selection intents; Up/Down/Home/End, Shift-arrows, Cmd/Ctrl+A,
-/// Enter and Escape use the same callback. The host applies the intent to a
-/// [`ListSelection`] and decides what activating an item does.
 #[allow(clippy::too_many_arguments)]
-pub fn selectable_row<V: ControlHost>(
+fn selectable_row<V: ControlHost>(
     id: ComboId,
-    order: &[SharedString],
+    order: &Rc<[SharedString]>,
     index: usize,
+    active: bool,
     selection: &ListSelection,
     content: impl IntoElement,
     ctx: WidgetContext<'_, '_, '_, V>,
-    on_intent: impl Fn(&mut V, SelectionIntent, &mut Window, &mut Context<V>) + 'static,
+    on_intent: OnIntent<V>,
 ) -> impl IntoElement {
     let WidgetContext { palette, view, cx } = ctx;
     let row_id = order[index].clone();
     let selected = selection.contains(&row_id);
-    let active = active_row(order, index, selection.active());
+    let has_selection = !selection.is_empty();
     let focus = view.control_state().focus(id, cx);
     let click_focus = focus.clone();
     let on = view
         .control_state()
         .blend((id, "selected", &row_id), selected, SWITCH_SLIDE);
-    let on_intent = Rc::new(on_intent);
     let click_intent = on_intent.clone();
-    let key_intent = on_intent.clone();
+    let click_order = order.clone();
     let dismiss_intent = on_intent.clone();
-    let previous = index.checked_sub(1).and_then(|at| order.get(at)).cloned();
-    let next = order.get(index + 1).cloned();
-    let first = order.first().cloned();
-    let last = order.last().cloned();
-    let count = order.len();
-    let current = row_id.clone();
+    let dismiss_order = order.clone();
+    let key_order = order.clone();
 
     div()
         .id(ElementId::NamedChild(
@@ -252,10 +304,10 @@ pub fn selectable_row<V: ControlHost>(
                 SelectionIntent::Choose {
                     id: row_id.clone(),
                     extend: modifiers.shift,
-                    toggle: primary_modifier(&modifiers) && !modifiers.alt && !modifiers.function,
+                    toggle: secondary_only(&modifiers),
                 }
             };
-            click_intent(this, intent, window, cx);
+            click_intent(this, &click_order, intent, window, cx);
             cx.notify();
         }))
         .child(content)
@@ -263,62 +315,52 @@ pub fn selectable_row<V: ControlHost>(
             el.child(
                 keyboard::ring_for(&focus, crate::controls::CONTROL_RADIUS, palette)
                     .on_action(cx.listener(move |this, _: &Dismiss, window, cx| {
-                        dismiss_intent(this, SelectionIntent::Clear, window, cx);
+                        // Nothing selected means nothing here for Escape to
+                        // undo, so the root gets it and closes an overlay,
+                        // as it would with the keyboard anywhere else.
+                        if !has_selection {
+                            cx.propagate();
+                            return;
+                        }
+                        dismiss_intent(this, &dismiss_order, SelectionIntent::Clear, window, cx);
                         cx.notify();
                     }))
                     .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                         let modifiers = &event.keystroke.modifiers;
-                        let intent = if primary_modifier(modifiers)
-                            && !modifiers.shift
-                            && !modifiers.alt
-                            && !modifiers.function
+                        let (intent, scroll_to) = if *modifiers == Modifiers::secondary_key()
                             && event.keystroke.key == "a"
                         {
-                            Some((SelectionIntent::All, None))
-                        } else if let Some(key) = keyboard::key(event) {
-                            let target_id = match key {
-                                Key::Up => previous.clone(),
-                                Key::Down => next.clone(),
-                                Key::Home => first.clone(),
-                                Key::End => last.clone(),
-                                Key::Activate => {
-                                    cx.stop_propagation();
-                                    key_intent(
-                                        this,
-                                        SelectionIntent::Activate(current.clone()),
-                                        window,
-                                        cx,
-                                    );
-                                    cx.notify();
-                                    return;
+                            (SelectionIntent::All, None)
+                        } else {
+                            match keyboard::key(event) {
+                                Some(Key::Activate) => {
+                                    (SelectionIntent::Activate(key_order[index].clone()), None)
                                 }
-                                _ => None,
-                            };
-                            navigation_target(key, index, count)
-                                .zip(target_id)
-                                .map(|(at, id)| {
+                                Some(key) => {
+                                    let Some(at) = navigation_target(key, index, key_order.len())
+                                    else {
+                                        return;
+                                    };
                                     (
                                         SelectionIntent::Choose {
-                                            id,
+                                            id: key_order[at].clone(),
                                             extend: modifiers.shift,
                                             toggle: false,
                                         },
                                         Some(at),
                                     )
-                                })
-                        } else {
-                            None
-                        };
-                        if let Some((intent, scroll_to)) = intent {
-                            cx.stop_propagation();
-                            if let Some(at) = scroll_to {
-                                this.control_state()
-                                    .scroll((id, "selection-scroll"))
-                                    .scroll_to_item(at);
+                                }
+                                None => return,
                             }
-                            key_intent(this, intent, window, cx);
-                            cx.notify();
+                        };
+                        cx.stop_propagation();
+                        if let Some(at) = scroll_to {
+                            this.control_state()
+                                .scroll((id, "selection-scroll"))
+                                .scroll_to_item(at);
                         }
+                        on_intent(this, &key_order, intent, window, cx);
+                        cx.notify();
                     })),
             )
         })
@@ -336,11 +378,6 @@ mod tests {
     fn plain_toggle_and_shift_choose_stable_ids() {
         let order = order();
         let mut selection = ListSelection::new();
-        let choose = |id: &str, extend, toggle| SelectionIntent::Choose {
-            id: id.into(),
-            extend,
-            toggle,
-        };
         selection.apply(&order, choose("b", false, false));
         selection.apply(&order, choose("d", false, true));
         assert_eq!(selection.selected_in(&order), vec!["b", "d"]);
@@ -373,9 +410,86 @@ mod tests {
     fn a_filtered_out_active_id_leaves_focus_on_the_first_visible_row() {
         let visible = vec!["a".into(), "c".into()];
         let stale: SharedString = "b".into();
-        assert!(active_row(&visible, 0, Some(&stale)));
-        assert!(!active_row(&visible, 1, Some(&stale)));
-        assert!(active_row(&visible, 1, Some(&visible[1])));
+        assert_eq!(active_index(&visible, Some(&stale)), 0);
+        assert_eq!(active_index(&visible, None), 0);
+        assert_eq!(active_index(&visible, Some(&visible[1])), 1);
+    }
+
+    fn choose(id: &str, extend: bool, toggle: bool) -> SelectionIntent {
+        SelectionIntent::Choose {
+            id: id.into(),
+            extend,
+            toggle,
+        }
+    }
+
+    #[test]
+    fn shift_after_escape_extends_from_the_active_row() {
+        let order = order();
+        let mut selection = ListSelection::new();
+        selection.apply(&order, choose("b", false, false));
+        selection.apply(&order, SelectionIntent::Clear);
+        assert!(selection.is_empty());
+        selection.apply(&order, choose("c", true, false));
+        assert_eq!(selection.selected_in(&order), vec!["b", "c"]);
+        // The range keeps pivoting on where it started.
+        selection.apply(&order, choose("d", true, false));
+        assert_eq!(selection.selected_in(&order), vec!["b", "c", "d"]);
+    }
+
+    #[test]
+    fn shift_on_a_fresh_list_extends_from_the_first_row() {
+        let order = order();
+        let mut selection = ListSelection::new();
+        selection.apply(&order, choose("b", true, false));
+        assert_eq!(selection.selected_in(&order), vec!["a", "b"]);
+        selection.apply(&order, choose("c", true, false));
+        assert_eq!(selection.selected_in(&order), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn secondary_shift_adds_a_range_to_the_selection() {
+        let order = order();
+        let mut selection = ListSelection::new();
+        selection.apply(&order, choose("a", false, false));
+        selection.apply(&order, choose("c", false, true));
+        selection.apply(&order, choose("d", true, true));
+        assert_eq!(selection.selected_in(&order), vec!["a", "c", "d"]);
+        assert_eq!(selection.len(), 3);
+    }
+
+    #[test]
+    fn select_all_on_an_empty_list_selects_nothing() {
+        let mut selection = ListSelection::new();
+        selection.apply(&[], SelectionIntent::All);
+        assert!(selection.is_empty());
+        assert_eq!(selection.active(), None);
+    }
+
+    #[test]
+    fn choosing_an_id_not_in_the_list_changes_nothing() {
+        let order = order();
+        let mut selection = ListSelection::new();
+        selection.apply(&order, choose("b", false, false));
+        selection.apply(&order, choose("z", false, false));
+        selection.apply(&order, choose("z", true, true));
+        assert_eq!(selection.selected_in(&order), vec!["b"]);
+        assert_eq!(selection.active().map(SharedString::as_ref), Some("b"));
+    }
+
+    #[test]
+    fn only_the_platform_key_and_shift_toggle() {
+        let secondary = Modifiers::secondary_key();
+        assert!(secondary_only(&secondary));
+        assert!(secondary_only(&Modifiers {
+            shift: true,
+            ..secondary
+        }));
+        assert!(!secondary_only(&Modifiers {
+            alt: true,
+            ..secondary
+        }));
+        assert!(!secondary_only(&Modifiers::none()));
     }
 
     #[test]
