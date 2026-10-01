@@ -110,6 +110,9 @@ impl TabBarLayout {
 const TAB_HEIGHT: f32 = 26.0;
 const TAB_GAP: f32 = 2.0;
 const TAB_PAD: f32 = 2.0;
+/// The well's border plus its padding: where the first tab starts inside
+/// the scrolled content, and how far the last one ends before its end.
+const TAB_INSET: f32 = 1.0 + TAB_PAD;
 
 /// Horizontal tab bar with drag-to-reorder.
 ///
@@ -551,63 +554,122 @@ pub fn tab_bar_layout<V: ControlHost>(
         .bottom_0()
     };
 
-    // The outer element owns the viewport. Horizontal wells hug their tabs;
-    // a vertical well fills the width the host gave it.
-    div()
-        .id(id)
-        .flex()
-        .when(vertical || uniform_width.is_some(), |el| {
-            el.w_full().min_w(px(0.0))
+    let axis = if vertical {
+        ScrollAxis::Vertical
+    } else {
+        ScrollAxis::Horizontal
+    };
+    // Tabs leaving the viewport fade into the well rather than being cut
+    // mid-glyph. The fades cover only the lane the tabs run in, inset by the
+    // well's border and padding, so the recess itself carries on to the
+    // edge and says there is more of it; and the well is flat, so its own
+    // fill is exactly what a fade has to land on.
+    //
+    // No scrollbar: a strip one tab deep has no room for an overlay track
+    // that would not sit on the tabs and take their presses, which start
+    // reorders. The wheel, a trackpad, the arrow keys (the selection is
+    // revealed) and the fades already say the strip goes on and move it.
+    let fades = div()
+        .absolute()
+        .when(vertical, |el| {
+            el.top_0()
+                .bottom_0()
+                .left(px(TAB_INSET))
+                .right(px(TAB_INSET))
         })
-        .when(vertical, |el| el.h_full().flex_col().overflow_y_scroll())
-        .when(!vertical, |el| el.overflow_x_scroll())
-        .restrict_scroll_to_axis()
-        .track_scroll(&scroll)
+        .when(!vertical, |el| {
+            el.left_0()
+                .right_0()
+                .top(px(TAB_INSET))
+                .bottom(px(TAB_INSET))
+        })
+        .children(scroll_fades(
+            state,
+            id,
+            &scroll,
+            axis,
+            palette.field_surface,
+            palette.field_surface,
+        ));
+
+    // The outer element sizes the bar and holds the fades over the
+    // viewport. Horizontal wells hug their tabs; a vertical well fills the
+    // width the host gave it.
+    div()
+        .relative()
+        .flex()
+        .min_w(px(0.0))
+        .when(vertical || uniform_width.is_some(), |el| el.w_full())
+        .when(vertical, |el| el.h_full().min_h(px(0.0)).flex_col())
         .child(
             div()
-                .relative()
+                .id(id)
                 .flex()
-                // The well must keep its content height. If it stretches to
-                // the viewport's height, GPUI measures no overflow and the
-                // wheel event goes to the page behind the rail.
-                .when(vertical, |el| el.w_full().flex_col().flex_none())
-                .when(!vertical, |el| el.items_center())
-                .gap(px(TAB_GAP))
-                .p(px(TAB_PAD))
-                .rounded(px(CONTROL_RADIUS))
-                .bg(palette.field_surface)
-                .border_1()
-                .border_color(palette.field_border)
-                .shadow(lighting::recessed(dark))
-                // Where the well is, for a held tab to know where its slot is
-                // on screen.
-                .child(well_probe)
-                // Under the tabs, so the active label reads through it.
-                .when_some(pill, |el, (pos, size)| {
-                    el.child(
-                        div()
-                            .absolute()
-                            .when(vertical, |el| {
-                                el.top(px(pos))
-                                    .left(px(TAB_PAD))
-                                    .right(px(TAB_PAD))
-                                    .h(px(size))
-                            })
-                            .when(!vertical, |el| {
-                                el.top(px(TAB_PAD))
-                                    .left(px(pos))
-                                    .w(px(size))
-                                    .h(px(TAB_HEIGHT))
-                            })
-                            .rounded(px(CONTROL_RADIUS))
-                            .bg(lighting::lit(palette.control_fill, 0.08))
-                            .shadow(lighting::raised(dark)),
-                    )
+                .flex_grow(1.0)
+                .min_w(px(0.0))
+                .when(vertical, |el| {
+                    el.min_h(px(0.0))
+                        .flex_col()
+                        .overflow_y_scroll()
+                        // Without this a sideways trackpad swipe scrolls
+                        // the rail: GPUI maps an x-delta onto y for a
+                        // container that only scrolls one way.
+                        .restrict_scroll_to_axis()
                 })
-                .children(rendered)
-                // Last, so the tab in hand paints over every other.
-                .children(floating),
+                // Left unrestricted on purpose: the same mapping is what
+                // turns a plain mouse wheel's vertical delta into sideways
+                // scrolling, and a strip of tabs has nothing else to
+                // scroll.
+                .when(!vertical, |el| el.overflow_x_scroll())
+                .track_scroll(&scroll)
+                .child(
+                    div()
+                        .relative()
+                        .flex()
+                        // The well must keep its content height. If it
+                        // stretches to the viewport's height, GPUI measures
+                        // no overflow and the wheel event goes to the page
+                        // behind the rail.
+                        .when(vertical, |el| el.w_full().flex_col().flex_none())
+                        .when(!vertical, |el| el.items_center())
+                        .gap(px(TAB_GAP))
+                        .p(px(TAB_PAD))
+                        .rounded(px(CONTROL_RADIUS))
+                        .bg(palette.field_surface)
+                        .border_1()
+                        .border_color(palette.field_border)
+                        .shadow(lighting::recessed(dark))
+                        // Where the well is, for a held tab to know where
+                        // its slot is on screen.
+                        .child(well_probe)
+                        // Under the tabs, so the active label reads through it.
+                        .when_some(pill, |el, (pos, size)| {
+                            el.child(
+                                div()
+                                    .absolute()
+                                    .when(vertical, |el| {
+                                        el.top(px(pos))
+                                            .left(px(TAB_PAD))
+                                            .right(px(TAB_PAD))
+                                            .h(px(size))
+                                    })
+                                    .when(!vertical, |el| {
+                                        el.top(px(TAB_PAD))
+                                            .left(px(pos))
+                                            .w(px(size))
+                                            .h(px(TAB_HEIGHT))
+                                    })
+                                    .rounded(px(CONTROL_RADIUS))
+                                    .bg(lighting::lit(palette.control_fill, 0.08))
+                                    .shadow(lighting::raised(dark)),
+                            )
+                        })
+                        .children(rendered)
+                        // Last, so the tab in hand paints over every other.
+                        .children(floating),
+                ),
         )
+        .child(fades)
 }
 
 /// A tab's face without its behaviour: what both the tab in the bar and the
