@@ -55,16 +55,17 @@ The application's own keys — ⌘K, ⌘S — are still the host's to bind, afte
 | `button`, `icon_button`, `chip` | Space or Enter. |
 | `checkbox`, `switch` | Space or Enter toggles. The ring is on the box and on the track — the parts with a fill. Both take an optional label that is part of the hit target. |
 | `radio_group` | One tab stop. Up and down move the choice and wrap; Home and End reach the ends. Disabled choices are stepped over, never landed on. |
-| `segmented`, `tab_bar` | One tab stop. Left and right move the selection and wrap. |
+| `segmented`, `tab_bar`, `tab_bar_layout` | One tab stop. Horizontal choices use Left and Right; vertical tabs use Up and Down. Selection wraps, and an overflowed tab is scrolled into view when reached by arrow key. |
 | `combo` | Space, Enter or Down opens; moving the keyboard away closes it. Up and down move the highlight, Enter commits it, Escape closes and leaves the value alone — arrowing through a list is looking, not choosing. |
 | `slider` | Arrows move one step, Page ten, Home and End the ends. A stepped track moves one notch. |
 | `dialog` | Takes the keyboard when it opens, on the primary button or failing one the first. Tab cycles among its buttons. Enter is the default action, Escape dismisses, and closing hands the keyboard back where it was. |
 | `command_palette`, `search_list`, `ranked_command_palette`, `ranked_search_list` | The query field has the keyboard. Up and down move the highlight, Page Up and Page Down move it a viewport — ten rows in `search_list`, which does not scroll — and Enter picks it. Section headings take no step, and a list that scrolls keeps the highlighted row in view. A new query puts the highlight back on the best match and the list back at its top. Results that change under the same query, as a late source arrives, leave a highlight nobody has moved on the first row, so it stays on the best match; one that has been moved stays on its result, by id, and the list scrolls to keep it in view. Only if that result has gone does the highlight go back to the first row. The palette opens with the keyboard in its query, closes on Escape, and hands the keyboard back where it was. |
 | `collapsible` | Space toggles, Left closes, Right opens. |
 | `split_handle` | Arrows move the divider. A divider only the mouse can move is content a keyboard user cannot reach. |
-| `context_menu` | Takes focus when it opens. Up and down move over the enabled rows only, Enter runs one, Escape closes. Focus goes back where it was. |
+| `context_menu`, `menu_button` | The button opens with Space, Enter or Down; the menu takes focus. Up and down move over enabled rows, Right or Enter opens a submenu with the keyboard on its first row, Left or Escape returns one level, and Escape at the top closes the menu; Left there does nothing. Enter on a leaf runs it. Focus goes back where it was after closing. |
 | `table_header` | Sortable columns are tab stops; Space or Enter sorts. |
 | `tree_row` | One tab stop, on the selected row. Up and down walk the flattened rows without wrapping. Right opens a closed branch and then steps into it; left closes an open one and then steps out to the parent. |
+| `selectable_list` | One tab stop for the list, on its active row. Up and down move without wrapping; Home and End reach the ends; the target scrolls into view. Shift extends from the anchor, or from the active row when there is none; Cmd/Ctrl-click toggles a row; Cmd/Ctrl+A selects all; Enter or Space activates; Escape clears the selection, and with nothing selected goes on to the root. |
 | `color_pad` | Left and right move chroma, up and down move lightness. |
 | `swatch_grid` | Each swatch is a tab stop. |
 | `spinbox` | Up and down step the value from inside the field, Enter commits a typed one; the steppers are tab stops too. |

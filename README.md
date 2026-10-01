@@ -107,11 +107,11 @@ The gallery supports both colour schemes:
 
 **Controls** — `button`, `icon_button` (with `glyph`), `switch`, `checkbox`, `radio_group`, `segmented`, `chip` / `chip_group`, `spinbox`, `text_field`, `text_area`, `search_field`, `combo`, `slider`, `progress_bar`, `spinner`, `badge`, `separator`, `scrollbar`, `caption`, `fading_text`.
 
-**Containers** — `tab_bar` (drag to reorder, optional close buttons) with `reorder`, `split_handle` + `split_area`, `collapsible`, `dialog`, `card` with `card_at`, `labelled`, `row` / `column`, `scroll_area`, `arriving`.
+**Containers** — `tab_bar` and `tab_bar_layout` (natural, uniform-width horizontal, or vertical tabs; drag to reorder and optional close buttons) with `reorder`, `split_handle` + `split_area`, `collapsible`, `dialog`, `card` with `card_at`, `labelled`, `row` / `column`, `scroll_area`, `arriving`.
 
-**Menus and overlays** — `context_menu`, `menu_button`, `menu_target`, `Tooltip`, `command_palette` and `search_list` with `fuzzy_filter` / `fuzzy_score`, and `ranked_command_palette` / `ranked_search_list` for host-ranked `SearchResult`s with sections, details and leading visuals, and `rank_results` to rank them.
+**Menus and overlays** — `context_menu` with nested `MenuItem::submenu` levels, `menu_button`, `menu_target`, `Tooltip`, `command_palette` and `search_list` with `fuzzy_filter` / `fuzzy_score`, and `ranked_command_palette` / `ranked_search_list` for host-ranked `SearchResult`s with sections, details and leading visuals, and `rank_results` to rank them.
 
-**Data** — `tree_row` with `flatten_tree`, `table_header` and `table_row` with `Column` and `SortDirection`.
+**Data** — `tree_row` with `flatten_tree`, `selectable_list` with host-owned `ListSelection`, `table_header` and `table_row` with `Column` and `SortDirection`.
 
 **Theme** — `Theme`, `Scheme`, optional `scheme_picker`, `hue_picker` and `saturation_picker`: hue and saturation chosen by the app, a scheme that follows the desktop, and the palette derived from them.
 
