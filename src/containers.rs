@@ -6,13 +6,14 @@
 //! container renders whatever the host puts inside it, so each one takes
 //! elements and returns a bigger element.
 
+use std::cell::Cell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, Context, Div, ElementId, FocusHandle, FontWeight, KeyDownEvent, MouseButton,
-    MouseDownEvent, PathBuilder, ScrollHandle, SharedString, Window, canvas, deferred, div, point,
-    prelude::*, px,
+    AnyElement, Context, DispatchPhase, Div, ElementId, FocusHandle, FontWeight, KeyDownEvent,
+    MouseButton, MouseDownEvent, PathBuilder, ScrollHandle, ScrollWheelEvent, SharedString, Window,
+    canvas, deferred, div, point, prelude::*, px,
 };
 
 use crate::controls::{
@@ -554,8 +555,19 @@ pub fn tab_bar_layout<V: ControlHost>(
                 .into_any_element(),
         );
     }
+    // Where the strip stood when a wheel event reached it, before it moved.
+    // GPUI never stops a wheel event, so without this a strip inside a
+    // scrolling page scrolls the page under it too. Listeners bubble in the
+    // reverse of the order they were painted in, and an element registers
+    // its own before its children paint: this probe, inside the strip,
+    // hears the event first, then the strip scrolls, then the strip's
+    // `on_scroll_wheel` compares the two and stops the event only if the
+    // strip moved. At either end it lets the event go to the page.
+    let wheel_from: Rc<Cell<Option<f32>>> = Rc::default();
     let well_probe = {
         let weak = weak.clone();
+        let scroll = scroll.clone();
+        let wheel_from = wheel_from.clone();
         canvas(
             move |bounds, _window, cx| {
                 if let Some(host) = weak.upgrade() {
@@ -564,7 +576,13 @@ pub fn tab_bar_layout<V: ControlHost>(
                     });
                 }
             },
-            |_bounds, _state, _window, _cx| {},
+            move |_bounds, _state, window, _cx| {
+                window.on_mouse_event(move |_: &ScrollWheelEvent, phase, _window, _cx| {
+                    if phase == DispatchPhase::Bubble {
+                        wheel_from.set(Some(scroll_along(&scroll, vertical)));
+                    }
+                });
+            },
         )
         .absolute()
         .top_0()
@@ -642,6 +660,17 @@ pub fn tab_bar_layout<V: ControlHost>(
                 // scroll.
                 .when(!vertical, |el| el.overflow_x_scroll())
                 .track_scroll(&scroll)
+                .on_scroll_wheel({
+                    let scroll = scroll.clone();
+                    move |_event, _window, cx| {
+                        let max = max_scroll_along(&scroll, vertical);
+                        if let Some(from) = wheel_from.take()
+                            && wheel_moved(from, scroll_along(&scroll, vertical), max)
+                        {
+                            cx.stop_propagation();
+                        }
+                    }
+                })
                 .child(
                     div()
                         .relative()
@@ -756,6 +785,25 @@ fn track_axis(vertical: bool) -> TrackAxis {
     } else {
         TrackAxis::Horizontal
     }
+}
+
+fn scroll_along(scroll: &ScrollHandle, vertical: bool) -> f32 {
+    let offset = scroll.offset();
+    f32::from(if vertical { offset.y } else { offset.x })
+}
+
+fn max_scroll_along(scroll: &ScrollHandle, vertical: bool) -> f32 {
+    let max = scroll.max_offset();
+    f32::from(if vertical { max.y } else { max.x })
+}
+
+/// Whether a wheel event moved a strip whose offset went from `from` to
+/// `to`. GPUI adds the delta first and clamps at the next layout, so both
+/// can be past an end; clamped alike, a strip already at the end has not
+/// moved, and the event belongs to whatever scrolls behind it.
+fn wheel_moved(from: f32, to: f32, max: f32) -> bool {
+    let clamp = |offset: f32| offset.clamp(-max.max(0.0), 0.0);
+    (clamp(from) - clamp(to)).abs() > 0.01
 }
 
 fn tab_places(sizes: &[f32], order: &[usize], gap: f32) -> Vec<f32> {
@@ -1553,7 +1601,7 @@ fn moved_selection(selected: usize, from: usize, to: usize) -> usize {
 mod layout_tests {
     use super::{
         ButtonVariant, TAB_HEIGHT, TAB_INSET, TabBarLayout, dialog_default, moved_selection,
-        reorder, reveal_delta, reveal_scroll, tab_content_len, tab_places,
+        reorder, reveal_delta, reveal_scroll, tab_content_len, tab_places, wheel_moved,
     };
     use crate::keyboard::Orientation;
     use crate::scroll::SCROLL_FADE;
@@ -1716,6 +1764,26 @@ mod layout_tests {
         assert_eq!(reveal_delta(20.0, 120.0, 40.0, 100.0), 0.0);
         assert_eq!(reveal_delta(20.0, 120.0, 8.0, 68.0), 12.0);
         assert_eq!(reveal_delta(20.0, 120.0, 75.0, 146.0), -26.0);
+    }
+
+    /// A strip keeps the wheel while it moves and hands it on at its ends,
+    /// so the page behind scrolls once the strip has nowhere left to go.
+    #[test]
+    fn a_strip_keeps_the_wheel_only_while_it_moves() {
+        let max = 300.0;
+        assert!(wheel_moved(-100.0, -140.0, max), "mid-strip");
+        assert!(wheel_moved(-290.0, -330.0, max), "arriving at the end");
+        assert!(!wheel_moved(-300.0, -340.0, max), "already at the end");
+        assert!(
+            !wheel_moved(-340.0, -380.0, max),
+            "a second event before the strip is clamped"
+        );
+        assert!(!wheel_moved(0.0, 40.0, max), "already at the start");
+        assert!(wheel_moved(-300.0, -260.0, max), "back from the end");
+        assert!(
+            !wheel_moved(0.0, -40.0, 0.0),
+            "a strip that fits never moves"
+        );
     }
 
     /// A tab longer than the view lines up its start from either side,
