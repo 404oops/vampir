@@ -548,7 +548,7 @@ impl Render for Gallery {
         let body = match page {
             Page::Controls => self.page_controls(palette, cx),
             Page::Fields => self.page_fields(palette, window, cx),
-            Page::Data => self.page_data(palette, cx),
+            Page::Data => self.page_data(palette, window, cx),
             Page::Colour => self.page_colour(palette, cx),
         };
         // Keyed by the page, not the tab's position, so reordering the tabs
@@ -1086,7 +1086,12 @@ impl Gallery {
 }
 
 impl Gallery {
-    fn page_data(&mut self, palette: Palette, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn page_data(
+        &mut self,
+        palette: Palette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let columns = [
             Column::new("name", "Name"),
             Column::new("size", "Size").width(80.0).numeric(),
@@ -1205,7 +1210,8 @@ impl Gallery {
         .into_iter()
         .map(Into::into)
         .collect();
-        // The fades land on the card the list sits in, not on a flat surface.
+        // The fades land near enough on the card the list sits in; a flat
+        // surface colour would show as a band against its lit gradient.
         let (card_top, card_bottom) = lit_stops(palette.area_surface, CARD_LIFT);
         let selection_list = selectable_list(
             "selectable-files",
@@ -1214,6 +1220,7 @@ impl Gallery {
             card_top,
             card_bottom,
             WidgetContext::new(palette, self, cx),
+            window,
             selection_order.iter().map(|label| {
                 div()
                     .h(px(34.0))

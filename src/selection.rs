@@ -70,14 +70,22 @@ fn navigation_target(key: Key, index: usize, count: usize) -> Option<usize> {
 /// Only the active row gets the list's focus handle, so Tab crosses even a
 /// very long list in one step. Click, Cmd/Ctrl-click and Shift-click are
 /// reported as selection intents; Up/Down/Home/End, Shift-arrows,
-/// Cmd/Ctrl+A, Enter and Escape use the same callback, and the arrows
-/// scroll their target into view. `on_intent` is handed the order the rows
+/// Cmd/Ctrl+A, Enter or Space and Escape use the same callback, and the
+/// arrows scroll their target into view. `on_intent` is handed the order the rows
 /// were drawn in, so the host applies the intent to its [`ListSelection`]
 /// without keeping a copy for the listener, and decides what activating an
 /// item does. Escape with nothing selected goes on to the root.
 ///
-/// `start` and `end` are the colours behind the list at its top and bottom
-/// edges, as for [`scroll_fades`]: the fades have to land on them exactly.
+/// `start` and `end` are the colours of the surface behind the list's top
+/// and bottom edges, as for [`scroll_fades`]. The closer they are, the less
+/// a fade shows as a band of its own. The list cannot see where it sits on
+/// a lit surface, so inside a [`card`](crate::card) pass the card's own two
+/// ends, which are near enough on a surface lit this gently.
+///
+/// `rows` is drawn while `ctx` holds `cx`, so a lazy iterator cannot use
+/// `cx` itself: build interactive row content — a button, a checkbox — into
+/// a `Vec<AnyElement>` first and pass that.
+///
 /// Give the returned element a height so a long list has a viewport to
 /// scroll in.
 ///
@@ -85,7 +93,7 @@ fn navigation_target(key: Key, index: usize, count: usize) -> Option<usize> {
 /// let (top, bottom) = lit_stops(palette.area_surface, CARD_LIFT);
 /// selectable_list(
 ///     "files", &order, &self.selection, top, bottom,
-///     WidgetContext::new(palette, self, cx),
+///     WidgetContext::new(palette, self, cx), window,
 ///     order.iter().map(|name| div().child(name.clone())),
 ///     |this, order, intent, _window, _cx| this.selection.apply(order, intent),
 /// )
@@ -99,6 +107,7 @@ pub fn selectable_list<V: ControlHost, E: IntoElement>(
     start: Rgba,
     end: Rgba,
     mut ctx: WidgetContext<'_, '_, '_, V>,
+    window: &mut Window,
     rows: impl IntoIterator<Item = E>,
     on_intent: impl Fn(&mut V, &[SharedString], SelectionIntent, &mut Window, &mut Context<V>) + 'static,
 ) -> Div {
@@ -107,6 +116,22 @@ pub fn selectable_list<V: ControlHost, E: IntoElement>(
     let order: Rc<[SharedString]> = order.into();
     let on_intent: OnIntent<V> = Rc::new(on_intent);
     let active = active_index(&order, selection.active());
+    let focus = ctx.state().focus(id, ctx.cx);
+    if order.is_empty() && focus.is_focused(window) {
+        // Filtered to nothing with the keyboard on it: the row holding the
+        // handle is gone, and GPUI dispatches nothing from a handle that is
+        // no longer drawn, not even the root's shortcuts.
+        ctx.state().focus_root(window, ctx.cx);
+    }
+    let rows: Vec<E> = rows.into_iter().collect();
+    // A short iterator would leave the arrows and Shift ranges reaching ids
+    // with no row drawn for them, and the keyboard vanishing along with the
+    // ring.
+    debug_assert_eq!(
+        rows.len(),
+        order.len(),
+        "selectable_list `{id}`: one row of content per id in `order`"
+    );
     let mut list = div()
         .id(ElementId::Name(format!("{id}-selection-scroll").into()))
         .size_full()
@@ -448,6 +473,17 @@ mod tests {
     }
 
     #[test]
+    fn shift_back_toward_the_anchor_shrinks_the_range() {
+        let order = order();
+        let mut selection = ListSelection::new();
+        selection.apply(&order, choose("b", false, false));
+        selection.apply(&order, choose("d", true, false));
+        assert_eq!(selection.selected_in(&order), vec!["b", "c", "d"]);
+        selection.apply(&order, choose("c", true, false));
+        assert_eq!(selection.selected_in(&order), vec!["b", "c"]);
+    }
+
+    #[test]
     fn secondary_shift_adds_a_range_to_the_selection() {
         let order = order();
         let mut selection = ListSelection::new();
@@ -488,6 +524,13 @@ mod tests {
         assert!(!secondary_only(&Modifiers {
             alt: true,
             ..secondary
+        }));
+        // Cmd-Ctrl on macOS; on other platforms Ctrl with the Windows or
+        // Super key, which is just as much someone else's.
+        assert!(!secondary_only(&Modifiers {
+            control: true,
+            platform: true,
+            ..Modifiers::none()
         }));
         assert!(!secondary_only(&Modifiers::none()));
     }
