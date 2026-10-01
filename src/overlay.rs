@@ -349,7 +349,8 @@ pub fn fuzzy_filter(query: &str, commands: &[Command]) -> Vec<Command> {
 /// at once would scatter them into a heading per row. The label, the detail
 /// and the section are all searched, so "book" finds everything under
 /// Bookmarks. Ties keep the order the sources were assembled in, and an
-/// empty query keeps everything as it was.
+/// empty query keeps source order within each section and puts sections in
+/// their first-seen order.
 pub fn rank_results(query: &str, results: &[SearchResult]) -> Vec<SearchResult> {
     // Scored on the label alone: it is what the person reads and
     // abbreviates, and the score's length penalty would otherwise let a
