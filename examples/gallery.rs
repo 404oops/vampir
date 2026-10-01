@@ -24,10 +24,10 @@ use vampir::{
     Command, ControlHost, ControlState, DialogButton, Hint, InputStyle, MAX_CHROMA, MenuItem,
     Oklch, Palette, Scheme, ScrollAxis, SearchResult, SliderTrack, SortDirection, Span, TEXT_SIZE,
     TITLE_TEXT_SIZE, Tab, TextInput, Theme, TreeRow, WidgetContext, arriving, badge, bind_keys,
-    button, caption, card, checkbox, chip_group, collapsible, color_pad, column, combo,
-    command_palette, context_menu, dialog, edit_menu, fading_text, flatten_tree, fuzzy_score,
-    glyph, ground, hue_picker, hue_slider, hue_wheel, icon_button, labelled, lit, menu_button,
-    menu_target, progress_bar, radio_group, ranked_command_palette, ranked_search_list, reorder,
+    button, caption, card, card_at, checkbox, chip_group, collapsible, color_pad, column, combo,
+    command_palette, context_menu, dialog, edit_menu, fading_text, flatten_tree, glyph, ground,
+    hue_picker, hue_slider, hue_wheel, icon_button, labelled, lit, menu_button, menu_target,
+    progress_bar, radio_group, rank_results, ranked_command_palette, ranked_search_list, reorder,
     row, saturation_picker, scheme_picker, scroll_area, search_list, segmented, separator,
     shortcut_recorder, slider, spinbox, spinner, split_area, split_handle, swatch_grid, switch,
     tab_bar, table_header, table_row, text_area, text_field, tree_row, ui_font,
@@ -581,36 +581,16 @@ impl Gallery {
         self.note(format!("Opened {label}"), cx);
     }
 
+    /// Every source's results, best first. History stands for a source
+    /// that answers late, and only joins once its button says it has.
     fn ranked_results(&self, query: &str) -> Vec<SearchResult> {
-        let query = query.trim();
-        let mut scored: Vec<(i32, &SearchResult)> = self
+        let loaded: Vec<SearchResult> = self
             .ranked_items
             .iter()
             .filter(|result| self.history_loaded || result.section.as_deref() != Some("History"))
-            .filter_map(|result| {
-                let score = if query.is_empty() {
-                    0
-                } else {
-                    fuzzy_score(
-                        query,
-                        &format!(
-                            "{} {} {}",
-                            result.label,
-                            result.detail.as_deref().unwrap_or(""),
-                            result.section.as_deref().unwrap_or("")
-                        ),
-                    )?
-                };
-                Some((score, result))
-            })
+            .cloned()
             .collect();
-        if !query.is_empty() {
-            scored.sort_by_key(|item| std::cmp::Reverse(item.0));
-        }
-        scored
-            .into_iter()
-            .map(|(_, result)| result.clone())
-            .collect()
+        rank_results(query, &loaded)
     }
 
     fn minimize(&mut self, _: &MinimizeWindow, window: &mut Window, _cx: &mut Context<Self>) {
@@ -1173,11 +1153,14 @@ impl Gallery {
                 column()
                     .child(labelled(
                         palette,
-                        "Empty query: click the field, press Down to scroll results, then Enter. Try ‘design’ + Add history to rerank.",
+                        "Several sources, ranked as you type — history arrives late",
                         ranked_search_list(
                             "ranked-search",
                             &self.ranked_query,
                             &ranked_results,
+                            // The card is a gradient; this is its colour
+                            // about where the list's fades sit.
+                            card_at(palette, 0.75),
                             WidgetContext::new(palette, self, cx),
                             window,
                             |this, id, _window, cx| this.note(format!("Opened {id}"), cx),

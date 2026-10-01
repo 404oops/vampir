@@ -103,12 +103,6 @@ impl From<String> for Tag {
     }
 }
 
-impl From<&String> for Tag {
-    fn from(text: &String) -> Self {
-        Tag::new(text.as_str())
-    }
-}
-
 impl From<SharedString> for Tag {
     fn from(text: SharedString) -> Self {
         Tag::new(text.as_ref())
@@ -222,11 +216,29 @@ enum Record {
     },
     /// A group of rows: the frame its current run of frames began in.
     Streak { started: u32 },
-    /// The keyboard's row in a filtering list, and a hash of the query the
-    /// row belongs to.
-    List { highlight: usize, query: u64 },
+    /// The keyboard's row in a filtering list, a hash of the query the row
+    /// belongs to, and the tag of the result it was on when the list was
+    /// last drawn, or zero before it has been drawn with ids.
+    List {
+        highlight: usize,
+        query: u64,
+        item: u64,
+    },
     /// Where something painted last frame.
     Bounds(Bounds<Pixels>),
+}
+
+/// What [`ControlState::follow_list`] did to a list's keyboard row, which
+/// tells a scrolling list what to do with its scroll.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ListChange {
+    /// The row is where it was.
+    Same,
+    /// A new query, or the highlighted result went away: back to the
+    /// first row, and the list back to its top.
+    Reset,
+    /// The highlighted result moved, and the row went with it.
+    Moved,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -856,43 +868,100 @@ impl ControlState {
 
     // ---- Filtering lists ----
 
-    /// Which row the keyboard is on in list `list`, given the query or
-    /// result-set identity it is currently filtered by. A changed identity
-    /// puts it back on the first row, so asynchronous re-ranking never
-    /// leaves the keyboard pointing at a different result by accident.
-    pub fn list_highlight(&self, list: impl Into<Tag>, query: impl Into<Tag>) -> usize {
-        self.list_highlight_with_change(list, query).0
+    /// Which row the keyboard is on in list `list`, given the query the
+    /// list is currently filtered by. A changed query puts it back on the
+    /// first row: the rows have been re-ranked, and the best match is the
+    /// one the person most likely means.
+    pub fn list_highlight(&self, list: impl Into<Tag>, query: &str) -> usize {
+        let hash = Tag::new(query).0;
+        let frame = self.frame.get();
+        let mut records = self.records.borrow_mut();
+        let entry = records
+            .entry(Kind::List.slot(list.into()))
+            .or_insert(Entry {
+                touched: frame,
+                record: Record::List {
+                    highlight: 0,
+                    query: hash,
+                    item: 0,
+                },
+            });
+        entry.touched = frame;
+        let Record::List {
+            highlight,
+            query,
+            item,
+        } = &mut entry.record
+        else {
+            return 0;
+        };
+        if *query != hash {
+            *query = hash;
+            *highlight = 0;
+            *item = 0;
+        }
+        *highlight
     }
 
-    /// Also reports whether the query or result identity changed, so a
-    /// tracked result viewport can return to its new first row.
-    pub(crate) fn list_highlight_with_change(
+    /// [`list_highlight`](Self::list_highlight) for a list that knows its
+    /// rows' ids, which keeps the keyboard on a result rather than on a
+    /// row. A new query still goes back to the first row. Results that
+    /// change under the same query — a slow source arriving, a host
+    /// re-ranking — take the highlight with the result it was on, so Enter
+    /// never picks something the person did not arrow to; only if that
+    /// result has gone does it fall back to the first row.
+    pub(crate) fn follow_list(
         &self,
         list: impl Into<Tag>,
-        query: impl Into<Tag>,
-    ) -> (usize, bool) {
-        let hash = query.into().0;
+        query: &str,
+        ids: &[SharedString],
+    ) -> (usize, ListChange) {
+        let hash = Tag::new(query).0;
+        let tag = |id: &SharedString| Tag::from(id).0;
         let frame = self.frame.get();
         let mut records = self.records.borrow_mut();
         let slot = Kind::List.slot(list.into());
+        // A list arriving afresh starts at the top, wherever a scroll
+        // handle that outlived its last showing was left.
         let fresh = !records.contains_key(&slot);
         let entry = records.entry(slot).or_insert(Entry {
             touched: frame,
             record: Record::List {
                 highlight: 0,
                 query: hash,
+                item: 0,
             },
         });
         entry.touched = frame;
-        let Record::List { highlight, query } = &mut entry.record else {
-            return (0, false);
+        let Record::List {
+            highlight,
+            query,
+            item,
+        } = &mut entry.record
+        else {
+            return (0, ListChange::Same);
         };
-        let changed = fresh || *query != hash;
-        if changed {
+        let change = if fresh || *query != hash {
             *query = hash;
             *highlight = 0;
-        }
-        (*highlight, changed)
+            ListChange::Reset
+        } else if *item != 0 && ids.get(*highlight).map(tag) != Some(*item) {
+            match ids.iter().position(|id| tag(id) == *item) {
+                Some(index) => {
+                    *highlight = index;
+                    ListChange::Moved
+                }
+                None => {
+                    *highlight = 0;
+                    ListChange::Reset
+                }
+            }
+        } else {
+            ListChange::Same
+        };
+        *highlight = (*highlight).min(ids.len().saturating_sub(1));
+        *item = ids.get(*highlight).map_or(0, tag);
+        (*highlight, change)
     }
 
     /// The keyboard's row in list `list` as last set, whatever the query.
@@ -908,20 +977,40 @@ impl ControlState {
 
     /// Puts the keyboard on row `index` of list `list`.
     pub fn highlight_list(&self, list: impl Into<Tag>, index: usize) {
+        self.set_list_highlight(list.into(), index, 0);
+    }
+
+    /// Puts the keyboard on row `index` of list `list`, which shows result
+    /// `id` there. Naming the result as well as the row lets
+    /// [`follow_list`](Self::follow_list) keep the keyboard on it even if
+    /// the results change before the list is next drawn.
+    pub(crate) fn highlight_list_item(
+        &self,
+        list: impl Into<Tag>,
+        index: usize,
+        id: &SharedString,
+    ) {
+        self.set_list_highlight(list.into(), index, Tag::from(id).0);
+    }
+
+    fn set_list_highlight(&self, list: Tag, index: usize, to: u64) {
         let frame = self.frame.get();
         let mut records = self.records.borrow_mut();
-        let entry = records
-            .entry(Kind::List.slot(list.into()))
-            .or_insert(Entry {
-                touched: frame,
-                record: Record::List {
-                    highlight: index,
-                    query: Tag::new("").0,
-                },
-            });
+        let entry = records.entry(Kind::List.slot(list)).or_insert(Entry {
+            touched: frame,
+            record: Record::List {
+                highlight: index,
+                query: Tag::new("").0,
+                item: to,
+            },
+        });
         entry.touched = frame;
-        if let Record::List { highlight, .. } = &mut entry.record {
+        if let Record::List {
+            highlight, item, ..
+        } = &mut entry.record
+        {
             *highlight = index;
+            *item = to;
         }
     }
 
@@ -1830,7 +1919,7 @@ pub fn end_drags<V: ControlHost>(host: &mut V, cx: &mut Context<V>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlState, Entry, Palette, SCHEME_FADE, TabDrag, Tag, TrackAxis};
+    use super::{ControlState, Entry, ListChange, Palette, SCHEME_FADE, TabDrag, Tag, TrackAxis};
     use gpui::{Bounds, ElementId, Point, SharedString, px, size};
 
     fn at(x: f32, y: f32) -> Point<gpui::Pixels> {
@@ -2333,23 +2422,74 @@ mod tests {
         assert_eq!(state.list_position("commands"), 4);
     }
 
+    fn ids(names: &[&'static str]) -> Vec<SharedString> {
+        names.iter().map(|name| SharedString::from(*name)).collect()
+    }
+
+    /// Arrowing to a result and then having a slow source land must leave
+    /// Enter on the result that was arrowed to, not on whatever is now in
+    /// its row.
     #[test]
-    fn re_ranked_results_do_not_leave_the_keyboard_on_another_item() {
+    fn the_highlight_stays_on_its_result_as_sources_arrive() {
         let state = ControlState::new();
-        let original = ["tab", "bookmark", "history"];
-        let updated = ["history", "tab", "bookmark"];
+        let first = ids(&["tab", "bookmark", "file", "action"]);
         assert_eq!(
-            state.list_highlight_with_change("results", ("des", original)),
-            (0, true)
+            state.follow_list("results", "des", &first).1,
+            ListChange::Reset
         );
+        state.highlight_list_item("results", 3, &first[3]);
+
+        let appended = ids(&["tab", "bookmark", "file", "action", "remote"]);
+        assert_eq!(
+            state.follow_list("results", "des", &appended),
+            (3, ListChange::Same)
+        );
+
+        let ranked_above = ids(&["tab", "history", "bookmark", "file", "action", "remote"]);
+        assert_eq!(
+            state.follow_list("results", "des", &ranked_above),
+            (4, ListChange::Moved)
+        );
+        assert_eq!(
+            state.follow_list("results", "des", &ranked_above),
+            (4, ListChange::Same)
+        );
+
+        let gone = ids(&["tab", "history"]);
+        assert_eq!(
+            state.follow_list("results", "des", &gone),
+            (0, ListChange::Reset)
+        );
+    }
+
+    #[test]
+    fn a_new_query_puts_a_followed_list_back_on_its_first_row() {
+        let state = ControlState::new();
+        let results = ids(&["tab", "bookmark", "file"]);
+        state.follow_list("results", "de", &results);
+        state.highlight_list_item("results", 2, &results[2]);
+        assert_eq!(
+            state.follow_list("results", "des", &results),
+            (0, ListChange::Reset)
+        );
+    }
+
+    /// A host moving the highlight by row alone has it followed from the
+    /// next time the list is drawn.
+    #[test]
+    fn a_row_set_by_the_host_is_followed_once_drawn() {
+        let state = ControlState::new();
+        let results = ids(&["tab", "bookmark", "file"]);
+        state.follow_list("results", "", &results);
         state.highlight_list("results", 1);
         assert_eq!(
-            state.list_highlight_with_change("results", ("des", original)),
-            (1, false)
+            state.follow_list("results", "", &results),
+            (1, ListChange::Same)
         );
+        let reordered = ids(&["bookmark", "tab", "file"]);
         assert_eq!(
-            state.list_highlight_with_change("results", ("des", updated)),
-            (0, true)
+            state.follow_list("results", "", &reordered),
+            (0, ListChange::Moved)
         );
     }
 

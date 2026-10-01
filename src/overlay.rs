@@ -3,11 +3,12 @@
 
 use std::ops::Range;
 use std::rc::Rc;
+use std::time::Instant;
 
 use gpui::{
     AnyElement, AnyView, App, Context, Div, ElementId, Entity, FontWeight, InteractiveElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, Render, ScrollHandle, SharedString, StyledText,
-    Window, deferred, div, point, prelude::*, px,
+    KeyDownEvent, MouseButton, MouseDownEvent, Point, Render, Rgba, ScrollHandle, SharedString,
+    StyledText, Window, deferred, div, point, prelude::*, px,
 };
 
 use crate::controls::{WidgetContext, search_field};
@@ -15,7 +16,9 @@ use crate::easing::{ease_out_cubic, progress};
 use crate::keyboard::{self, Dismiss, Key, Orientation};
 use crate::lighting;
 use crate::palette::Palette;
-use crate::state::{COMBO_REVEAL, ComboId, ControlHost, MOVE, SWITCH_SLIDE, Tag};
+use crate::state::{
+    COMBO_REVEAL, ComboId, ControlHost, ControlState, ListChange, MOVE, SWITCH_SLIDE, Tag,
+};
 use crate::text_input::{self as text, TextInput};
 
 // ---- Tooltip ----------------------------------------------------------------
@@ -179,19 +182,42 @@ impl Command {
     }
 }
 
-/// One result from a host-ranked search. Its position is already its rank;
-/// [`ranked_search_list`] and [`ranked_command_palette`] never filter or sort
-/// it. The host may replace the slice when another source finishes loading.
-/// Result ids must be unique within one list and stable across updates.
-#[derive(Clone)]
+/// One result from a host-ranked search. Its position is already its rank:
+/// [`ranked_search_list`] and [`ranked_command_palette`] never filter or
+/// sort it, and [`rank_results`] is there for a host that wants the
+/// toolkit's fuzzy ranking rather than its own.
+///
+/// The host may replace the slice at any time, as each source finishes
+/// loading. Ids must be unique within one list and stable across updates:
+/// the keyboard's highlight stays on a result by its id, so a source that
+/// lands after the person has arrowed down takes the highlight along with
+/// the result it was on, rather than leaving Enter on whatever now fills
+/// that row.
+#[derive(Clone, Debug)]
 pub struct SearchResult {
     pub id: SharedString,
     pub label: SharedString,
+    /// A second, quieter line under the label.
     pub detail: Option<SharedString>,
     /// Shown once before each run of results from the same source.
     pub section: Option<SharedString>,
     pub shortcut: Option<SharedString>,
-    leading: Option<Rc<dyn Fn(Palette) -> AnyElement>>,
+    leading: Option<Leading>,
+    /// A [`Command`]'s group, which a [`command_list`] shows before the
+    /// label rather than as a heading: commands are ranked across groups,
+    /// so one group's commands seldom arrive in a run.
+    group: Option<SharedString>,
+}
+
+/// The host's drawing for a result's leading slot, in a type of its own so
+/// that [`SearchResult`] can still be `Debug`.
+#[derive(Clone)]
+struct Leading(Rc<dyn Fn(Palette) -> AnyElement>);
+
+impl std::fmt::Debug for Leading {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Leading(..)")
+    }
 }
 
 impl SearchResult {
@@ -203,6 +229,7 @@ impl SearchResult {
             section: None,
             shortcut: None,
             leading: None,
+            group: None,
         }
     }
 
@@ -228,8 +255,23 @@ impl SearchResult {
         mut self,
         render: impl Fn(Palette) -> E + 'static,
     ) -> Self {
-        self.leading = Some(Rc::new(move |palette| render(palette).into_any_element()));
+        self.leading = Some(Leading(Rc::new(move |palette| {
+            render(palette).into_any_element()
+        })));
         self
+    }
+}
+
+/// A command as a result row, so commands and results share one drawing.
+fn command_result(command: &Command) -> SearchResult {
+    SearchResult {
+        id: command.id.clone(),
+        label: command.label.clone(),
+        detail: None,
+        section: None,
+        shortcut: command.shortcut.clone(),
+        leading: None,
+        group: command.group.clone(),
     }
 }
 
@@ -277,33 +319,57 @@ pub fn fuzzy_score(query: &str, candidate: &str) -> Option<i32> {
     Some(score - (candidate.chars().count() as i32 / 8))
 }
 
+/// Items whose text matches a query, best first. The sort is stable, so
+/// ties keep their original order and a host's own ranking survives where
+/// the score cannot separate two — and an empty query, which scores
+/// everything alike, leaves the list exactly as it was.
+fn fuzzy_rank<T: Clone>(query: &str, items: &[T], text: impl Fn(&T) -> String) -> Vec<T> {
+    let mut scored: Vec<(i32, &T)> = items
+        .iter()
+        .filter_map(|item| fuzzy_score(query, &text(item)).map(|score| (score, item)))
+        .collect();
+    scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+    scored.into_iter().map(|(_, item)| item.clone()).collect()
+}
+
 /// Commands matching a query, best first. Ties keep their original order,
 /// so a host's own ranking survives where the score cannot separate two.
 pub fn fuzzy_filter(query: &str, commands: &[Command]) -> Vec<Command> {
-    let mut scored: Vec<(i32, usize, Command)> = commands
-        .iter()
-        .enumerate()
-        .filter_map(|(index, command)| {
-            let haystack = match &command.group {
-                Some(group) => format!("{group} {}", command.label),
-                None => command.label.to_string(),
-            };
-            fuzzy_score(query, &haystack).map(|score| (score, index, command.clone()))
-        })
-        .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    scored.into_iter().map(|(_, _, command)| command).collect()
+    fuzzy_rank(query, commands, |command| match &command.group {
+        Some(group) => format!("{group} {}", command.label),
+        None => command.label.to_string(),
+    })
 }
 
-/// Byte ranges to emphasize in displayed text. A whole word match reads
-/// best; when the host matched a fuzzy abbreviation, mark its letters.
-fn matched_ranges(text: &str, query: &str) -> Vec<Range<usize>> {
+/// Results matching a query, best first, for a host that would rather rank
+/// with [`fuzzy_score`] than with its own measure before handing them to
+/// [`ranked_search_list`] or [`ranked_command_palette`]. The label, the
+/// detail and the section are all searched, so "book" finds everything
+/// under Bookmarks. Ties keep the order the sources were assembled in, and
+/// an empty query keeps everything as it was.
+pub fn rank_results(query: &str, results: &[SearchResult]) -> Vec<SearchResult> {
+    fuzzy_rank(query, results, |result| {
+        let mut text = result.label.to_string();
+        for part in [&result.detail, &result.section].into_iter().flatten() {
+            text.push(' ');
+            text.push_str(part);
+        }
+        text
+    })
+}
+
+/// Byte ranges to emphasise in displayed text. A whole word match reads
+/// best. Failing one, `scattered` marks the letters of a fuzzy abbreviation
+/// wherever they fall — right for a label, which is what the person was
+/// abbreviating, but on a detail line it only picks out stray letters that
+/// happened to come in the right order.
+fn matched_ranges(text: &str, query: &str, scattered: bool) -> Vec<Range<usize>> {
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     let same = |a: char, b: char| a.to_lowercase().eq(b.to_lowercase());
     let mut ranges = Vec::new();
     for word in query.split_whitespace() {
         let needle: Vec<char> = word.chars().collect();
-        let positions = (0..=chars.len().saturating_sub(needle.len()))
+        let whole = (0..=chars.len().saturating_sub(needle.len()))
             .find(|&start| {
                 start + needle.len() <= chars.len()
                     && needle
@@ -311,23 +377,24 @@ fn matched_ranges(text: &str, query: &str) -> Vec<Range<usize>> {
                         .enumerate()
                         .all(|(offset, &ch)| same(chars[start + offset].1, ch))
             })
-            .map(|start| (start..start + needle.len()).collect::<Vec<_>>())
-            .or_else(|| {
-                let mut found = Vec::new();
-                let mut from = 0;
-                for &ch in &needle {
-                    let index = (from..chars.len()).find(|&i| same(chars[i].1, ch))?;
-                    found.push(index);
-                    from = index + 1;
-                }
-                Some(found)
-            });
-        if let Some(positions) = positions {
-            for index in positions {
-                let start = chars[index].0;
-                let end = chars.get(index + 1).map_or(text.len(), |next| next.0);
-                ranges.push(start..end);
+            .map(|start| (start..start + needle.len()).collect::<Vec<_>>());
+        let positions = whole.or_else(|| {
+            if !scattered {
+                return None;
             }
+            let mut found = Vec::new();
+            let mut from = 0;
+            for &ch in &needle {
+                let index = (from..chars.len()).find(|&i| same(chars[i].1, ch))?;
+                found.push(index);
+                from = index + 1;
+            }
+            Some(found)
+        });
+        for index in positions.into_iter().flatten() {
+            let start = chars[index].0;
+            let end = chars.get(index + 1).map_or(text.len(), |next| next.0);
+            ranges.push(start..end);
         }
     }
     ranges.sort_by_key(|range| range.start);
@@ -344,207 +411,266 @@ fn matched_ranges(text: &str, query: &str) -> Vec<Range<usize>> {
     merged
 }
 
-fn emphasized(text: &SharedString, query: &str) -> StyledText {
+fn emphasised(text: &SharedString, query: &str, scattered: bool) -> StyledText {
     StyledText::new(text.to_string()).with_highlights(
-        matched_ranges(text, query)
+        matched_ranges(text, query, scattered)
             .into_iter()
             .map(|range| (range, FontWeight::SEMIBOLD.into())),
     )
 }
 
-/// Renders a host-ranked set of results in the order supplied. Section names
-/// are quiet headings rather than selectable rows; only results count when
-/// Up, Down and Enter move the highlight.
-struct RankedRows {
-    elements: Vec<AnyElement>,
-    child_indices: Vec<usize>,
-    positions: Vec<f32>,
-}
+/// Height of one row in a [`command_list`], and of any result row without
+/// a detail line.
+pub const COMMAND_ROW_HEIGHT: f32 = 30.0;
+/// Height of a result row with a detail line under its label.
+const DETAIL_ROW_HEIGHT: f32 = 44.0;
+const SECTION_HEIGHT: f32 = 20.0;
+const ROW_GAP: f32 = 1.0;
+const ROW_INSET: f32 = 9.0;
+const LEADING_SIZE: f32 = 20.0;
+const ROW_SPACING: f32 = 8.0;
+/// The tallest an inline result list grows before it scrolls.
+const INLINE_RESULT_MAX_HEIGHT: f32 = 300.0;
+/// The same for the list in a palette, which has the window to itself.
+const PALETTE_RESULT_MAX_HEIGHT: f32 = 340.0;
 
 struct RowPlacement {
+    /// Whether a section heading goes above this row.
     heading: bool,
-    child_index: usize,
     top: f32,
     height: f32,
 }
 
-fn ranked_row_layout(results: &[SearchResult]) -> Vec<RowPlacement> {
-    let mut previous_section: Option<&str> = None;
-    let mut children = 0;
+/// Where each result sits in its list. Worked out from the row metrics
+/// rather than read back from the last layout, so a highlight that moved
+/// with its result can be scrolled to in the same frame the results
+/// changed, before anything has been laid out.
+fn row_layout(results: &[SearchResult]) -> Vec<RowPlacement> {
+    let mut previous: Option<&str> = None;
     let mut top = 0.0;
     results
         .iter()
         .map(|result| {
             let section = result.section.as_deref();
-            let heading = section.is_some() && section != previous_section;
+            let heading = section.is_some() && section != previous;
+            previous = section;
             if heading {
-                children += 1;
-                top += 21.0;
+                top += SECTION_HEIGHT + ROW_GAP;
             }
-            previous_section = section;
-            let height = if result.detail.is_some() { 44.0 } else { 32.0 };
+            let height = if result.detail.is_some() {
+                DETAIL_ROW_HEIGHT
+            } else {
+                COMMAND_ROW_HEIGHT
+            };
             let placement = RowPlacement {
                 heading,
-                child_index: children,
                 top,
                 height,
             };
-            children += 1;
-            top += height + 1.0;
+            top += height + ROW_GAP;
             placement
         })
         .collect()
 }
 
-fn ranked_result_rows<V: ControlHost>(
+/// How far a row or heading has arrived. A list that has just appeared
+/// arrives whole, with whatever brought it. Once it is up, rows the query
+/// lets through fade in at their place and rows that stay slide to their
+/// new one, so typing reads as the list being sifted rather than replaced.
+fn arrival(state: &ControlState, key: Tag, fresh: bool) -> f32 {
+    if fresh {
+        state.tween(key, 1.0, SWITCH_SLIDE)
+    } else {
+        state.tween_from(key, 0.0, 1.0, SWITCH_SLIDE)
+    }
+}
+
+/// The rows of a result list in the order given, and where each result
+/// sits. Section names are quiet headings rather than rows; only results
+/// take a keyboard step. `emphasis` is the text to pick out in each row.
+fn result_rows<V: ControlHost>(
     id: &'static str,
-    query: &str,
+    emphasis: &str,
     results: &[SearchResult],
     highlighted: usize,
     ctx: WidgetContext<'_, '_, '_, V>,
     on_activate: Activate<V>,
-) -> RankedRows {
+) -> (Vec<AnyElement>, Vec<Range<f32>>) {
     let WidgetContext { palette, view, cx } = ctx;
     let state = view.control_state();
     let fresh = !state.present(id);
-    let reduce_motion = cx.reduce_motion();
     let has_leading = results.iter().any(|result| result.leading.is_some());
-    let placements = ranked_row_layout(results);
-    let mut rows: Vec<AnyElement> = Vec::with_capacity(results.len() * 2);
-    let mut child_indices = Vec::with_capacity(results.len());
-    let mut positions = Vec::with_capacity(results.len());
-    for (index, (result, placement)) in results.iter().zip(&placements).enumerate() {
-        let section = result.section.as_deref();
+    let mut elements: Vec<AnyElement> = Vec::with_capacity(results.len());
+    let mut extents = Vec::with_capacity(results.len());
+    for (index, (result, placement)) in results.iter().zip(row_layout(results)).enumerate() {
         if placement.heading
-            && let Some(section) = section
+            && let Some(section) = &result.section
         {
-            let key = (id, "section-shown", &result.id);
-            let shown = if reduce_motion {
-                state.snap(key, 1.0)
-            } else if fresh {
-                state.tween(key, 1.0, SWITCH_SLIDE)
-            } else {
-                state.tween_from(key, 0.0, 1.0, SWITCH_SLIDE)
-            };
-            rows.push(
-                div()
-                    .h(px(20.0))
-                    .flex_none()
-                    .px(px(if has_leading { 37.0 } else { 9.0 }))
-                    .flex()
-                    .items_center()
-                    .opacity(shown)
-                    .text_size(px(11.5))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(palette.text_secondary)
-                    .child(section.to_string())
-                    .into_any_element(),
-            );
+            let shown = arrival(state, Tag::new((id, "section-shown", &result.id)), fresh);
+            elements.push(section_heading(section, has_leading, shown, palette));
         }
         let cx: &mut Context<V> = &mut *cx;
-        let command_id = result.id.clone();
-        let active = index == highlighted;
-        let key = |part: &'static str| Tag::new((id, part, &command_id));
-        let on = if reduce_motion {
-            state.snap(key("lit"), if active { 1.0 } else { 0.0 })
-        } else {
-            state.blend(key("lit"), active, SWITCH_SLIDE)
+        let look = RowLook {
+            active: index == highlighted,
+            has_leading,
+            fresh,
+            palette,
         };
-        let shown = if reduce_motion {
-            state.snap(key("shown"), 1.0)
-        } else if fresh {
-            state.tween(key("shown"), 1.0, SWITCH_SLIDE)
-        } else {
-            state.tween_from(key("shown"), 0.0, 1.0, SWITCH_SLIDE)
-        };
-        let offset = if reduce_motion {
-            state.snap(key("place"), placement.top);
-            0.0
-        } else {
-            state.tween(key("place"), placement.top, MOVE) - placement.top
-        };
-        let secondary = crate::color::lerp(palette.text_secondary, palette.soft_label, on);
-        let leading = result.leading.as_ref().map(|render| render(palette));
-        let on_activate = on_activate.clone();
-        child_indices.push(placement.child_index);
-        positions.push(placement.top);
-        rows.push(
-            div()
-                .id(ElementId::Name(format!("{id}-result-{}", result.id).into()))
-                .relative()
-                .top(px(offset))
-                .opacity(shown)
-                .h(px(placement.height))
-                .flex_none()
-                .w_full()
-                .px(px(9.0))
-                .flex()
-                .items_center()
-                .gap(px(8.0))
-                .rounded(px(5.0))
-                .cursor_pointer()
-                .text_size(px(12.5))
-                .text_color(crate::color::lerp(
-                    palette.text_primary,
-                    palette.soft_label,
-                    on,
-                ))
-                .when(on > 0.01, |el| {
-                    el.bg(lighting::lit_at(palette.soft_fill, 0.08, on))
-                })
-                .when(!active, |el| {
-                    el.hover(move |style| style.bg(palette.row_hover))
-                })
-                .on_click(cx.listener(move |this, _event, window, cx| {
-                    on_activate(this, command_id.clone(), window, cx);
-                    cx.notify();
-                }))
-                .when(has_leading, |el| {
-                    el.child(
-                        div()
-                            .size(px(20.0))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .children(leading),
-                    )
-                })
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .flex()
-                        .flex_col()
-                        .gap(px(2.0))
-                        .child(div().truncate().child(emphasized(&result.label, query)))
-                        .children(result.detail.as_ref().map(|detail| {
-                            div()
-                                .truncate()
-                                .text_size(px(11.5))
-                                .text_color(secondary)
-                                .child(emphasized(detail, query))
-                        })),
-                )
-                .children(result.shortcut.clone().map(|shortcut| {
-                    div()
-                        .flex_none()
-                        .text_size(px(11.5))
-                        .text_color(secondary)
-                        .child(shortcut)
-                }))
-                .into_any_element(),
-        );
+        elements.push(result_row(
+            id,
+            result,
+            emphasis,
+            &placement,
+            look,
+            state,
+            cx,
+            on_activate.clone(),
+        ));
+        extents.push(placement.top..placement.top + placement.height);
     }
-    RankedRows {
-        elements: rows,
-        child_indices,
-        positions,
-    }
+    (elements, extents)
 }
 
-/// Height of one row in a [`command_list`].
-pub const COMMAND_ROW_HEIGHT: f32 = 30.0;
+fn section_heading(
+    section: &SharedString,
+    has_leading: bool,
+    shown: f32,
+    palette: Palette,
+) -> AnyElement {
+    // Over the labels rather than the icons, so a heading reads as the
+    // title of the run of results under it.
+    let inset = if has_leading {
+        ROW_INSET + LEADING_SIZE + ROW_SPACING
+    } else {
+        ROW_INSET
+    };
+    div()
+        .h(px(SECTION_HEIGHT))
+        .flex_none()
+        .px(px(inset))
+        .flex()
+        .items_center()
+        .opacity(shown)
+        .text_size(px(11.5))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(palette.text_secondary)
+        .child(section.clone())
+        .into_any_element()
+}
+
+#[derive(Clone, Copy)]
+struct RowLook {
+    active: bool,
+    has_leading: bool,
+    fresh: bool,
+    palette: Palette,
+}
+
+/// One row of a result list or a command list: the same chrome for both,
+/// so a command palette and a results palette cannot drift apart.
+#[allow(clippy::too_many_arguments)]
+fn result_row<V: ControlHost>(
+    id: &'static str,
+    result: &SearchResult,
+    emphasis: &str,
+    placement: &RowPlacement,
+    look: RowLook,
+    state: &ControlState,
+    cx: &mut Context<V>,
+    on_activate: Activate<V>,
+) -> AnyElement {
+    let RowLook {
+        active,
+        has_leading,
+        fresh,
+        palette,
+    } = look;
+    let key = |part: &'static str| Tag::new((id, part, &result.id));
+    // Keyed by the result rather than the row, so the highlight and the
+    // fade belong to the result as it moves.
+    let on = state.blend(key("lit"), active, SWITCH_SLIDE);
+    // Secondary ink is for unselected rows; all selected text needs
+    // the foreground paired with the accent surface underneath it.
+    let secondary = crate::color::lerp(palette.text_secondary, palette.soft_label, on);
+    let shown = arrival(state, key("shown"), fresh);
+    let offset = state.tween(key("place"), placement.top, MOVE) - placement.top;
+    let picked = result.id.clone();
+    div()
+        .id(ElementId::Name(format!("{id}-result-{}", result.id).into()))
+        .relative()
+        .top(px(offset))
+        .opacity(shown)
+        .h(px(placement.height))
+        .flex_none()
+        .w_full()
+        .px(px(ROW_INSET))
+        .flex()
+        .items_center()
+        .gap(px(ROW_SPACING))
+        .rounded(px(5.0))
+        .cursor_pointer()
+        .text_size(px(12.5))
+        .text_color(crate::color::lerp(
+            palette.text_primary,
+            palette.soft_label,
+            on,
+        ))
+        .when(on > 0.01, |el| {
+            el.bg(lighting::lit_at(palette.soft_fill, 0.08, on))
+        })
+        .when(!active, |el| {
+            el.hover(move |style| style.bg(palette.row_hover))
+        })
+        .on_click(cx.listener(move |this, _event, window, cx| {
+            on_activate(this, picked.clone(), window, cx);
+            cx.notify();
+        }))
+        .when(has_leading, |el| {
+            el.child(
+                div()
+                    .size(px(LEADING_SIZE))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .children(result.leading.as_ref().map(|leading| (leading.0)(palette))),
+            )
+        })
+        .children(
+            result
+                .group
+                .clone()
+                .map(|group| div().flex_none().text_color(secondary).child(group)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .truncate()
+                        .child(emphasised(&result.label, emphasis, true)),
+                )
+                .children(result.detail.as_ref().map(|detail| {
+                    div()
+                        .truncate()
+                        .text_size(px(11.5))
+                        .text_color(secondary)
+                        .child(emphasised(detail, emphasis, false))
+                })),
+        )
+        .children(result.shortcut.clone().map(|shortcut| {
+            div()
+                .flex_none()
+                .text_size(px(11.5))
+                .text_color(secondary)
+                .child(shortcut)
+        }))
+        .into_any_element()
+}
 
 /// A list of matching commands, one row each, with one highlighted.
 ///
@@ -559,100 +685,18 @@ pub fn command_list<V: ControlHost>(
     ctx: WidgetContext<'_, '_, '_, V>,
     on_activate: impl Fn(&mut V, SharedString, &mut Window, &mut Context<V>) + 'static,
 ) -> Div {
-    let WidgetContext { palette, view, cx } = ctx;
     // A concrete `Div` rather than `impl IntoElement`: in the 2024 edition an
     // opaque return captures every input lifetime, which would keep `cx`
     // borrowed for as long as the list lived and stop the caller building
     // anything else with it.
-    let on_activate = Rc::new(on_activate);
-    let state = view.control_state();
-    // A list that has just appeared arrives whole, with whatever brought it.
-    // Once it is up, rows the query lets through fade in at their place and
-    // rows that stay slide to their new one, so typing reads as the list
-    // being sifted rather than replaced.
-    let fresh = !state.present(id);
-    let mut rows: Vec<AnyElement> = Vec::with_capacity(matches.len());
-    for (index, command) in matches.iter().enumerate() {
-        let cx: &mut Context<V> = &mut *cx;
-        let on_activate = on_activate.clone();
-        let command_id = command.id.clone();
-        let active = index == highlighted;
-        let key = |what: &'static str| Tag::new((id, what, &command_id));
-        // Keyed by the command rather than the row, so the highlight and the
-        // fade belong to the command as it moves.
-        let on = state.blend(key("lit"), active, SWITCH_SLIDE);
-        // Secondary ink is for unselected rows; all selected text needs
-        // the foreground paired with the accent surface underneath it.
-        let secondary = crate::color::lerp(palette.text_secondary, palette.soft_label, on);
-        let shown = if fresh {
-            state.tween(key("shown"), 1.0, SWITCH_SLIDE)
-        } else {
-            state.tween_from(key("shown"), 0.0, 1.0, SWITCH_SLIDE)
-        };
-        let place = index as f32 * (COMMAND_ROW_HEIGHT + 1.0);
-        let offset = state.tween(key("place"), place, MOVE) - place;
-        rows.push(
-            div()
-                .id(ElementId::NamedInteger(
-                    format!("{id}-command").into(),
-                    index as u64,
-                ))
-                .relative()
-                .top(px(offset))
-                .opacity(shown)
-                .h(px(COMMAND_ROW_HEIGHT))
-                .flex_none()
-                .w_full()
-                .px(px(9.0))
-                .flex()
-                .items_center()
-                .gap(px(8.0))
-                .rounded(px(5.0))
-                .cursor_pointer()
-                .text_size(px(12.5))
-                .text_color(crate::color::lerp(
-                    palette.text_primary,
-                    palette.soft_label,
-                    on,
-                ))
-                .when(on > 0.01, |el| {
-                    el.bg(lighting::lit_at(palette.soft_fill, 0.08, on))
-                })
-                .when(!active, |el| {
-                    el.hover(move |style| style.bg(palette.row_hover))
-                })
-                .on_click(cx.listener(move |this, _event, window, cx| {
-                    on_activate(this, command_id.clone(), window, cx);
-                    cx.notify();
-                }))
-                .children(
-                    command
-                        .group
-                        .clone()
-                        .map(|group| div().flex_none().text_color(secondary).child(group)),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .overflow_hidden()
-                        .child(command.label.clone()),
-                )
-                .children(command.shortcut.clone().map(|shortcut| {
-                    div()
-                        .flex_none()
-                        .text_size(px(11.5))
-                        .text_color(secondary)
-                        .child(shortcut)
-                }))
-                .into_any_element(),
-        );
-    }
+    let results: Vec<SearchResult> = matches.iter().map(command_result).collect();
+    let (rows, _) = result_rows(id, "", &results, highlighted, ctx, Rc::new(on_activate));
     // Clipped, so a row sliding up from where it was emerges from the list's
     // edge instead of crossing whatever sits below it.
     div()
         .flex()
         .flex_col()
-        .gap(px(1.0))
+        .gap(px(ROW_GAP))
         .overflow_hidden()
         .children(rows)
 }
@@ -680,14 +724,11 @@ pub fn search_list<V: ControlHost>(
     on_activate: impl Fn(&mut V, SharedString, &mut Window, &mut Context<V>) + 'static,
 ) -> Div {
     let palette = ctx.palette;
-    let view = ctx.view;
     let on_activate: Activate<V> = Rc::new(on_activate);
     let text = query.read(ctx.cx).text();
     let matches = fuzzy_filter(&text, items);
-    let highlighted = view
-        .control_state()
-        .list_highlight(id, text.as_str())
-        .min(matches.len().saturating_sub(1));
+    let ids: Rc<[SharedString]> = matches.iter().map(|command| command.id.clone()).collect();
+    let (highlighted, _) = ctx.view.control_state().follow_list(id, &text, &ids);
     let rows = {
         let on_activate = on_activate.clone();
         command_list(
@@ -699,7 +740,6 @@ pub fn search_list<V: ControlHost>(
         )
     };
     let cx: &mut Context<V> = &mut *ctx.cx;
-    let ids = matches.iter().map(|command| command.id.clone()).collect();
     let list = div()
         .flex()
         .flex_col()
@@ -709,120 +749,216 @@ pub fn search_list<V: ControlHost>(
     list_keys(list, id, ids, None, cx, on_activate)
 }
 
-/// A search field over results already filtered and ranked by the host.
-/// Source updates may replace `results` at any time; a changed query or
-/// result order resets the keyboard highlight to the first result. Section
-/// headings do not take a keyboard step. The supplied `id` identifies this
-/// list in [`ControlState`](crate::ControlState), just as for [`search_list`].
-/// Long result sets scroll within the list, leaving the query field in place.
+/// A search field over results the host has already filtered and ranked,
+/// in a list that scrolls under the field once it is taller than a few
+/// rows. The keys work as in [`search_list`], except that Page Up and Page
+/// Down move a viewport at a time; section headings take no keyboard step,
+/// and the highlighted row is kept in view.
+///
+/// The host may replace `results` at any time. A new query puts the
+/// highlight back on the first result and the list back at its top; results
+/// that change under the same query keep the highlight on the result it was
+/// on, by id, and scroll to keep it in view — see [`SearchResult`].
+/// `backdrop` is the surface the list sits on, which its edge fades land on,
+/// as for [`scroll_fades`](crate::scroll_fades). `id` identifies the list in
+/// [`ControlState`](crate::ControlState), as for [`search_list`].
 #[allow(clippy::too_many_arguments)]
 pub fn ranked_search_list<V: ControlHost>(
     id: &'static str,
     query: &Entity<TextInput>,
     results: &[SearchResult],
+    backdrop: Rgba,
     mut ctx: WidgetContext<'_, '_, '_, V>,
     window: &Window,
     on_activate: impl Fn(&mut V, SharedString, &mut Window, &mut Context<V>) + 'static,
 ) -> Div {
     let palette = ctx.palette;
     let text = query.read(ctx.cx).text();
-    let ids: Vec<SharedString> = results.iter().map(|result| result.id.clone()).collect();
-    let (highlighted, changed) = ctx
-        .view
-        .control_state()
-        .list_highlight_with_change(id, (text.as_str(), ids.as_slice()));
-    let highlighted = highlighted.min(results.len().saturating_sub(1));
-    let list_scroll = ctx.view.control_state().scroll((id, "list"));
-    if changed {
-        list_scroll.set_offset(Default::default());
-    }
     let on_activate: Activate<V> = Rc::new(on_activate);
-    let rows = ranked_result_rows(
+    let list = result_list(
         id,
         &text,
+        &text,
         results,
-        highlighted,
+        INLINE_RESULT_MAX_HEIGHT,
         ctx.reborrow(),
         on_activate.clone(),
     );
-    let navigation = Rc::new(ResultNavigation {
-        scroll: list_scroll.clone(),
-        child_indices: rows.child_indices,
-        positions: rows.positions,
-    });
     let state = ctx.view.control_state();
     let cx: &mut Context<V> = &mut *ctx.cx;
-    let list = div()
+    let element = div()
         .flex()
         .flex_col()
         .gap(px(6.0))
         .child(search_field(id, query, palette, window, cx))
+        .child(result_viewport(
+            id,
+            list.elements,
+            &list.navigation,
+            "No results",
+            backdrop,
+            palette,
+            state,
+        ));
+    list_keys(
+        element,
+        id,
+        list.ids,
+        Some(list.navigation),
+        cx,
+        on_activate,
+    )
+}
+
+/// A scrolling result list's rows, with what its keys need to move through
+/// them.
+struct ResultList {
+    elements: Vec<AnyElement>,
+    ids: Rc<[SharedString]>,
+    navigation: Rc<ResultNavigation>,
+}
+
+/// Draws a scrolling result list, keeping the keyboard's row on its result
+/// as the results change and the list's scroll in step with the row.
+#[allow(clippy::too_many_arguments)]
+fn result_list<V: ControlHost>(
+    id: &'static str,
+    query: &str,
+    emphasis: &str,
+    results: &[SearchResult],
+    max_height: f32,
+    ctx: WidgetContext<'_, '_, '_, V>,
+    on_activate: Activate<V>,
+) -> ResultList {
+    let ids: Rc<[SharedString]> = results.iter().map(|result| result.id.clone()).collect();
+    let state = ctx.view.control_state();
+    let (highlighted, change) = state.follow_list(id, query, &ids);
+    let scroll = state.scroll((id, "list"));
+    let (elements, rows) = result_rows(id, emphasis, results, highlighted, ctx, on_activate);
+    let navigation = Rc::new(ResultNavigation {
+        scroll,
+        rows,
+        max_height,
+    });
+    match change {
+        ListChange::Reset => navigation.scroll.set_offset(Point::default()),
+        ListChange::Moved => navigation.reveal(highlighted),
+        ListChange::Same => {}
+    }
+    ResultList {
+        elements,
+        ids,
+        navigation,
+    }
+}
+
+/// A result list's rows in a viewport that scrolls under the query field,
+/// which stays where it is.
+fn result_viewport(
+    id: &'static str,
+    rows: Vec<AnyElement>,
+    navigation: &ResultNavigation,
+    empty_message: &'static str,
+    backdrop: Rgba,
+    palette: Palette,
+    state: &ControlState,
+) -> Div {
+    let empty = rows.is_empty();
+    div()
+        .relative()
         .child(
             div()
-                .relative()
-                .child(
-                    div()
-                        .id(ElementId::Name(format!("{id}-list").into()))
-                        .max_h(px(INLINE_RESULT_MAX_HEIGHT))
-                        .flex()
-                        .flex_col()
-                        .gap(px(1.0))
-                        .overflow_y_scroll()
-                        .restrict_scroll_to_axis()
-                        .track_scroll(&list_scroll)
-                        .children(rows.elements)
-                        .when(results.is_empty(), |el| {
-                            el.child(
-                                div()
-                                    .h(px(30.0))
-                                    .px(px(9.0))
-                                    .flex()
-                                    .items_center()
-                                    .text_size(px(12.5))
-                                    .text_color(palette.text_secondary)
-                                    .child("No results"),
-                            )
-                        }),
-                )
-                .children(crate::scroll::scroll_fades(
-                    state,
-                    id,
-                    &list_scroll,
-                    crate::scroll::ScrollAxis::Vertical,
-                    palette.area_surface,
-                    palette.area_surface,
-                )),
-        );
-    list_keys(list, id, ids, Some(navigation), cx, on_activate)
+                .id(ElementId::Name(format!("{id}-list").into()))
+                .max_h(px(navigation.max_height))
+                .flex()
+                .flex_col()
+                .gap(px(ROW_GAP))
+                .overflow_y_scroll()
+                .restrict_scroll_to_axis()
+                .track_scroll(&navigation.scroll)
+                .children(rows)
+                .when(empty, |el| {
+                    el.child(
+                        div()
+                            .h(px(COMMAND_ROW_HEIGHT))
+                            .px(px(ROW_INSET))
+                            .flex()
+                            .items_center()
+                            .text_size(px(12.5))
+                            .font_weight(FontWeight::NORMAL)
+                            .text_color(palette.text_secondary)
+                            .child(empty_message),
+                    )
+                }),
+        )
+        // A long list fades at the edge that has more past it, rather than
+        // slicing a row in half.
+        .children(crate::scroll::scroll_fades(
+            state,
+            id,
+            &navigation.scroll,
+            crate::scroll::ScrollAxis::Vertical,
+            backdrop,
+            backdrop,
+        ))
 }
 
-const INLINE_RESULT_MAX_HEIGHT: f32 = 300.0;
-
+/// Where a scrolling list's results are, for the keys that move through it.
 struct ResultNavigation {
     scroll: ScrollHandle,
-    child_indices: Vec<usize>,
-    positions: Vec<f32>,
+    /// Each result's extent, top to bottom, in the list's own coordinates.
+    rows: Vec<Range<f32>>,
+    max_height: f32,
 }
 
-fn page_target(key: Key, current: usize, positions: &[f32], viewport: f32) -> Option<usize> {
-    let last = positions.len().checked_sub(1)?;
+impl ResultNavigation {
+    fn content_height(&self) -> f32 {
+        self.rows.last().map_or(0.0, |row| row.end)
+    }
+
+    fn viewport_height(&self) -> f32 {
+        self.content_height().min(self.max_height)
+    }
+
+    /// Scrolls just far enough to bring result `index` clear of the edge
+    /// fades.
+    fn reveal(&self, index: usize) {
+        let Some(row) = self.rows.get(index) else {
+            return;
+        };
+        let viewport = self.viewport_height();
+        let offset = self.scroll.offset();
+        let next = revealed_offset(
+            f32::from(offset.y),
+            self.content_height() - viewport,
+            0.0..viewport,
+            row.clone(),
+        );
+        self.scroll.set_offset(point(offset.x, px(next)));
+    }
+}
+
+/// The result a page away from `current`: the first whose top is a whole
+/// viewport past it, or the end of the list.
+fn page_target(key: Key, current: usize, rows: &[Range<f32>], viewport: f32) -> Option<usize> {
+    let last = rows.len().checked_sub(1)?;
     let current = current.min(last);
     let page = viewport.max(1.0);
     match key {
         Key::PageDown => {
-            let threshold = positions[current] + page;
+            let threshold = rows[current].start + page;
             Some(
                 ((current + 1)..=last)
-                    .find(|&index| positions[index] >= threshold)
+                    .find(|&index| rows[index].start >= threshold)
                     .unwrap_or(last),
             )
         }
         Key::PageUp => {
-            let threshold = positions[current] - page;
+            let threshold = rows[current].start - page;
             Some(
                 (0..current)
                     .rev()
-                    .find(|&index| positions[index] <= threshold)
+                    .find(|&index| rows[index].start <= threshold)
                     .unwrap_or(0),
             )
         }
@@ -830,6 +966,8 @@ fn page_target(key: Key, current: usize, positions: &[f32], viewport: f32) -> Op
     }
 }
 
+/// The scroll offset that shows `item` inside `viewport`, short of the
+/// edge fades, moving as little as it can.
 fn revealed_offset(offset: f32, max_offset: f32, viewport: Range<f32>, item: Range<f32>) -> f32 {
     let margin = crate::scroll::SCROLL_FADE.min((viewport.end - viewport.start) / 4.0);
     let wanted = if item.start + offset < viewport.start + margin {
@@ -842,89 +980,103 @@ fn revealed_offset(offset: f32, max_offset: f32, viewport: Range<f32>, item: Ran
     wanted.clamp(-max_offset.max(0.0), 0.0)
 }
 
-fn reveal_result(navigation: &ResultNavigation, index: usize) {
-    let scroll = &navigation.scroll;
-    let Some(item) = scroll.bounds_for_item(navigation.child_indices[index]) else {
-        return;
-    };
-    let viewport = scroll.bounds();
-    let offset = scroll.offset();
-    let next = revealed_offset(
-        f32::from(offset.y),
-        f32::from(scroll.max_offset().y),
-        f32::from(viewport.top())..f32::from(viewport.bottom()),
-        f32::from(item.top())..f32::from(item.bottom()),
-    );
-    scroll.set_offset(point(offset.x, px(next)));
-}
-
 fn navigate_list<V: ControlHost>(
     this: &mut V,
     id: &'static str,
-    count: usize,
+    ids: &[SharedString],
     key: Key,
     navigation: Option<&ResultNavigation>,
     cx: &mut Context<V>,
 ) {
+    let count = ids.len();
     let state = this.control_state();
     let here = state.list_position(id).min(count.saturating_sub(1));
     let moved = match (key, navigation) {
-        (Key::PageUp | Key::PageDown, Some(navigation)) => page_target(
-            key,
-            here,
-            &navigation.positions,
-            f32::from(navigation.scroll.bounds().size.height),
-        ),
+        (Key::PageUp | Key::PageDown, Some(navigation)) => {
+            page_target(key, here, &navigation.rows, navigation.viewport_height())
+        }
+        // A list that does not scroll has no page to measure, so Page moves
+        // ten, as it does on a slider.
         (Key::PageUp, None) => count.checked_sub(1).map(|_| here.saturating_sub(10)),
         (Key::PageDown, None) => count.checked_sub(1).map(|last| (here + 10).min(last)),
         _ => keyboard::step(key, Orientation::Vertical, here, count),
     };
-    if let Some(moved) = moved {
-        state.highlight_list(id, moved);
+    if let Some(moved) = moved
+        && let Some(picked) = ids.get(moved)
+    {
+        state.highlight_list_item(id, moved, picked);
         if let Some(navigation) = navigation {
-            reveal_result(navigation, moved);
+            navigation.reveal(moved);
         }
         cx.notify();
     }
 }
 
 /// Puts a filtering list's keys on the element that holds its query field:
-/// Up, Down and Page move the highlight through `ids`, Enter picks it.
+/// Up and Down move the highlight through `ids`, Page Up and Page Down move
+/// it a page, Enter picks the highlighted one.
 fn list_keys<V: ControlHost, E: InteractiveElement>(
     element: E,
     id: &'static str,
-    ids: Vec<SharedString>,
+    ids: Rc<[SharedString]>,
     navigation: Option<Rc<ResultNavigation>>,
     cx: &mut Context<V>,
     on_activate: Activate<V>,
 ) -> E {
-    let count = ids.len();
-    let up_navigation = navigation.clone();
-    let down_navigation = navigation.clone();
-    let page_navigation = navigation;
+    let step = {
+        let ids = ids.clone();
+        Rc::new(move |this: &mut V, key: Key, cx: &mut Context<V>| {
+            navigate_list(this, id, &ids, key, navigation.as_deref(), cx);
+        })
+    };
+    let step_down = step.clone();
+    let step_page = step.clone();
     element
         .on_action(cx.listener(move |this, _: &text::Up, _window, cx| {
-            navigate_list(this, id, count, Key::Up, up_navigation.as_deref(), cx);
+            step(this, Key::Up, cx);
         }))
         .on_action(cx.listener(move |this, _: &text::Down, _window, cx| {
-            navigate_list(this, id, count, Key::Down, down_navigation.as_deref(), cx);
+            step_down(this, Key::Down, cx);
         }))
+        // The field has no actions for Page Up and Page Down, so they
+        // arrive as keys.
         .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _window, cx| {
             if let Some(key @ (Key::PageUp | Key::PageDown)) = keyboard::key(event) {
                 cx.stop_propagation();
-                navigate_list(this, id, count, key, page_navigation.as_deref(), cx);
+                step_page(this, key, cx);
             }
         }))
         .on_action(cx.listener(move |this, _: &text::Enter, window, cx| {
             let here = this
                 .control_state()
                 .list_position(id)
-                .min(count.saturating_sub(1));
+                .min(ids.len().saturating_sub(1));
             if let Some(picked) = ids.get(here) {
                 on_activate(this, picked.clone(), window, cx);
                 cx.notify();
             }
         }))
+}
+
+/// When palette `id` opened, if it is the one open.
+fn palette_opened_at(state: &ControlState, id: ComboId) -> Option<Instant> {
+    state
+        .palette_overlay
+        .as_ref()
+        .filter(|open| open.id == id)
+        .map(|open| open.opened_at)
+}
+
+/// The host's callback, run after the palette closes, which hands the
+/// keyboard back where it was, so a command that opens something starts
+/// from the right place.
+fn closing_palette<V: ControlHost>(
+    on_activate: impl Fn(&mut V, SharedString, &mut Window, &mut Context<V>) + 'static,
+) -> Activate<V> {
+    Rc::new(move |view: &mut V, picked, window, cx| {
+        view.control_state_mut().close_palette(window, cx);
+        on_activate(view, picked, window, cx);
+    })
 }
 
 /// Centred overlay with a filter field and a list of matching commands.
@@ -933,11 +1085,11 @@ fn list_keys<V: ControlHost, E: InteractiveElement>(
 /// — or [`toggle_palette`](crate::ControlState::toggle_palette), from
 /// whatever shortcut the host gives it; while `id` is not open this returns
 /// nothing. The host owns the query input and the commands. The palette
-/// filters them with [`fuzzy_filter`], moves the highlight with Up and Down,
-/// runs the highlighted command on Enter or a clicked one, and closes on
-/// Escape or a press on the scrim. It closes before a command runs, handing
-/// the keyboard back where it was, so a command that opens something starts
-/// from the right place.
+/// filters them with [`fuzzy_filter`], moves the highlight with Up, Down,
+/// Page Up and Page Down, keeping it in view, runs the highlighted command
+/// on Enter or a clicked one, and closes on Escape or a press on the scrim.
+/// It closes before a command runs, handing the keyboard back where it was,
+/// so a command that opens something starts from the right place.
 #[allow(clippy::too_many_arguments)]
 pub fn command_palette<V: ControlHost>(
     id: ComboId,
@@ -947,31 +1099,27 @@ pub fn command_palette<V: ControlHost>(
     window: &Window,
     on_activate: impl Fn(&mut V, SharedString, &mut Window, &mut Context<V>) + 'static,
 ) -> Option<impl IntoElement> {
-    if !ctx.view.control_state().is_palette_open(id) {
-        return None;
-    }
+    let opened_at = palette_opened_at(ctx.view.control_state(), id)?;
     let text = query.read(ctx.cx).text();
-    let matches = fuzzy_filter(&text, commands);
-    let highlighted = ctx
-        .view
-        .control_state()
-        .list_highlight(id, text.as_str())
-        .min(matches.len().saturating_sub(1));
-    let on_activate: Activate<V> = Rc::new(move |view: &mut V, picked, window, cx| {
-        view.control_state_mut().close_palette(window, cx);
-        on_activate(view, picked, window, cx);
-    });
-    let rows = command_list(id, &matches, highlighted, ctx.reborrow(), {
-        let on_activate = on_activate.clone();
-        move |view, id, window, cx| on_activate(view, id, window, cx)
-    });
-    let ids = matches.iter().map(|command| command.id.clone()).collect();
+    let matches: Vec<SearchResult> = fuzzy_filter(&text, commands)
+        .iter()
+        .map(command_result)
+        .collect();
+    let on_activate = closing_palette(on_activate);
+    let list = result_list(
+        id,
+        &text,
+        "",
+        &matches,
+        PALETTE_RESULT_MAX_HEIGHT,
+        ctx.reborrow(),
+        on_activate.clone(),
+    );
     Some(palette_with_results(
         id,
+        opened_at,
         query,
-        vec![rows.into_any_element()],
-        ids,
-        None,
+        list,
         "No matching commands",
         ctx,
         window,
@@ -979,9 +1127,10 @@ pub fn command_palette<V: ControlHost>(
     ))
 }
 
-/// An overlay for results the host already filtered and ranked. It retains
-/// the command palette's focus, keyboard and dismissal behavior, while its
-/// rows show optional details, leading visuals and source sections.
+/// An overlay for results the host has already filtered and ranked: a
+/// [`command_palette`] in every way that concerns opening, the keyboard and
+/// closing, whose rows are [`SearchResult`]s, kept on their result as the
+/// results change, exactly as in [`ranked_search_list`].
 #[allow(clippy::too_many_arguments)]
 pub fn ranked_command_palette<V: ControlHost>(
     id: ComboId,
@@ -991,38 +1140,23 @@ pub fn ranked_command_palette<V: ControlHost>(
     window: &Window,
     on_activate: impl Fn(&mut V, SharedString, &mut Window, &mut Context<V>) + 'static,
 ) -> Option<impl IntoElement> {
-    if !ctx.view.control_state().is_palette_open(id) {
-        return None;
-    }
+    let opened_at = palette_opened_at(ctx.view.control_state(), id)?;
     let text = query.read(ctx.cx).text();
-    let ids: Vec<SharedString> = results.iter().map(|result| result.id.clone()).collect();
-    let (highlighted, changed) = ctx
-        .view
-        .control_state()
-        .list_highlight_with_change(id, (text.as_str(), ids.as_slice()));
-    let highlighted = highlighted.min(results.len().saturating_sub(1));
-    if changed {
-        let scroll = ctx.view.control_state().scroll((id, "list"));
-        scroll.set_offset(Default::default());
-    }
-    let on_activate: Activate<V> = Rc::new(move |view: &mut V, picked, window, cx| {
-        view.control_state_mut().close_palette(window, cx);
-        on_activate(view, picked, window, cx);
-    });
-    let rows = ranked_result_rows(
+    let on_activate = closing_palette(on_activate);
+    let list = result_list(
         id,
         &text,
+        &text,
         results,
-        highlighted,
+        PALETTE_RESULT_MAX_HEIGHT,
         ctx.reborrow(),
         on_activate.clone(),
     );
     Some(palette_with_results(
         id,
+        opened_at,
         query,
-        rows.elements,
-        ids,
-        Some((rows.child_indices, rows.positions)),
+        list,
         "No results",
         ctx,
         window,
@@ -1035,10 +1169,9 @@ pub fn ranked_command_palette<V: ControlHost>(
 #[allow(clippy::too_many_arguments)]
 fn palette_with_results<V: ControlHost>(
     id: ComboId,
+    opened_at: Instant,
     query: &Entity<TextInput>,
-    rows: Vec<AnyElement>,
-    ids: Vec<SharedString>,
-    navigation: Option<(Vec<usize>, Vec<f32>)>,
+    list: ResultList,
     empty_message: &'static str,
     ctx: WidgetContext<'_, '_, '_, V>,
     window: &Window,
@@ -1046,33 +1179,19 @@ fn palette_with_results<V: ControlHost>(
 ) -> impl IntoElement {
     let WidgetContext { palette, view, cx } = ctx;
     let state = view.control_state();
-    let opened_at = state
-        .palette_overlay
-        .as_ref()
-        .filter(|open| open.id == id)
-        .expect("palette was open when its rows were built")
-        .opened_at;
     let dark = palette.is_dark;
-    let reveal = if cx.reduce_motion() {
-        1.0
-    } else {
-        ease_out_cubic(progress(opened_at, state.scaled(COMBO_REVEAL)))
-    };
-    let list_scroll = state.scroll((id, "list"));
-    let navigation = navigation.map(|(child_indices, positions)| {
-        Rc::new(ResultNavigation {
-            scroll: list_scroll.clone(),
-            child_indices,
-            positions,
-        })
-    });
+    // The panel arrives the way a menu does: the same reveal, a short drift
+    // down into place.
+    let reveal = ease_out_cubic(progress(opened_at, state.scaled(COMBO_REVEAL)));
     let fill = if dark {
         palette.soft_fill
     } else {
         palette.field_surface
     };
-    let empty = ids.is_empty();
     let panel = div()
+        // A little above centre: the list grows downward, and a palette
+        // pinned to the middle ends up low on the screen as soon as it has
+        // results.
         .mt(gpui::relative(0.16))
         .relative()
         .top(px(-6.0 * (1.0 - reveal)))
@@ -1089,49 +1208,24 @@ fn palette_with_results<V: ControlHost>(
         .border_color(lighting::rim(fill, dark))
         .shadow(lighting::panel(dark))
         .occlude()
+        // Once `bind_keys` has run, Escape arrives as this action and never
+        // as a key. The query field has the keyboard, and this is the first
+        // thing above it.
         .on_action(cx.listener(move |this, _: &Dismiss, window, cx| {
             this.control_state_mut().close_palette(window, cx);
             cx.notify();
         }))
         .child(search_field(id, query, palette, window, cx))
-        .child(
-            div()
-                .relative()
-                .child(
-                    div()
-                        .id(ElementId::Name(format!("{id}-list").into()))
-                        .max_h(px(340.0))
-                        .flex()
-                        .flex_col()
-                        .gap(px(1.0))
-                        .overflow_y_scroll()
-                        .restrict_scroll_to_axis()
-                        .track_scroll(&list_scroll)
-                        .children(rows)
-                        .when(empty, |el| {
-                            el.child(
-                                div()
-                                    .h(px(30.0))
-                                    .px(px(9.0))
-                                    .flex()
-                                    .items_center()
-                                    .text_size(px(12.5))
-                                    .font_weight(FontWeight::NORMAL)
-                                    .text_color(palette.text_secondary)
-                                    .child(empty_message),
-                            )
-                        }),
-                )
-                .children(crate::scroll::scroll_fades(
-                    state,
-                    id,
-                    &list_scroll,
-                    crate::scroll::ScrollAxis::Vertical,
-                    fill,
-                    fill,
-                )),
-        );
-    let panel = list_keys(panel, id, ids, navigation, cx, on_activate);
+        .child(result_viewport(
+            id,
+            list.elements,
+            &list.navigation,
+            empty_message,
+            fill,
+            palette,
+            state,
+        ));
+    let panel = list_keys(panel, id, list.ids, Some(list.navigation), cx, on_activate);
     deferred(
         div()
             .id(ElementId::Name(format!("{id}-scrim").into()))
@@ -1204,18 +1298,55 @@ mod tests {
 
     #[test]
     fn emphasis_prefers_a_whole_match_and_merges_overlapping_words() {
-        assert_eq!(matched_ranges("Design system", "sign des"), vec![0..6]);
-        assert_eq!(matched_ranges("Open File", "opf"), vec![0..2, 5..6]);
+        assert_eq!(
+            matched_ranges("Design system", "sign des", true),
+            vec![0..6]
+        );
+        assert_eq!(matched_ranges("Open File", "opf", true), vec![0..2, 5..6]);
     }
 
     #[test]
     fn emphasis_uses_valid_unicode_byte_boundaries() {
-        assert_eq!(matched_ranges("Café résumé", "fé su"), vec![2..5, 9..11]);
-        assert!(matched_ranges("Café", "").is_empty());
+        assert_eq!(
+            matched_ranges("Café résumé", "fé su", true),
+            vec![2..5, 9..11]
+        );
+        assert!(matched_ranges("Café", "", true).is_empty());
+    }
+
+    /// A detail line is not what the person abbreviated, so scattered
+    /// letters there are coincidence, not a match.
+    #[test]
+    fn a_detail_line_emphasises_whole_words_only() {
+        let detail = "Project board · 2 minutes ago";
+        assert!(matched_ranges(detail, "de", false).is_empty());
+        assert_eq!(matched_ranges(detail, "board", false), vec![8..13]);
+        assert_eq!(matched_ranges("Design review", "de", true), vec![0..2]);
     }
 
     #[test]
-    fn section_headings_do_not_change_result_navigation_indices() {
+    fn ranked_results_are_best_first_and_keep_their_order_on_ties() {
+        let results = [
+            SearchResult::new("notes", "Design notes").section("History"),
+            SearchResult::new("budget", "Quarterly budget").detail("Shared documents"),
+            SearchResult::new("system", "Design system").section("Bookmarks"),
+            SearchResult::new("review", "Design review").section("Open tabs"),
+        ];
+        let ids = |query: &str| -> Vec<SharedString> {
+            rank_results(query, &results)
+                .into_iter()
+                .map(|result| result.id)
+                .collect()
+        };
+        assert_eq!(ids(""), ["notes", "budget", "system", "review"]);
+        assert_eq!(ids("design"), ["notes", "system", "review"]);
+        assert_eq!(ids("book"), ["system"]);
+        assert_eq!(ids("shared"), ["budget"]);
+        assert!(ids("zzz").is_empty());
+    }
+
+    #[test]
+    fn section_headings_take_room_but_no_keyboard_step() {
         let results = [
             SearchResult::new("a", "First")
                 .section("Tabs")
@@ -1226,24 +1357,36 @@ mod tests {
                 .section("Bookmarks")
                 .detail("Detail"),
         ];
-        let layout = ranked_row_layout(&results);
+        let layout = row_layout(&results);
         assert_eq!(
-            layout.iter().map(|row| row.child_index).collect::<Vec<_>>(),
-            [1, 2, 3, 5]
+            layout.iter().map(|row| row.heading).collect::<Vec<_>>(),
+            [true, false, false, true]
         );
         assert_eq!(
             layout.iter().map(|row| row.top).collect::<Vec<_>>(),
-            [21.0, 66.0, 99.0, 153.0]
+            [21.0, 66.0, 97.0, 149.0]
+        );
+        assert_eq!(
+            layout.iter().map(|row| row.height).collect::<Vec<_>>(),
+            [
+                DETAIL_ROW_HEIGHT,
+                COMMAND_ROW_HEIGHT,
+                COMMAND_ROW_HEIGHT,
+                DETAIL_ROW_HEIGHT
+            ]
         );
     }
 
     #[test]
     fn page_navigation_moves_by_viewport_and_stops_at_edges() {
-        let tops = [21.0, 66.0, 99.0, 153.0, 198.0, 243.0];
-        assert_eq!(page_target(Key::PageDown, 0, &tops, 100.0), Some(3));
-        assert_eq!(page_target(Key::PageUp, 3, &tops, 100.0), Some(0));
-        assert_eq!(page_target(Key::PageDown, 3, &tops, 100.0), Some(5));
-        assert_eq!(page_target(Key::PageUp, 0, &tops, 100.0), Some(0));
+        let rows: Vec<Range<f32>> = [21.0, 66.0, 99.0, 153.0, 198.0, 243.0]
+            .into_iter()
+            .map(|top| top..top + 30.0)
+            .collect();
+        assert_eq!(page_target(Key::PageDown, 0, &rows, 100.0), Some(3));
+        assert_eq!(page_target(Key::PageUp, 3, &rows, 100.0), Some(0));
+        assert_eq!(page_target(Key::PageDown, 3, &rows, 100.0), Some(5));
+        assert_eq!(page_target(Key::PageUp, 0, &rows, 100.0), Some(0));
         assert_eq!(page_target(Key::PageDown, 0, &[], 100.0), None);
     }
 
@@ -1270,23 +1413,55 @@ mod tests {
                     .detail("A second line")
             })
             .collect();
-        let layout = ranked_row_layout(&results);
-        let positions: Vec<_> = layout.iter().map(|row| row.top).collect();
-        let last = layout.last().expect("results have a last row");
-        let max_offset = (last.top + last.height - INLINE_RESULT_MAX_HEIGHT).max(0.0);
-        let target = page_target(Key::PageDown, 0, &positions, INLINE_RESULT_MAX_HEIGHT)
+        let navigation = ResultNavigation {
+            scroll: ScrollHandle::new(),
+            rows: row_layout(&results)
+                .iter()
+                .map(|row| row.top..row.top + row.height)
+                .collect(),
+            max_height: INLINE_RESULT_MAX_HEIGHT,
+        };
+        let viewport = navigation.viewport_height();
+        assert_eq!(viewport, INLINE_RESULT_MAX_HEIGHT);
+        let target = page_target(Key::PageDown, 0, &navigation.rows, viewport)
             .expect("page down reaches a result");
-        assert!(positions[target] >= INLINE_RESULT_MAX_HEIGHT);
-        let row = &layout[target];
+        let row = navigation.rows[target].clone();
+        assert!(row.start >= viewport);
         let offset = revealed_offset(
             0.0,
-            max_offset,
-            0.0..INLINE_RESULT_MAX_HEIGHT,
-            row.top..row.top + row.height,
+            navigation.content_height() - viewport,
+            0.0..viewport,
+            row.clone(),
         );
         assert!(offset < 0.0);
-        assert!(
-            row.top + row.height + offset <= INLINE_RESULT_MAX_HEIGHT - crate::scroll::SCROLL_FADE
+        assert!(row.end + offset <= viewport - crate::scroll::SCROLL_FADE);
+    }
+
+    /// A list shorter than its cap is all viewport, so nothing scrolls and
+    /// a page goes to the end.
+    #[test]
+    fn a_short_list_is_its_own_viewport() {
+        let results: Vec<_> = (0..3)
+            .map(|index| SearchResult::new(format!("r{index}"), "Result"))
+            .collect();
+        let navigation = ResultNavigation {
+            scroll: ScrollHandle::new(),
+            rows: row_layout(&results)
+                .iter()
+                .map(|row| row.top..row.top + row.height)
+                .collect(),
+            max_height: PALETTE_RESULT_MAX_HEIGHT,
+        };
+        assert_eq!(navigation.content_height(), 3.0 * COMMAND_ROW_HEIGHT + 2.0);
+        assert_eq!(navigation.viewport_height(), navigation.content_height());
+        assert_eq!(
+            page_target(
+                Key::PageDown,
+                0,
+                &navigation.rows,
+                navigation.viewport_height()
+            ),
+            Some(2)
         );
     }
 }

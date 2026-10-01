@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, Context, Div, ElementId, FocusHandle, FontWeight, KeyDownEvent, MouseButton,
-    MouseDownEvent, PathBuilder, ScrollHandle, SharedString, Window, canvas, deferred, div, point,
-    prelude::*, px,
+    MouseDownEvent, PathBuilder, Rgba, ScrollHandle, SharedString, Window, canvas, deferred, div,
+    point, prelude::*, px,
 };
 
 use crate::controls::{
@@ -1058,12 +1058,22 @@ pub fn card(palette: Palette, title: &str, body: impl IntoElement) -> Div {
         .flex_none()
         .p(px(16.0))
         .rounded(px(10.0))
-        .bg(lighting::lit(palette.area_surface, 0.04))
+        .bg(lighting::lit(palette.area_surface, CARD_LIFT))
         .border_1()
         .border_color(palette.area_border)
         .shadow(lighting::panel(palette.is_dark))
         .child(caption(palette, title))
         .child(body)
+}
+
+const CARD_LIFT: f32 = 0.04;
+
+/// A [`card`]'s colour `fraction` of the way down it, 0 at the top and 1 at
+/// the bottom: what a scroll-edge fade inside a card has to land on, as
+/// [`ground_at`](crate::ground_at) is for the window's ground.
+pub fn card_at(palette: Palette, fraction: f32) -> Rgba {
+    let (top, bottom) = lighting::lit_stops(palette.area_surface, CARD_LIFT);
+    crate::color::lerp(top, bottom, fraction.clamp(0.0, 1.0))
 }
 
 /// A caption over a control, as a column, so a row of labelled controls
