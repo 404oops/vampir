@@ -365,15 +365,22 @@ pub struct OpenMenu {
     /// retains its reachable-row position so Back restores the cursor to the
     /// row that opened that level.
     pub(crate) levels: Vec<MenuBranch>,
+    /// When the visible level last changed. The rows of a new level slide in
+    /// under a pointer that was aimed at the old one, so they take no clicks
+    /// until they have arrived.
+    pub(crate) level_changed_at: Option<Instant>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct MenuBranch {
     pub index: usize,
     pub highlight: usize,
-    /// Fingerprint of this branch's labels and action ids. An index alone
+    /// Fingerprint of this branch's label and its own rows. An index alone
     /// could point into a different submenu after the host rebuilds rows.
     pub identity: u64,
+    /// How far the parent level was scrolled, so coming back out lands
+    /// where the reader left it rather than at the top.
+    pub scroll: Point<Pixels>,
 }
 
 /// A modal dialog that is open, or on its way out.
@@ -1466,7 +1473,9 @@ impl ControlState {
             opened_at: Instant::now(),
             highlight: None,
             levels: Vec::new(),
+            level_changed_at: None,
         });
+        self.menu_scroll(id).set_offset(Point::default());
     }
 
     /// Opens a menu hanging beneath an element rather than at the pointer,
@@ -1486,7 +1495,9 @@ impl ControlState {
             opened_at: Instant::now(),
             highlight: None,
             levels: Vec::new(),
+            level_changed_at: None,
         });
+        self.menu_scroll(id).set_offset(Point::default());
     }
 
     // ---- Focus ----
@@ -1634,15 +1645,32 @@ impl ControlState {
 
     /// Enters an enabled submenu. The menu opening, target and focus handle
     /// stay put; only the visible level and its keyboard row change.
-    pub(crate) fn enter_menu(&mut self, index: usize, highlight: usize, identity: u64) {
+    ///
+    /// A level entered from the keyboard starts on its first row, so the
+    /// next Enter has something to act on. One entered with the pointer
+    /// starts on nothing, as the root does: the hand is still over the row
+    /// it clicked, and a wash on a row it never touched would be a guess.
+    pub(crate) fn enter_menu(
+        &mut self,
+        index: usize,
+        highlight: usize,
+        identity: u64,
+        by_keyboard: bool,
+    ) {
+        let Some(id) = self.menu.as_ref().map(|menu| menu.id) else {
+            return;
+        };
+        let scroll = self.menu_scroll(id).offset();
         if let Some(menu) = self.menu.as_mut() {
             menu.levels.push(MenuBranch {
                 index,
                 highlight,
                 identity,
+                scroll,
             });
-            menu.highlight = None;
+            menu.highlight = by_keyboard.then_some(0);
         }
+        self.menu_level_changed(Point::default());
     }
 
     /// Returns to the parent level, restoring the row that opened it.
@@ -1655,7 +1683,41 @@ impl ControlState {
             return false;
         };
         menu.highlight = Some(branch.highlight);
+        self.menu_level_changed(branch.scroll);
         true
+    }
+
+    /// The open menu's scroll handle. Keyed by the menu alone, not by the
+    /// opening or the level, so a session of menus holds one handle rather
+    /// than one per level ever shown; each change of level sets its offset
+    /// instead.
+    pub(crate) fn menu_scroll(&self, id: ComboId) -> ScrollHandle {
+        self.scroll((id, "menu-scroll"))
+    }
+
+    /// Notes that the open menu now shows another level, scrolled to
+    /// `offset`.
+    pub(crate) fn menu_level_changed(&mut self, offset: Point<Pixels>) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        menu.level_changed_at = Some(Instant::now());
+        let id = menu.id;
+        self.menu_scroll(id).set_offset(offset);
+    }
+
+    /// Whether a row click belongs to the opening `opened_at` and to the
+    /// level now on screen. The second click of a double-click on a submenu
+    /// row lands on whatever row of the new level slid under the pointer;
+    /// until the level has finished arriving, a click is the tail of one
+    /// aimed at the level before.
+    pub(crate) fn menu_takes_click(&self, opened_at: Instant) -> bool {
+        self.menu.as_ref().is_some_and(|menu| {
+            menu.opened_at == opened_at
+                && menu
+                    .level_changed_at
+                    .is_none_or(|changed| changed.elapsed() >= self.scaled(MOVE))
+        })
     }
 
     /// Closes whatever is showing over the view: a pop-up list, a context
@@ -1943,9 +2005,9 @@ mod tests {
         state.open_menu("row", at(10.0, 20.0), "budget.csv");
         let opening = state.menu_opened_at();
 
-        state.enter_menu(3, 1, 11);
+        state.enter_menu(3, 1, 11, false);
         state.highlight_menu(Some(2));
-        state.enter_menu(4, 2, 22);
+        state.enter_menu(4, 2, 22, false);
         assert_eq!(state.menu_target(), Some("budget.csv"));
         assert_eq!(state.menu_opened_at(), opening);
         assert_eq!(state.menu_highlight(), None);
@@ -1956,6 +2018,58 @@ mod tests {
         assert_eq!(state.menu_highlight(), Some(1));
         assert!(!state.back_menu());
         assert_eq!(state.menu_target(), Some("budget.csv"));
+    }
+
+    #[test]
+    fn a_level_entered_by_keyboard_starts_on_its_first_row() {
+        let mut state = ControlState::new();
+        state.open_menu("row", at(10.0, 20.0), "budget.csv");
+        state.enter_menu(3, 1, 11, true);
+        assert_eq!(state.menu_highlight(), Some(0));
+        assert!(state.back_menu());
+        state.enter_menu(3, 1, 11, false);
+        assert_eq!(state.menu_highlight(), None);
+    }
+
+    /// Back is the way out of a level, so it returns to the parent as it
+    /// was left: the same row lit and the same stretch scrolled into view,
+    /// while the level that opened in its place starts at the top.
+    #[test]
+    fn back_restores_the_parent_scroll_and_a_new_level_starts_at_the_top() {
+        let mut state = ControlState::new();
+        state.open_menu("row", at(10.0, 20.0), "budget.csv");
+        let scroll = state.menu_scroll("row");
+        scroll.set_offset(at(0.0, -120.0));
+        state.enter_menu(9, 4, 11, false);
+        assert_eq!(scroll.offset(), Point::default());
+
+        assert!(state.back_menu());
+        assert_eq!(scroll.offset(), at(0.0, -120.0));
+        assert_eq!(state.menu_highlight(), Some(4));
+        // At the root there is nothing to go back to, and Back says so
+        // rather than closing anything itself.
+        assert!(!state.back_menu());
+        assert!(state.is_menu_open("row"));
+
+        state.open_menu("row", at(10.0, 20.0), "notes.md");
+        assert_eq!(scroll.offset(), Point::default());
+    }
+
+    #[test]
+    fn rows_take_no_clicks_until_their_level_has_arrived() {
+        let mut state = ControlState::new();
+        state.open_menu("row", at(10.0, 20.0), "budget.csv");
+        let opening = state.menu_opened_at().expect("open");
+        assert!(state.menu_takes_click(opening));
+
+        state.enter_menu(3, 1, 11, false);
+        assert!(!state.menu_takes_click(opening));
+        state.set_time_scale(0.001);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert!(state.menu_takes_click(opening));
+
+        state.open_menu("row", at(10.0, 20.0), "notes.md");
+        assert!(!state.menu_takes_click(opening));
     }
 
     /// Reopening replaces the target rather than keeping the first one, so a

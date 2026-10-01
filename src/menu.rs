@@ -18,11 +18,11 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use gpui::{
-    Anchor, App, ElementId, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    SharedString, Window, anchored, canvas, deferred, div, point, prelude::*, px,
+    Anchor, App, ClickEvent, ElementId, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, SharedString, Window, anchored, canvas, deferred, div, point, prelude::*, px,
 };
 
 use crate::controls::WidgetContext;
@@ -141,32 +141,31 @@ impl MenuItem {
     }
 }
 
-/// Identity uses the labels of nested branches and the ids of leaf actions.
-/// Checked state, disabled descendants and displayed action text can change
-/// while the menu is open without turning it into a different branch.
+/// Identity is the branch's label and the shape of its own rows: the ids of
+/// its actions and the labels of its branches. Checked state, disabled rows
+/// and displayed action text can change while the menu is open without
+/// turning it into a different branch. Nothing deeper is hashed: each level
+/// below is checked by its own entry in the path, and folding it in here
+/// would throw the reader out of a level that has not changed because of
+/// an edit in a sibling's subtree.
 fn submenu_identity(label: &SharedString, children: &[MenuItem]) -> u64 {
-    fn hash_items(items: &[MenuItem], hasher: &mut impl Hasher) {
-        items.len().hash(hasher);
-        for item in items {
-            match item {
-                MenuItem::Action(action) => {
-                    0_u8.hash(hasher);
-                    action.id.hash(hasher);
-                }
-                MenuItem::Submenu { label, items, .. } => {
-                    1_u8.hash(hasher);
-                    label.hash(hasher);
-                    hash_items(items, hasher);
-                }
-                MenuItem::Separator => 2_u8.hash(hasher),
-                MenuItem::Header(_) => 3_u8.hash(hasher),
-            }
-        }
-    }
-
     let mut hasher = DefaultHasher::new();
     label.hash(&mut hasher);
-    hash_items(children, &mut hasher);
+    children.len().hash(&mut hasher);
+    for item in children {
+        match item {
+            MenuItem::Action(action) => {
+                0_u8.hash(&mut hasher);
+                action.id.hash(&mut hasher);
+            }
+            MenuItem::Submenu { label, .. } => {
+                1_u8.hash(&mut hasher);
+                label.hash(&mut hasher);
+            }
+            MenuItem::Separator => 2_u8.hash(&mut hasher),
+            MenuItem::Header(_) => 3_u8.hash(&mut hasher),
+        }
+    }
     hasher.finish()
 }
 
@@ -196,6 +195,102 @@ fn visible_level<'a>(
     Some((items, title))
 }
 
+/// Backs out of levels the host's latest tree no longer has, to the deepest
+/// one it still does. Returns the branch it came back out of, if any.
+///
+/// The row that opened a vanished level may have moved or gone with it, so
+/// the keyboard is put back on it only if a branch still stands at the same
+/// place. Anywhere else the restored row could be an action the reader
+/// never chose, one Enter away from running.
+fn settle_levels(
+    items: &[MenuItem],
+    levels: &mut Vec<MenuBranch>,
+    highlight: &mut Option<usize>,
+) -> Option<MenuBranch> {
+    let mut left = None;
+    while visible_level(items, levels).is_none() {
+        left = Some(levels.pop()?);
+    }
+    let branch = left?;
+    let (level, _) = visible_level(items, levels)?;
+    let still_there = reachable_indices(level).get(branch.highlight) == Some(&branch.index)
+        && matches!(level.get(branch.index), Some(MenuItem::Submenu { .. }));
+    *highlight = still_there.then_some(branch.highlight);
+    Some(branch)
+}
+
+/// What a key does to the open menu, worked out without the window so it
+/// can be tested.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MenuCommand {
+    /// Up a level. At the root, Escape closes the menu and Left does
+    /// nothing: Left means "back", and there is no back from the top.
+    Back {
+        close_at_root: bool,
+    },
+    Enter {
+        row: usize,
+        at: usize,
+        identity: u64,
+    },
+    Run(ComboId),
+    /// Light this reachable row.
+    Highlight(usize),
+}
+
+fn menu_command(
+    key: Key,
+    at: Option<usize>,
+    items: &[MenuItem],
+    reachable: &[usize],
+) -> Option<MenuCommand> {
+    let at = at.filter(|at| *at < reachable.len());
+    match key {
+        Key::Dismiss => Some(MenuCommand::Back {
+            close_at_root: true,
+        }),
+        Key::Left => Some(MenuCommand::Back {
+            close_at_root: false,
+        }),
+        Key::Activate | Key::Right => {
+            let at = at?;
+            let row = *reachable.get(at)?;
+            match items.get(row)? {
+                MenuItem::Action(action) if key == Key::Activate => {
+                    Some(MenuCommand::Run(action.id))
+                }
+                MenuItem::Submenu {
+                    label,
+                    items,
+                    enabled: true,
+                } => Some(MenuCommand::Enter {
+                    row,
+                    at,
+                    identity: submenu_identity(label, items),
+                }),
+                _ => None,
+            }
+        }
+        key => step_highlight(key, at, reachable.len()).map(MenuCommand::Highlight),
+    }
+}
+
+/// No row is lit until the first arrow: Down starts at the top, Up at the
+/// bottom. A level with nothing reachable has nowhere to go.
+fn step_highlight(key: Key, at: Option<usize>, len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    match at {
+        Some(at) => keyboard::step(key, Orientation::Vertical, at, len),
+        None => match key {
+            Key::Down | Key::Home => Some(0),
+            Key::Up | Key::End => Some(len - 1),
+            _ => None,
+        },
+    }
+}
+
 fn reachable_indices(items: &[MenuItem]) -> Vec<usize> {
     items
         .iter()
@@ -219,6 +314,17 @@ fn menu_height(items: &[MenuItem], nested: bool) -> f32 {
         .sum();
     let back = if nested { ITEM_HEIGHT + 7.0 } else { 0.0 };
     (rows + back + 2.0 * (MENU_PADDING + 1.0)).min(MENU_MAX_HEIGHT)
+}
+
+/// The panel's height in a window `window` tall. The window only moves a
+/// menu back inside its edges; it never shrinks one, so a level taller than
+/// the window has to be cut to fit here and scroll instead of overflowing.
+fn fit_to_window(height: f32, window: Option<f32>) -> f32 {
+    let Some(window) = window else {
+        return height;
+    };
+    let room = window - 2.0 * VIEWPORT_MARGIN;
+    height.min(room.max(ITEM_HEIGHT + 2.0 * (MENU_PADDING + 1.0)))
 }
 
 /// Renders the context menu `id` if it is the one currently open, otherwise
@@ -245,23 +351,25 @@ pub fn context_menu<V: ControlHost>(
     // A host may replace the item tree while a menu is open. Walk back to
     // the last live branch rather than leaving the keyboard in a vanished
     // level with no rows to answer it.
-    let (anchor, under, opened_at, highlight, levels) = {
-        let menu = view.control_state_mut().menu.as_mut()?;
+    let state = view.control_state_mut();
+    let left = {
+        let menu = state.menu.as_mut()?;
         if menu.id != id {
             return None;
         }
-        while visible_level(items, &menu.levels).is_none() {
-            let branch = menu.levels.pop()?;
-            menu.highlight = Some(branch.highlight);
-        }
-        (
-            menu.anchor,
-            menu.under,
-            menu.opened_at,
-            menu.highlight,
-            menu.levels.clone(),
-        )
+        settle_levels(items, &mut menu.levels, &mut menu.highlight)
     };
+    if let Some(branch) = left {
+        state.menu_level_changed(branch.scroll);
+    }
+    let menu = state.menu.as_ref()?;
+    let (anchor, under, opened_at, highlight, levels) = (
+        menu.anchor,
+        menu.under,
+        menu.opened_at,
+        menu.highlight,
+        menu.levels.clone(),
+    );
     let (level, title) = visible_level(items, &levels)?;
     let title = title.cloned();
     let items = level.to_vec();
@@ -277,10 +385,12 @@ pub fn context_menu<V: ControlHost>(
     let focus = view.control_state_mut().menu_focus(cx);
     let focus_on_open = focus.clone();
     let weak = cx.entity().downgrade();
-    let scroll = view
-        .control_state()
-        .scroll((id, "menu-scroll", (opened_at, &levels)));
+    let scroll = view.control_state().menu_scroll(id);
     let key_scroll = scroll.clone();
+    let window_height = view
+        .control_state()
+        .measured((id, "menu-window"))
+        .map(|window| f32::from(window.size.height));
 
     // A menu that would run off the window is flipped back over the
     // pointer, which is what every desktop toolkit does and what the hand
@@ -293,38 +403,44 @@ pub fn context_menu<V: ControlHost>(
 
     // The panel fades in over the same reveal a pop-up list uses, so the
     // two kinds of thing that drop out of a click arrive the same way.
-    let reveal = if cx.reduce_motion() {
-        1.0
-    } else {
-        crate::easing::ease_out_cubic(crate::easing::progress(
-            opened_at,
-            view.control_state().scaled(crate::state::COMBO_REVEAL),
-        ))
+    let reveal = crate::easing::ease_out_cubic(crate::easing::progress(
+        opened_at,
+        view.control_state().scaled(crate::state::COMBO_REVEAL),
+    ));
+
+    // Each level's rows get their own washes, so a row does not inherit the
+    // light of the one that sat at its index in the level before.
+    let level_key = {
+        let mut hasher = DefaultHasher::new();
+        for branch in &levels {
+            (branch.index, branch.identity).hash(&mut hasher);
+        }
+        hasher.finish()
     };
 
     // A level change is noticed during render, regardless of whether it
     // came from a key, pointer, or host mutation. The panel keeps its
     // location while its rows and height settle into the next level.
-    let duration = if cx.reduce_motion() {
-        Duration::ZERO
-    } else {
-        crate::state::MOVE
-    };
     let depth = levels.len() as f32;
-    let position = view
-        .control_state()
-        .tween((id, "menu-level", opened_at), depth, duration);
+    let position =
+        view.control_state()
+            .tween((id, "menu-level", opened_at), depth, crate::state::MOVE);
     let level_reveal = (1.0 - (position - depth).abs()).clamp(0.0, 1.0);
     let level_offset = (depth - position) * 10.0;
-    let height = view.control_state().tween(
-        (id, "menu-height", opened_at),
-        menu_height(&items, nested),
-        duration,
+    // The window's cap is applied outside the tween: it is a limit, not a
+    // change of level, and a resize should not set the panel sliding.
+    let height = fit_to_window(
+        view.control_state().tween(
+            (id, "menu-height", opened_at),
+            menu_height(&items, nested),
+            crate::state::MOVE,
+        ),
+        window_height,
     );
 
     let mut rows: Vec<gpui::AnyElement> = Vec::with_capacity(items.len() + row_offset);
     if let Some(title) = title {
-        rows.push(render_back(title, palette, cx));
+        rows.push(render_back(title, id, opened_at, palette, cx));
         rows.push(render_item(
             0,
             None,
@@ -342,13 +458,9 @@ pub fn context_menu<V: ControlHost>(
         let lit = selected.is_some_and(|at| reachable.get(at) == Some(&index));
         // The keyboard's wash moves from row to row rather than jumping.
         let lit = view.control_state().blend(
-            (id, "menu-lit", (opened_at, &levels, index)),
+            (id, "menu-lit", (opened_at, level_key, index)),
             lit,
-            if cx.reduce_motion() {
-                Duration::ZERO
-            } else {
-                crate::state::SWITCH_SLIDE
-            },
+            crate::state::SWITCH_SLIDE,
         );
         rows.push(render_item(
             index,
@@ -392,9 +504,28 @@ pub fn context_menu<V: ControlHost>(
         .track_focus(&focus)
         .child(
             // Prepaint is the first moment there is a `Window` to focus
-            // with. The handle is unchanged as the menu drills in or back.
+            // with, or to measure. The handle is unchanged as the menu
+            // drills in or back.
             canvas(
                 move |_bounds, window, cx| {
+                    let viewport =
+                        gpui::Bounds::new(point(px(0.0), px(0.0)), window.viewport_size());
+                    if let Some(host) = weak.upgrade() {
+                        let resized = host.update(cx, |host, _cx| {
+                            let state = host.control_state_mut();
+                            let resized = state.measured((id, "menu-window")) != Some(viewport);
+                            if resized {
+                                state.measure((id, "menu-window"), viewport);
+                            }
+                            resized
+                        });
+                        // Render has already used the old size. A notify
+                        // from inside a draw is dropped, so ask for the
+                        // next frame directly.
+                        if resized {
+                            window.request_animation_frame();
+                        }
+                    }
                     if focus_on_open.is_focused(window) {
                         return;
                     }
@@ -425,60 +556,38 @@ pub fn context_menu<V: ControlHost>(
                 return;
             };
             cx.stop_propagation();
-            let at = this
-                .control_state()
-                .menu_highlight()
-                .filter(|at| *at < key_reachable.len());
-            match key {
-                Key::Dismiss | Key::Left => {
-                    if !this.control_state_mut().back_menu() {
+            let at = this.control_state().menu_highlight();
+            match menu_command(key, at, &key_items, &key_reachable) {
+                Some(MenuCommand::Back { close_at_root }) => {
+                    if !this.control_state_mut().back_menu() && close_at_root {
                         this.control_state_mut().close_menu();
                         restore_focus(this, window, cx);
                     }
                 }
-                Key::Activate | Key::Right => {
-                    if let Some(at) = at
-                        && let Some(&row) = key_reachable.get(at)
-                    {
-                        match &key_items[row] {
-                            MenuItem::Action(action) if key == Key::Activate => {
-                                activate(this, action.id, opened_at, window, cx, &on_key_activate);
-                            }
-                            MenuItem::Submenu {
-                                label,
-                                items,
-                                enabled: true,
-                            } => {
-                                this.control_state_mut().enter_menu(
-                                    row,
-                                    at,
-                                    submenu_identity(label, items),
-                                );
-                            }
-                            _ => {}
-                        }
+                Some(MenuCommand::Enter { row, at, identity }) => {
+                    this.control_state_mut().enter_menu(row, at, identity, true);
+                }
+                Some(MenuCommand::Run(action)) => {
+                    activate(this, action, opened_at, window, cx, &on_key_activate);
+                }
+                Some(MenuCommand::Highlight(moved)) => {
+                    this.control_state_mut().highlight_menu(Some(moved));
+                    if let Some(&row) = key_reachable.get(moved) {
+                        key_scroll.scroll_to_item(row + row_offset);
                     }
                 }
-                key => {
-                    // No row is lit until the first arrow. Down starts at
-                    // the top; Up starts at the bottom.
-                    let moved = match at {
-                        Some(at) => {
-                            keyboard::step(key, Orientation::Vertical, at, key_reachable.len())
-                        }
-                        None => match key {
-                            Key::Down | Key::Home => Some(0),
-                            Key::Up | Key::End => key_reachable.len().checked_sub(1),
-                            _ => None,
-                        },
-                    };
-                    if let Some(moved) = moved {
-                        this.control_state_mut().highlight_menu(Some(moved));
-                        key_scroll.scroll_to_item(key_reachable[moved] + row_offset);
-                    }
-                }
+                None => {}
             }
             cx.notify();
+        }))
+        // Hover lights a row for the keyboard too, so the light has to go
+        // when the pointer does: otherwise Enter runs a row the hand has
+        // already left.
+        .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+            if !*hovered && this.control_state().menu_highlight().is_some() {
+                this.control_state_mut().highlight_menu(None);
+                cx.notify();
+            }
         }))
         .occlude()
         .on_mouse_down_out(
@@ -559,6 +668,27 @@ fn activate<V: ControlHost>(
     }
 }
 
+/// Whether a click on a row should count. A row click must belong to this
+/// opening and to a level that has finished arriving; see
+/// `ControlState::menu_takes_click`. A click counted
+/// past one is the second half of a double-click whose first half changed
+/// the level, so the row under it now was never aimed at either.
+fn takes_click<V: ControlHost>(view: &V, opened_at: Instant, event: &ClickEvent) -> bool {
+    event.click_count() <= 1 && view.control_state().menu_takes_click(opened_at)
+}
+
+/// The pointer lights the row it is over for the keyboard too. A disabled
+/// row cannot hold the keyboard, and passing over one on the way to the
+/// next should not drop the row that has it.
+fn hover_row<V: ControlHost>(view: &mut V, reachable_at: Option<usize>, cx: &mut Context<V>) {
+    if let Some(at) = reachable_at
+        && view.control_state().menu_highlight() != Some(at)
+    {
+        view.control_state_mut().highlight_menu(Some(at));
+        cx.notify();
+    }
+}
+
 fn chevron(right: bool, palette: Palette) -> impl IntoElement {
     let color: gpui::Hsla = crate::color::to_hsla(palette.text_secondary);
     div().w(px(10.0)).h(px(10.0)).flex_none().child(
@@ -583,11 +713,13 @@ fn chevron(right: bool, palette: Palette) -> impl IntoElement {
 
 fn render_back<V: ControlHost>(
     title: SharedString,
+    menu_id: ComboId,
+    opened_at: Instant,
     palette: Palette,
     cx: &mut Context<V>,
 ) -> gpui::AnyElement {
     div()
-        .id("menu-back")
+        .id(ElementId::Name(format!("{menu_id}-menu-back").into()))
         .h(px(ITEM_HEIGHT))
         .flex_none()
         .w_full()
@@ -607,9 +739,11 @@ fn render_back<V: ControlHost>(
                 cx.notify();
             }
         }))
-        .on_click(cx.listener(|this, _event, _window, cx| {
-            this.control_state_mut().back_menu();
-            cx.notify();
+        .on_click(cx.listener(move |this, event: &ClickEvent, _window, cx| {
+            if takes_click(this, opened_at, event) {
+                this.control_state_mut().back_menu();
+                cx.notify();
+            }
         }))
         .child(chevron(false, palette))
         .child(div().flex_1().overflow_hidden().child(title))
@@ -680,21 +814,17 @@ fn render_item<V: ControlHost>(
                     el.bg(lighting::lit_at(palette.control_fill, 0.08, lit))
                 })
                 .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _window, cx| {
-                    if this.control_state().menu_highlight() != reachable_at {
-                        this.control_state_mut().highlight_menu(reachable_at);
-                        cx.notify();
-                    }
+                    hover_row(this, reachable_at, cx);
                 }))
                 .when(enabled, |el| {
                     el.cursor_pointer()
                         .hover(move |style| style.bg(lighting::lit(palette.control_fill, 0.08)))
-                        .on_click(cx.listener(move |this, _event, _window, cx| {
-                            if this.control_state().menu_opened_at() == Some(opened_at) {
-                                this.control_state_mut().enter_menu(
-                                    index,
-                                    reachable_at.expect("enabled submenu is reachable"),
-                                    identity,
-                                );
+                        .on_click(cx.listener(move |this, event: &ClickEvent, _window, cx| {
+                            if takes_click(this, opened_at, event)
+                                && let Some(at) = reachable_at
+                            {
+                                this.control_state_mut()
+                                    .enter_menu(index, at, identity, false);
                                 cx.notify();
                             }
                         }))
@@ -746,10 +876,7 @@ fn render_item<V: ControlHost>(
                     ))
                 })
                 .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _window, cx| {
-                    if this.control_state().menu_highlight() != reachable_at {
-                        this.control_state_mut().highlight_menu(reachable_at);
-                        cx.notify();
-                    }
+                    hover_row(this, reachable_at, cx);
                 }))
                 .when(action.enabled, move |el| {
                     let on_activate = on_activate.clone();
@@ -764,9 +891,11 @@ fn render_item<V: ControlHost>(
                                 0.08,
                             ))
                         })
-                        .on_click(cx.listener(move |this, _event, window, cx| {
-                            activate(this, id, opened_at, window, cx, &on_activate);
-                            cx.notify();
+                        .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                            if takes_click(this, opened_at, event) {
+                                activate(this, id, opened_at, window, cx, &on_activate);
+                                cx.notify();
+                            }
                         }))
                 })
                 // Checked rows get a tick in a fixed gutter, so labels stay
@@ -964,8 +1093,10 @@ pub use crate::state::OpenMenu as ContextMenu;
 #[cfg(test)]
 mod tests {
     use super::{
-        MenuBranch, MenuItem, menu_height, reachable_indices, submenu_identity, visible_level,
+        MenuBranch, MenuCommand, MenuItem, fit_to_window, menu_command, menu_height,
+        reachable_indices, settle_levels, step_highlight, submenu_identity, visible_level,
     };
+    use crate::keyboard::Key;
 
     fn branch(item: &MenuItem, index: usize, highlight: usize) -> MenuBranch {
         let MenuItem::Submenu { label, items, .. } = item else {
@@ -975,7 +1106,42 @@ mod tests {
             index,
             highlight,
             identity: submenu_identity(label, items),
+            scroll: Default::default(),
         }
+    }
+
+    fn children(item: &MenuItem) -> &[MenuItem] {
+        let MenuItem::Submenu { items, .. } = item else {
+            panic!("expected submenu");
+        };
+        items
+    }
+
+    /// File > Organize > Move to, with a sibling branch beside Move to.
+    fn tree(move_to: &[&'static str], tag: &[&'static str]) -> Vec<MenuItem> {
+        let actions = |ids: &[&'static str]| {
+            ids.iter()
+                .map(|id| MenuItem::action(id, *id))
+                .collect::<Vec<_>>()
+        };
+        vec![
+            MenuItem::action("open", "Open"),
+            MenuItem::submenu(
+                "Organize",
+                vec![
+                    MenuItem::action("pin", "Pin"),
+                    MenuItem::submenu("Move to", actions(move_to)),
+                    MenuItem::submenu("Tag", actions(tag)),
+                ],
+            ),
+        ]
+    }
+
+    fn path_to_move(items: &[MenuItem]) -> Vec<MenuBranch> {
+        vec![
+            branch(&items[1], 1, 1),
+            branch(&children(&items[1])[1], 1, 1),
+        ]
     }
 
     #[test]
@@ -1026,6 +1192,112 @@ mod tests {
         assert!(visible_level(&relabelled, &path).is_some());
     }
 
+    /// Editing one branch's subtree must not throw the reader out of
+    /// another: only the levels on the path, and their own rows, count.
+    #[test]
+    fn an_edit_in_a_sibling_subtree_keeps_the_open_level() {
+        let original = tree(&["inbox"], &["red"]);
+        let path = path_to_move(&original);
+        let retagged = tree(&["inbox"], &["red", "blue"]);
+        let (level, title) = visible_level(&retagged, &path).expect("still open");
+        assert_eq!(title.map(|title| title.as_ref()), Some("Move to"));
+        assert!(matches!(level, [MenuItem::Action(action)] if action.id == "inbox"));
+
+        // The open level's own rows changing still rejects it.
+        let moved = tree(&["archive"], &["red"]);
+        assert!(visible_level(&moved, &path).is_none());
+        assert!(visible_level(&moved, &path[..1]).is_some());
+    }
+
+    #[test]
+    fn settling_backs_out_only_as_far_as_the_tree_changed() {
+        let original = tree(&["inbox"], &["red"]);
+        let path = path_to_move(&original);
+
+        let mut levels = path.clone();
+        let mut highlight = Some(0);
+        let retagged = tree(&["inbox"], &["red", "blue"]);
+        assert_eq!(settle_levels(&retagged, &mut levels, &mut highlight), None);
+        assert_eq!((levels.len(), highlight), (2, Some(0)));
+
+        // Move to's rows changed: back to Organize, keyboard on Move to,
+        // which is still a branch in the same place.
+        let moved = tree(&["archive"], &["red"]);
+        let left = settle_levels(&moved, &mut levels, &mut highlight);
+        assert_eq!(left, Some(path[1]));
+        assert_eq!((levels.len(), highlight), (1, Some(1)));
+
+        // Organize itself gone: back to the root, with nothing lit rather
+        // than a stranger in Organize's place.
+        let mut levels = path.clone();
+        let mut highlight = Some(0);
+        let flattened = vec![
+            MenuItem::action("open", "Open"),
+            MenuItem::action("delete", "Delete").danger(),
+        ];
+        let left = settle_levels(&flattened, &mut levels, &mut highlight);
+        assert_eq!(left, Some(path[0]));
+        assert!(levels.is_empty());
+        assert_eq!(highlight, None);
+    }
+
+    #[test]
+    fn arrows_in_a_level_with_nothing_reachable_go_nowhere() {
+        for key in [Key::Down, Key::Home, Key::Up, Key::End] {
+            assert_eq!(step_highlight(key, None, 0), None);
+            assert_eq!(step_highlight(key, Some(3), 0), None);
+        }
+        let inert = vec![
+            MenuItem::header("Recent"),
+            MenuItem::separator(),
+            MenuItem::action("none", "Nothing yet").disabled(),
+        ];
+        let reachable = reachable_indices(&inert);
+        assert!(reachable.is_empty());
+        assert_eq!(menu_command(Key::Down, None, &inert, &reachable), None);
+        assert_eq!(menu_command(Key::Home, Some(0), &inert, &reachable), None);
+        assert_eq!(
+            menu_command(Key::Activate, Some(0), &inert, &reachable),
+            None
+        );
+
+        assert_eq!(step_highlight(Key::Down, None, 3), Some(0));
+        assert_eq!(step_highlight(Key::Up, None, 3), Some(2));
+    }
+
+    /// Left is "back" and Escape is "back, or away": at the root only
+    /// Escape closes the menu.
+    #[test]
+    fn left_and_escape_go_back_and_only_escape_closes_the_root() {
+        let items = tree(&["inbox"], &["red"]);
+        let reachable = reachable_indices(&items);
+        assert_eq!(
+            menu_command(Key::Left, None, &items, &reachable),
+            Some(MenuCommand::Back {
+                close_at_root: false
+            })
+        );
+        assert_eq!(
+            menu_command(Key::Dismiss, None, &items, &reachable),
+            Some(MenuCommand::Back {
+                close_at_root: true
+            })
+        );
+        assert_eq!(
+            menu_command(Key::Right, Some(1), &items, &reachable),
+            Some(MenuCommand::Enter {
+                row: 1,
+                at: 1,
+                identity: branch(&items[1], 1, 1).identity,
+            })
+        );
+        assert_eq!(
+            menu_command(Key::Activate, Some(0), &items, &reachable),
+            Some(MenuCommand::Run("open"))
+        );
+        assert_eq!(menu_command(Key::Right, Some(0), &items, &reachable), None);
+    }
+
     #[test]
     fn navigation_skips_inert_rows_but_enters_enabled_submenus() {
         let items = vec![
@@ -1045,5 +1317,17 @@ mod tests {
         assert_eq!(menu_height(&short, true) - menu_height(&short, false), 33.0);
         let long: Vec<_> = (0..40).map(|_| MenuItem::header("Section")).collect();
         assert_eq!(menu_height(&long, false), super::MENU_MAX_HEIGHT);
+    }
+
+    #[test]
+    fn a_short_window_cuts_the_panel_to_fit() {
+        assert_eq!(fit_to_window(520.0, None), 520.0);
+        assert_eq!(fit_to_window(520.0, Some(900.0)), 520.0);
+        assert_eq!(
+            fit_to_window(520.0, Some(300.0)),
+            300.0 - 2.0 * super::VIEWPORT_MARGIN
+        );
+        // A window too small for anything still leaves one row's worth.
+        assert_eq!(fit_to_window(520.0, Some(10.0)), 38.0);
     }
 }
