@@ -223,9 +223,10 @@ enum Record {
     List { highlight: usize, query: u64 },
     /// Where something painted last frame.
     Bounds(Bounds<Pixels>),
-    /// A selected tab needs one paint before its bounds can be scrolled into
-    /// view. Once acknowledged, manual scrolling must stay in the user's
-    /// control until the selection or layout changes again.
+    /// A selected tab needs its bar painted, in the orientation it is shown
+    /// in, before it can be scrolled into view. Once acknowledged, manual
+    /// scrolling must stay in the user's control until the selection or
+    /// orientation changes again.
     Reveal {
         selection: Tag,
         pending: bool,
@@ -1139,7 +1140,8 @@ impl ControlState {
     }
 
     /// Whether a selected tab still needs to be brought into view. Its first
-    /// render has no bounds to scroll to, so the request survives that frame.
+    /// render has nothing painted to measure, so the request survives until
+    /// a render that has.
     /// A completed request stays completed through ordinary manual scrolls.
     pub(crate) fn tab_reveal_pending(&self, bar: ComboId, selection: impl Hash) -> bool {
         let selection = Tag::new(selection);

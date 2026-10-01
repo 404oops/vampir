@@ -21,7 +21,7 @@ use crate::controls::{
 use crate::keyboard::{self, Dismiss, Key, Orientation};
 use crate::lighting;
 use crate::palette::Palette;
-use crate::scroll::{ScrollAxis, scroll_fades};
+use crate::scroll::{SCROLL_FADE, ScrollAxis, scroll_fades};
 use crate::state::{
     ComboId, ControlHost, ControlState, MOVE, SWITCH_SLIDE, TabDrag, Tag, TrackAxis,
 };
@@ -95,6 +95,15 @@ impl TabBarLayout {
         matches!(self, Self::Vertical)
     }
 
+    /// Which arrows move the selection: the ones along the bar.
+    fn orientation(self) -> Orientation {
+        if self.vertical() {
+            Orientation::Vertical
+        } else {
+            Orientation::Horizontal
+        }
+    }
+
     fn tab_width(self) -> Option<f32> {
         match self {
             Self::HorizontalUniform { width } => Some(if width.is_finite() {
@@ -104,6 +113,29 @@ impl TabBarLayout {
             }),
             _ => None,
         }
+    }
+
+    /// A tab's size along the bar, given what it measured when it last
+    /// painted. Only a natural-width tab depends on the measurement; the
+    /// other layouts set the size themselves, so they can plan a slide on
+    /// their first frame and after a switch of layout.
+    fn tab_size(self, measured: Option<f32>) -> Option<f32> {
+        match self {
+            Self::Vertical => Some(TAB_HEIGHT),
+            Self::HorizontalUniform { .. } => self.tab_width(),
+            Self::Horizontal => measured,
+        }
+    }
+
+    /// Every tab's size along the bar, or `None` until all of them are
+    /// known. A natural-width bar that has not painted yet plans nothing and
+    /// draws the active tab's own fill instead of a pill — exactly what
+    /// [`tab_bar`] did before it had layouts.
+    fn tab_sizes(self, measured: impl IntoIterator<Item = Option<f32>>) -> Option<Vec<f32>> {
+        measured
+            .into_iter()
+            .map(|measured| self.tab_size(measured))
+            .collect()
     }
 }
 
@@ -159,7 +191,12 @@ pub fn tab_bar_layout<V: ControlHost>(
     let uniform_width = layout.tab_width();
     let on_select = Rc::new(on_select);
     let on_close = Rc::new(on_close);
-    let scroll = view.control_state().scroll((id, "tab-scroll"));
+    // Everything the bar measures is kept per orientation. After a host
+    // switches layout, last frame's geometry belongs to the other axis: a
+    // pill tweened from it would sweep across the bar, and a reveal read
+    // from it would scroll to a place that no longer exists. Keyed apart,
+    // the new orientation starts from nothing and waits for its own paint.
+    let scroll = view.control_state().scroll((id, "tab-scroll", vertical));
     // One tab stop for the bar, not one per tab: a tab bar is a single
     // choice, so Tab passes it in one press and the arrows move between
     // tabs — which is what stops a twenty-tab editor swallowing twenty
@@ -173,12 +210,7 @@ pub fn tab_bar_layout<V: ControlHost>(
             let Some(key) = keyboard::key(event) else {
                 return;
             };
-            let orientation = if vertical {
-                Orientation::Vertical
-            } else {
-                Orientation::Horizontal
-            };
-            if let Some(moved) = keyboard::step(key, orientation, selected, count) {
+            if let Some(moved) = keyboard::step(key, layout.orientation(), selected, count) {
                 cx.stop_propagation();
                 on_select(this, moved, window, cx);
                 cx.notify();
@@ -207,53 +239,35 @@ pub fn tab_bar_layout<V: ControlHost>(
     };
 
     let state = view.control_state();
-    // The first render has no tab bounds yet. Keep this reveal pending until
-    // a painted frame can supply them; then leave manual scrolling alone
-    // until the selection or layout changes.
-    if let Some(tab) = tabs.get(selected)
-        && state.tab_reveal_pending(
-            id,
-            (&tab.id, selected, vertical, uniform_width.map(f32::to_bits)),
-        )
-        && reveal_tab(state, id, &tab.id, &scroll, vertical)
-    {
-        state.finish_tab_reveal(
-            id,
-            (&tab.id, selected, vertical, uniform_width.map(f32::to_bits)),
-        );
-    }
     // Where each tab will sit in this order, worked out from the sizes they
     // painted at last frame. Knowing it before layout is what lets a tab
     // slide to a new slot rather than appear in it, and lets the raised pill
     // under the active tab follow the same numbers: one pill that moves,
     // rather than a fill that goes out on one tab and comes on on another.
-    // Sizes are measured by tab id. Uniform and vertical bars can plan from
-    // their requested size before the first paint; a natural-width tab must
-    // wait one paint before it can join the slide plan.
-    let sizes: Option<Vec<f32>> = tabs
-        .iter()
-        .map(|tab| {
-            state
-                .bounds((id, "tab", &tab.id))
-                .map(|bounds| {
-                    if vertical {
-                        f32::from(bounds.size.height)
-                    } else {
-                        f32::from(bounds.size.width)
-                    }
-                })
-                .or({
-                    if vertical {
-                        Some(TAB_HEIGHT)
-                    } else {
-                        uniform_width
-                    }
-                })
-        })
-        .collect();
+    // Sizes are measured by tab id, so a reorder carries them along.
+    let sizes: Option<Vec<f32>> = layout.tab_sizes(tabs.iter().map(|tab| {
+        state
+            .bounds(Tag::new((id, "tab", vertical, &tab.id)))
+            .map(|bounds| f32::from(bounds.size.width))
+    }));
     let places: Option<Vec<f32>> = sizes
         .as_ref()
         .map(|sizes| tab_places(sizes, &order, TAB_GAP));
+    // A newly selected tab is brought into view once, and then manual
+    // scrolling is left alone until the selection or the orientation
+    // changes. Keyed by the tab rather than its index, so closing or moving
+    // some other tab does not drag the strip back to it. The place comes
+    // from this frame's plan, not from where the tab painted last frame:
+    // that is where it is laid out after a close or a reorder, not where a
+    // slide happens to be drawing it.
+    if let Some(tab) = tabs.get(selected)
+        && state.tab_reveal_pending(id, (&tab.id, vertical))
+        && let Some((places, sizes)) = places.as_ref().zip(sizes.as_ref())
+        && let Some(slot) = order.iter().position(|&index| index == selected)
+        && reveal_tab(&scroll, vertical, places, sizes, &order, slot)
+    {
+        state.finish_tab_reveal(id, (&tab.id, vertical));
+    }
     // The tab under the hand rides with the pointer, from the point where it
     // was grabbed, and the others slide out of its way; only on release does
     // it settle into its slot. Its offset from where it is laid out comes
@@ -293,12 +307,12 @@ pub fn tab_bar_layout<V: ControlHost>(
             // there on release.
             match held_offset.filter(|_| held_slot == Some(slot)) {
                 Some(offset) => (
-                    state.snap((id, "pill-pos"), pos + offset),
-                    state.snap((id, "pill-size"), size),
+                    state.snap((id, "pill-pos", vertical), pos + offset),
+                    state.snap((id, "pill-size", vertical), size),
                 ),
                 None => (
-                    state.tween((id, "pill-pos"), pos, MOVE),
-                    state.tween((id, "pill-size"), size, MOVE),
+                    state.tween((id, "pill-pos", vertical), pos, MOVE),
+                    state.tween((id, "pill-size", vertical), size, MOVE),
                 ),
             }
         });
@@ -432,7 +446,10 @@ pub fn tab_bar_layout<V: ControlHost>(
                                 host.update(cx, |host, _cx| {
                                     let state = host.control_state_mut();
                                     state.record_slot(id, slot, laid_out);
-                                    state.record_bounds((id, "tab", &tab_id), bounds);
+                                    state.record_bounds(
+                                        Tag::new((id, "tab", vertical, &tab_id)),
+                                        laid_out,
+                                    );
                                 });
                             }
                         },
@@ -742,8 +759,13 @@ fn tab_places(sizes: &[f32], order: &[usize], gap: f32) -> Vec<f32> {
         .collect()
 }
 
+/// How far content has to move for `tab_start..tab_end` to sit inside
+/// `view_start..view_end`; positive brings earlier content in. A span longer
+/// than the view lines up its start, which is where its label begins;
+/// lining up whichever edge was out would only push the other one out, and
+/// the next frame would push it back.
 fn reveal_delta(view_start: f32, view_end: f32, tab_start: f32, tab_end: f32) -> f32 {
-    if tab_start < view_start {
+    if tab_start < view_start || tab_end - tab_start > view_end - view_start {
         view_start - tab_start
     } else if tab_end > view_end {
         view_end - tab_end
@@ -752,41 +774,71 @@ fn reveal_delta(view_start: f32, view_end: f32, tab_start: f32, tab_end: f32) ->
     }
 }
 
+/// Where a strip scrolled `scrolled` into content `content` long, with a
+/// viewport `view` long, has to scroll to for the tab at `slot` to be in
+/// view, all measured along the bar from the start of the well.
+///
+/// The tab is given [`SCROLL_FADE`] either side wherever there is content
+/// past it, or it would arrive under a fade with its close target veiled.
+/// The answer is clamped to the content, because after a close the offset
+/// can still be the old one, past an end that has moved in.
+fn reveal_scroll(
+    scrolled: f32,
+    view: f32,
+    places: &[f32],
+    sizes: &[f32],
+    order: &[usize],
+    slot: usize,
+) -> f32 {
+    let content = tab_content_len(places, sizes, order);
+    let start = TAB_INSET + places[slot];
+    let end = start + sizes[order[slot]];
+    let delta = reveal_delta(
+        scrolled,
+        scrolled + view,
+        (start - SCROLL_FADE).max(0.0),
+        (end + SCROLL_FADE).min(content),
+    );
+    (scrolled - delta).clamp(0.0, (content - view).max(0.0))
+}
+
+/// The well's length along the bar: every tab and gap, and its own inset at
+/// both ends.
+fn tab_content_len(places: &[f32], sizes: &[f32], order: &[usize]) -> f32 {
+    let tabs = match (places.last(), order.last()) {
+        (Some(place), Some(&index)) => place + sizes[index],
+        _ => 0.0,
+    };
+    2.0 * TAB_INSET + tabs
+}
+
+/// Scrolls the selected tab into view. False until the viewport has painted
+/// in this orientation, so the reveal waits rather than measuring a
+/// viewport that is not on screen.
 fn reveal_tab(
-    state: &ControlState,
-    bar: ComboId,
-    tab_id: &SharedString,
     scroll: &ScrollHandle,
     vertical: bool,
+    places: &[f32],
+    sizes: &[f32],
+    order: &[usize],
+    slot: usize,
 ) -> bool {
-    let Some(tab) = state.bounds((bar, "tab", tab_id)) else {
-        return false;
-    };
-    let view = scroll.bounds();
-    if view.size.width <= px(0.0) || view.size.height <= px(0.0) {
+    let bounds = scroll.bounds();
+    if bounds.size.width <= px(0.0) || bounds.size.height <= px(0.0) {
         return false;
     }
-    let delta = if vertical {
-        reveal_delta(
-            f32::from(view.top()),
-            f32::from(view.bottom()),
-            f32::from(tab.top()),
-            f32::from(tab.bottom()),
-        )
+    let mut offset = scroll.offset();
+    let (view, scrolled) = if vertical {
+        (f32::from(bounds.size.height), -f32::from(offset.y))
     } else {
-        reveal_delta(
-            f32::from(view.left()),
-            f32::from(view.right()),
-            f32::from(tab.left()),
-            f32::from(tab.right()),
-        )
+        (f32::from(bounds.size.width), -f32::from(offset.x))
     };
-    if delta != 0.0 {
-        let mut offset = scroll.offset();
+    let target = reveal_scroll(scrolled, view, places, sizes, order, slot);
+    if (target - scrolled).abs() > 0.5 {
         if vertical {
-            offset.y += px(delta);
+            offset.y = px(-target);
         } else {
-            offset.x += px(delta);
+            offset.x = px(-target);
         }
         scroll.set_offset(offset);
     }
@@ -1489,20 +1541,147 @@ fn moved_selection(selected: usize, from: usize, to: usize) -> usize {
 #[cfg(test)]
 mod layout_tests {
     use super::{
-        ButtonVariant, TabBarLayout, dialog_default, moved_selection, reorder, reveal_delta,
-        tab_places,
+        ButtonVariant, TAB_HEIGHT, TAB_INSET, TabBarLayout, dialog_default, moved_selection,
+        reorder, reveal_delta, reveal_scroll, tab_content_len, tab_places,
     };
+    use crate::keyboard::Orientation;
+    use crate::scroll::SCROLL_FADE;
 
+    /// Closing a tab in a natural-width bar slides the next one into its
+    /// place, but that tab is a different width, so its close target lands
+    /// somewhere else; a uniform bar puts the next close target exactly
+    /// where the last one was, which is what makes repeated closing work.
     #[test]
-    fn uniform_tabs_keep_the_next_close_target_in_the_closed_slot() {
+    fn only_uniform_tabs_keep_the_next_close_target_under_the_pointer() {
+        let gap = 2.0;
+        let natural = [90.0, 140.0, 70.0, 110.0];
+        let before = tab_places(&natural, &[0, 1, 2, 3], gap);
+        let after = tab_places(&[90.0, 70.0, 110.0], &[0, 1, 2], gap);
+        assert_eq!(before, [0.0, 92.0, 234.0, 306.0]);
+        assert_eq!(after[1], before[1], "the next tab takes the closed slot");
+        assert_eq!(
+            before[3] - after[2],
+            140.0 + gap,
+            "later tabs move by what was closed"
+        );
+        let close_target = |places: &[f32], sizes: &[f32], slot: usize| places[slot] + sizes[slot];
+        assert_ne!(
+            close_target(&after, &[90.0, 70.0, 110.0], 1),
+            close_target(&before, &natural, 1)
+        );
+
         let width = TabBarLayout::HorizontalUniform { width: 158.0 }
             .tab_width()
             .unwrap();
-        let before = tab_places(&[width; 4], &[0, 1, 2, 3], 2.0);
-        let after = tab_places(&[width; 3], &[0, 1, 2], 2.0);
-        assert_eq!(before[1], after[1]);
-        assert_eq!(before[1], 160.0);
-        assert_eq!(before[2] - before[1], width + 2.0);
+        let before = tab_places(&[width; 4], &[0, 1, 2, 3], gap);
+        let after = tab_places(&[width; 3], &[0, 1, 2], gap);
+        assert_eq!(
+            close_target(&after, &[width; 3], 1),
+            close_target(&before, &[width; 4], 1)
+        );
+    }
+
+    /// Scrolled to the end, closing the last tab selects the one before it.
+    /// The old offset is now past the end of the shorter strip, and the
+    /// viewport has to come back to the new end with that tab in it.
+    #[test]
+    fn closing_the_last_tab_scrolls_back_to_the_new_end() {
+        let gap = 2.0;
+        let view = 200.0;
+        let before = [90.0, 140.0, 70.0, 110.0];
+        let order = [0, 1, 2, 3];
+        let places = tab_places(&before, &order, gap);
+        let content = tab_content_len(&places, &before, &order);
+        assert_eq!(content, 2.0 * TAB_INSET + 410.0 + 3.0 * gap);
+        let at_end = content - view;
+        // Revealing the last tab from the start goes to the very end.
+        assert_eq!(
+            reveal_scroll(0.0, view, &places, &before, &order, 3),
+            at_end
+        );
+
+        let after = [90.0, 140.0, 70.0];
+        let order = [0, 1, 2];
+        let places = tab_places(&after, &order, gap);
+        let content = tab_content_len(&places, &after, &order);
+        let scrolled = reveal_scroll(at_end, view, &places, &after, &order, 2);
+        assert_eq!(scrolled, content - view);
+        assert!(scrolled < at_end, "the viewport moved");
+        let start = TAB_INSET + places[2];
+        assert!(scrolled <= start && start + after[2] <= scrolled + view);
+    }
+
+    /// A tab revealed in the middle of a long strip clears the fades either
+    /// side of it; one at the very start needs no room for a fade there.
+    #[test]
+    fn a_revealed_tab_clears_the_edge_fades() {
+        let sizes = [100.0; 8];
+        let order: Vec<usize> = (0..8).collect();
+        let places = tab_places(&sizes, &order, 2.0);
+        let view = 250.0;
+        let scrolled = reveal_scroll(0.0, view, &places, &sizes, &order, 4);
+        let end = TAB_INSET + places[4] + 100.0;
+        assert_eq!(scrolled + view, end + SCROLL_FADE);
+        let back = reveal_scroll(scrolled, view, &places, &sizes, &order, 0);
+        assert_eq!(back, 0.0);
+    }
+
+    /// The bar's tabs mid-reorder: the plan is in display order, so the
+    /// reveal follows the tab to the slot it is going to.
+    #[test]
+    fn a_reveal_reads_the_tab_in_its_planned_slot() {
+        let sizes = [100.0, 60.0, 80.0];
+        let order = [1, 2, 0];
+        let places = tab_places(&sizes, &order, 2.0);
+        let view = 200.0;
+        // Tab 0 is drawn last, so revealing it scrolls to the end.
+        let content = tab_content_len(&places, &sizes, &order);
+        assert_eq!(
+            reveal_scroll(0.0, view, &places, &sizes, &order, 2),
+            content - view
+        );
+        // In its old place, first, it needed no scrolling at all.
+        let order = [0, 1, 2];
+        let places = tab_places(&sizes, &order, 2.0);
+        assert_eq!(reveal_scroll(0.0, view, &places, &sizes, &order, 0), 0.0);
+    }
+
+    /// Before its first paint a natural-width bar has nothing to plan with,
+    /// so it draws as `tab_bar` always has: no pill, no slides. The other
+    /// layouts know their sizes up front.
+    #[test]
+    fn only_a_natural_width_bar_waits_for_its_first_paint() {
+        assert_eq!(TabBarLayout::Horizontal.tab_sizes([None, None]), None);
+        assert_eq!(
+            TabBarLayout::Horizontal.tab_sizes([Some(80.0), None]),
+            None,
+            "one unmeasured tab holds the plan back"
+        );
+        assert_eq!(
+            TabBarLayout::Horizontal.tab_sizes([Some(80.0), Some(64.0)]),
+            Some(vec![80.0, 64.0])
+        );
+        assert_eq!(
+            TabBarLayout::HorizontalUniform { width: 150.0 }.tab_sizes([None, Some(80.0)]),
+            Some(vec![150.0, 150.0])
+        );
+        assert_eq!(
+            TabBarLayout::Vertical.tab_sizes([None, Some(200.0)]),
+            Some(vec![TAB_HEIGHT, TAB_HEIGHT])
+        );
+    }
+
+    #[test]
+    fn the_arrows_run_along_the_bar() {
+        assert_eq!(
+            TabBarLayout::Horizontal.orientation(),
+            Orientation::Horizontal
+        );
+        assert_eq!(
+            TabBarLayout::HorizontalUniform { width: 158.0 }.orientation(),
+            Orientation::Horizontal
+        );
+        assert_eq!(TabBarLayout::Vertical.orientation(), Orientation::Vertical);
     }
 
     #[test]
@@ -1526,6 +1705,15 @@ mod layout_tests {
         assert_eq!(reveal_delta(20.0, 120.0, 40.0, 100.0), 0.0);
         assert_eq!(reveal_delta(20.0, 120.0, 8.0, 68.0), 12.0);
         assert_eq!(reveal_delta(20.0, 120.0, 75.0, 146.0), -26.0);
+    }
+
+    /// A tab longer than the view lines up its start from either side,
+    /// rather than each frame pushing out the edge the last one brought in.
+    #[test]
+    fn a_tab_longer_than_the_view_settles_on_its_start() {
+        assert_eq!(reveal_delta(20.0, 120.0, 0.0, 150.0), 20.0);
+        assert_eq!(reveal_delta(20.0, 120.0, 40.0, 190.0), -20.0);
+        assert_eq!(reveal_delta(20.0, 120.0, 20.0, 170.0), 0.0);
     }
 
     #[test]
