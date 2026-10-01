@@ -142,9 +142,10 @@ impl TabBarLayout {
 const TAB_HEIGHT: f32 = 26.0;
 const TAB_GAP: f32 = 2.0;
 const TAB_PAD: f32 = 2.0;
+const WELL_BORDER: f32 = 1.0;
 /// The well's border plus its padding: where the first tab starts inside
 /// the scrolled content, and how far the last one ends before its end.
-const TAB_INSET: f32 = 1.0 + TAB_PAD;
+const TAB_INSET: f32 = WELL_BORDER + TAB_PAD;
 
 /// Horizontal tab bar with drag-to-reorder.
 ///
@@ -577,10 +578,11 @@ pub fn tab_bar_layout<V: ControlHost>(
         ScrollAxis::Horizontal
     };
     // Tabs leaving the viewport fade into the well rather than being cut
-    // mid-glyph. The fades cover only the lane the tabs run in, inset by the
-    // well's border and padding, so the recess itself carries on to the
-    // edge and says there is more of it; and the well is flat, so its own
-    // fill is exactly what a fade has to land on.
+    // mid-glyph. The fades cover the well's whole inside, inset only by its
+    // border, so the border carries on to the edge and says the recess goes
+    // on; anything narrower would leave the end of the inner shadow and a
+    // faded pill's own shadow standing out past the fade. The well is flat,
+    // so its own fill is exactly what a fade has to land on.
     //
     // No scrollbar: a strip one tab deep has no room for an overlay track
     // that would not sit on the tabs and take their presses, which start
@@ -591,14 +593,14 @@ pub fn tab_bar_layout<V: ControlHost>(
         .when(vertical, |el| {
             el.top_0()
                 .bottom_0()
-                .left(px(TAB_INSET))
-                .right(px(TAB_INSET))
+                .left(px(WELL_BORDER))
+                .right(px(WELL_BORDER))
         })
         .when(!vertical, |el| {
             el.left_0()
                 .right_0()
-                .top(px(TAB_INSET))
-                .bottom(px(TAB_INSET))
+                .top(px(WELL_BORDER))
+                .bottom(px(WELL_BORDER))
         })
         .children(scroll_fades(
             state,
