@@ -82,6 +82,14 @@ These are in-window menus drawn by the toolkit. The macOS menu bar is a differen
 
 The tree stays the host's, and `flatten_tree` walks it into `TreeRow`s each frame, skipping the children of anything closed — the step that makes collapsing mean anything. Keeping the flattened list *as* the model is the tempting shortcut — it is what gets drawn, after all — but then closing a branch has nothing to hide, because its children were never underneath it. Sorting is the host's too: it compares keys, not the strings on screen, and only the host knows which is which.
 
+## Selection — `vampir::selection`
+
+| | |
+|---|---|
+| `selectable_list` / `ListSelection` | A scrolling list of rows the reader selects: click, Shift and Cmd/Ctrl ranges and toggles, the arrows, Select All. The host keeps the `ListSelection` and applies each `SelectionIntent`. |
+
+`selectable_list` is a scrolling list of rows the reader can select, for any row content, with one keyboard stop for the whole list, a focus ring on the active row, and standard click, modifier-click and arrow-key selection. The host owns `ListSelection` beside its data, hands the list the rows' stable ids in order with each row's content, and applies the `SelectionIntent` it reports; the callback is given the order back, so the host keeps no copy of it for the listener. Stable ids keep a selection on the same items when the list changes order. Give the list a height and the colours of the surface behind its top and bottom edges, for the edge fades; inside a `card`, the card's two ends, `lit_stops(palette.area_surface, CARD_LIFT)`, are near enough. Filtered to nothing while it has the keyboard, it hands the keyboard to the root. Up, Down, Home and End scroll the active row into view; Shift extends from the anchor, or from the active row when there is none. The gallery's Data page demonstrates range selection, toggling, Select All and moving the keyboard past the visible rows.
+
 ## Colour — `vampir::swatch`
 
 ![The colour page, with an Oklch chroma and lightness pad](colour.png)

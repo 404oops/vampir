@@ -20,17 +20,17 @@ use gpui_ce_platform::application;
 #[cfg(feature = "app-icon")]
 use vampir::AppIcon;
 use vampir::{
-    BadgeTone, ButtonVariant, CONTROL_HEIGHT, ChipSelection, Choice, Chord, Column, ComboId,
-    Command, ControlHost, ControlState, DialogButton, Hint, InputStyle, MAX_CHROMA, MenuItem,
-    Oklch, Palette, Scheme, ScrollAxis, SliderTrack, SortDirection, Span, TEXT_SIZE,
-    TITLE_TEXT_SIZE, Tab, TextInput, Theme, TreeRow, WidgetContext, arriving, badge, bind_keys,
-    button, caption, card, checkbox, chip_group, collapsible, color_pad, column, combo,
-    command_palette, context_menu, dialog, edit_menu, fading_text, flatten_tree, glyph, ground,
-    hue_picker, hue_slider, hue_wheel, icon_button, labelled, lit, menu_button, menu_target,
-    progress_bar, radio_group, reorder, row, saturation_picker, scheme_picker, scroll_area,
-    search_list, segmented, separator, shortcut_recorder, slider, spinbox, spinner, split_area,
-    split_handle, swatch_grid, switch, tab_bar, table_header, table_row, text_area, text_field,
-    tree_row, ui_font,
+    BadgeTone, ButtonVariant, CARD_LIFT, CONTROL_HEIGHT, ChipSelection, Choice, Chord, Column,
+    ComboId, Command, ControlHost, ControlState, DialogButton, Hint, InputStyle, ListSelection,
+    MAX_CHROMA, MenuItem, Oklch, Palette, Scheme, ScrollAxis, SelectionIntent, SliderTrack,
+    SortDirection, Span, TEXT_SIZE, TITLE_TEXT_SIZE, Tab, TextInput, Theme, TreeRow, WidgetContext,
+    arriving, badge, bind_keys, button, caption, card, checkbox, chip_group, collapsible,
+    color_pad, column, combo, command_palette, context_menu, dialog, edit_menu, fading_text,
+    flatten_tree, glyph, ground, hue_picker, hue_slider, hue_wheel, icon_button, labelled, lit,
+    lit_stops, menu_button, menu_target, progress_bar, radio_group, reorder, row,
+    saturation_picker, scheme_picker, scroll_area, search_list, segmented, selectable_list,
+    separator, shortcut_recorder, slider, spinbox, spinner, split_area, split_handle, swatch_grid,
+    switch, tab_bar, table_header, table_row, text_area, text_field, tree_row, ui_font,
 };
 
 // The gallery is also the smallest complete *macOS* host, so it carries the
@@ -212,6 +212,7 @@ struct Gallery {
     sort: (SharedString, SortDirection),
     split: f32,
     details_open: bool,
+    selection: ListSelection,
     last_action: SharedString,
 
     // Colour page.
@@ -385,6 +386,7 @@ impl Gallery {
             sort: ("changed".into(), SortDirection::Descending),
             split: 0.42,
             details_open: true,
+            selection: ListSelection::new(),
             last_action: "—".into(),
             colour: Oklch::new(268.0, 0.11, 0.62),
             palette_query,
@@ -546,7 +548,7 @@ impl Render for Gallery {
         let body = match page {
             Page::Controls => self.page_controls(palette, cx),
             Page::Fields => self.page_fields(palette, window, cx),
-            Page::Data => self.page_data(palette, cx),
+            Page::Data => self.page_data(palette, window, cx),
             Page::Colour => self.page_colour(palette, cx),
         };
         // Keyed by the page, not the tab's position, so reordering the tabs
@@ -660,8 +662,8 @@ impl Render for Gallery {
                     cx.notify();
                 },
             ));
-        // Chrome and overlays notice their transitions while they render too.
-        // Ask only after every control has had a chance to request a frame.
+        // A control notices a transition as it renders, including the
+        // footer and overlays, so ask for another frame after all of them.
         if self.controls.animating() {
             window.request_animation_frame();
         }
@@ -1106,7 +1108,12 @@ impl Gallery {
 }
 
 impl Gallery {
-    fn page_data(&mut self, palette: Palette, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn page_data(
+        &mut self,
+        palette: Palette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let columns = [
             Column::new("name", "Name"),
             Column::new("size", "Size").width(80.0).numeric(),
@@ -1206,6 +1213,51 @@ impl Gallery {
                 )
             }));
 
+        let selection_order: Vec<SharedString> = [
+            "Design notes",
+            "Budget",
+            "Launch plan",
+            "Research",
+            "Components",
+            "Typography",
+            "Motion study",
+            "Keyboard map",
+            "Accessibility",
+            "Integration tests",
+            "Screenshots",
+            "Translations",
+            "Release checklist",
+            "Archive",
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        // The fades land near enough on the card the list sits in; a flat
+        // surface colour would show as a band against its lit gradient.
+        let (card_top, card_bottom) = lit_stops(palette.area_surface, CARD_LIFT);
+        let selection_list = selectable_list(
+            "selectable-files",
+            &selection_order,
+            &self.selection,
+            card_top,
+            card_bottom,
+            WidgetContext::new(palette, self, cx),
+            window,
+            selection_order.iter().map(|label| {
+                div()
+                    .h(px(34.0))
+                    .px(px(10.0))
+                    .flex()
+                    .items_center()
+                    .child(label.clone())
+            }),
+            |this, order, intent, _window, cx| match intent {
+                SelectionIntent::Activate(id) => this.note(format!("Opened {id}"), cx),
+                intent => this.selection.apply(order, intent),
+            },
+        )
+        .h(px(196.0));
+
         column()
             .child(card(
                 palette,
@@ -1273,6 +1325,14 @@ impl Gallery {
                     this.details_open = expanded;
                     cx.notify();
                 },
+            ))
+            .child(card(
+                palette,
+                "Selection — click, ⇧ range, ⌘ toggle, arrows, ⌘A, End",
+                column().child(selection_list).child(caption(
+                    palette,
+                    &format!("{} selected", self.selection.len()),
+                )),
             ))
             .into_any_element()
     }

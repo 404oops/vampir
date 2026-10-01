@@ -65,6 +65,7 @@ The application's own keys — ⌘K, ⌘S — are still the host's to bind, afte
 | `context_menu`, `menu_button` | The button opens with Space, Enter or Down; the menu takes focus. Up and down move over enabled rows, Right or Enter opens a submenu with the keyboard on its first row, Left or Escape returns one level, and Escape at the top closes the menu; Left there does nothing. Enter on a leaf runs it. Focus goes back where it was after closing. |
 | `table_header` | Sortable columns are tab stops; Space or Enter sorts. |
 | `tree_row` | One tab stop, on the selected row. Up and down walk the flattened rows without wrapping. Right opens a closed branch and then steps into it; left closes an open one and then steps out to the parent. |
+| `selectable_list` | One tab stop for the list, on its active row. Up and down move without wrapping; Home and End reach the ends; the target scrolls into view. Shift extends from the anchor, or from the active row when there is none; Cmd/Ctrl-click toggles a row; Cmd/Ctrl+A selects all; Enter or Space activates; Escape clears the selection, and with nothing selected goes on to the root. |
 | `color_pad` | Left and right move chroma, up and down move lightness. |
 | `swatch_grid` | Each swatch is a tab stop. |
 | `spinbox` | Up and down step the value from inside the field, Enter commits a typed one; the steppers are tab stops too. |
