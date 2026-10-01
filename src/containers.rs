@@ -192,12 +192,14 @@ pub fn tab_bar_layout<V: ControlHost>(
     let uniform_width = layout.tab_width();
     let on_select = Rc::new(on_select);
     let on_close = Rc::new(on_close);
-    // Everything the bar measures is kept per orientation. After a host
-    // switches layout, last frame's geometry belongs to the other axis: a
-    // pill tweened from it would sweep across the bar, and a reveal read
-    // from it would scroll to a place that no longer exists. Keyed apart,
-    // the new orientation starts from nothing and waits for its own paint.
-    let scroll = view.control_state().scroll((id, "tab-scroll", vertical));
+    // Everything the bar measures is kept per layout. After a host switches
+    // layout, last frame's geometry belongs to the other one: a pill tweened
+    // from it would sweep across the bar, a slide planned from uniform
+    // widths would jump once natural ones arrive, and a reveal read from it
+    // would scroll to a place that no longer exists. Keyed apart, the new
+    // layout starts from nothing, at rest, and waits for its own paint.
+    let geometry = (vertical, uniform_width.map(f32::to_bits));
+    let scroll = view.control_state().scroll((id, "tab-scroll", geometry));
     // One tab stop for the bar, not one per tab: a tab bar is a single
     // choice, so Tab passes it in one press and the arrows move between
     // tabs — which is what stops a twenty-tab editor swallowing twenty
@@ -221,7 +223,10 @@ pub fn tab_bar_layout<V: ControlHost>(
     let dragging_here: Option<TabDrag> = view
         .control_state()
         .tab_drag()
-        .filter(|drag| drag.bar == id)
+        // A drag reads the axis it started on. If the host switched layout
+        // under it, its positions are along the other axis and mean nothing
+        // against these tabs, so the bar draws as if nothing were held.
+        .filter(|drag| drag.bar == id && drag.axis == track_axis(vertical))
         .copied();
     let weak = cx.entity().downgrade();
 
@@ -248,7 +253,7 @@ pub fn tab_bar_layout<V: ControlHost>(
     // Sizes are measured by tab id, so a reorder carries them along.
     let sizes: Option<Vec<f32>> = layout.tab_sizes(tabs.iter().map(|tab| {
         state
-            .bounds(Tag::new((id, "tab", vertical, &tab.id)))
+            .bounds(Tag::new((id, "tab", geometry, &tab.id)))
             .map(|bounds| f32::from(bounds.size.width))
     }));
     let places: Option<Vec<f32>> = sizes
@@ -262,12 +267,12 @@ pub fn tab_bar_layout<V: ControlHost>(
     // that is where it is laid out after a close or a reorder, not where a
     // slide happens to be drawing it.
     if let Some(tab) = tabs.get(selected)
-        && state.tab_reveal_pending(id, (&tab.id, vertical))
+        && state.tab_reveal_pending(id, (&tab.id, geometry))
         && let Some((places, sizes)) = places.as_ref().zip(sizes.as_ref())
         && let Some(slot) = order.iter().position(|&index| index == selected)
         && reveal_tab(&scroll, vertical, places, sizes, &order, slot)
     {
-        state.finish_tab_reveal(id, (&tab.id, vertical));
+        state.finish_tab_reveal(id, (&tab.id, geometry));
     }
     // The tab under the hand rides with the pointer, from the point where it
     // was grabbed, and the others slide out of its way; only on release does
@@ -308,12 +313,12 @@ pub fn tab_bar_layout<V: ControlHost>(
             // there on release.
             match held_offset.filter(|_| held_slot == Some(slot)) {
                 Some(offset) => (
-                    state.snap((id, "pill-pos", vertical), pos + offset),
-                    state.snap((id, "pill-size", vertical), size),
+                    state.snap((id, "pill-pos", geometry), pos + offset),
+                    state.snap((id, "pill-size", geometry), size),
                 ),
                 None => (
-                    state.tween((id, "pill-pos", vertical), pos, MOVE),
-                    state.tween((id, "pill-size", vertical), size, MOVE),
+                    state.tween((id, "pill-pos", geometry), pos, MOVE),
+                    state.tween((id, "pill-size", geometry), size, MOVE),
                 ),
             }
         });
@@ -344,7 +349,7 @@ pub fn tab_bar_layout<V: ControlHost>(
         let on = state.blend(key("tab-on"), active, SWITCH_SLIDE);
         // Laid out in its slot, drawn on its way there — or, for the tab in
         // hand, wherever the hand is.
-        let slide = key(if vertical { "tab-y" } else { "tab-x" });
+        let slide = Tag::new((id, "tab-slide", geometry, &tab.id));
         let offset = match (places.as_ref(), held_offset.filter(|_| held)) {
             (Some(places), Some(offset)) => state.snap(slide, places[slot] + offset) - places[slot],
             (Some(places), None) => {
@@ -448,7 +453,7 @@ pub fn tab_bar_layout<V: ControlHost>(
                                     let state = host.control_state_mut();
                                     state.record_slot(id, slot, laid_out);
                                     state.record_bounds(
-                                        Tag::new((id, "tab", vertical, &tab_id)),
+                                        Tag::new((id, "tab", geometry, &tab_id)),
                                         laid_out,
                                     );
                                 });
@@ -486,11 +491,7 @@ pub fn tab_bar_layout<V: ControlHost>(
                             .unwrap_or(0.0);
                         this.control_state_mut().begin_tab_drag(TabDrag {
                             bar: id,
-                            axis: if vertical {
-                                TrackAxis::Vertical
-                            } else {
-                                TrackAxis::Horizontal
-                            },
+                            axis: track_axis(vertical),
                             from: slot,
                             to: slot,
                             moved: false,
@@ -747,6 +748,14 @@ fn tab_close_glyph() -> Div {
         .rounded(px(3.0))
         .text_size(px(10.0))
         .child("\u{2715}")
+}
+
+fn track_axis(vertical: bool) -> TrackAxis {
+    if vertical {
+        TrackAxis::Vertical
+    } else {
+        TrackAxis::Horizontal
+    }
 }
 
 fn tab_places(sizes: &[f32], order: &[usize], gap: f32) -> Vec<f32> {

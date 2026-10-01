@@ -223,10 +223,10 @@ enum Record {
     List { highlight: usize, query: u64 },
     /// Where something painted last frame.
     Bounds(Bounds<Pixels>),
-    /// A selected tab needs its bar painted, in the orientation it is shown
-    /// in, before it can be scrolled into view. Once acknowledged, manual
+    /// A selected tab needs its bar painted, in the layout it is shown in,
+    /// before it can be scrolled into view. Once acknowledged, manual
     /// scrolling must stay in the user's control until the selection or
-    /// orientation changes again.
+    /// layout changes again.
     Reveal {
         selection: Tag,
         pending: bool,
