@@ -25,7 +25,7 @@ Vampir builds on [gpui-ce](https://github.com/gpui-ce/gpui-ce), the community ed
 
 ```toml
 [dependencies]
-vampir = "0.1"
+vampir = "0.2"
 gpui = { package = "gpui-ce", version = "0.2" }
 ```
 
