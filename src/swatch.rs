@@ -10,8 +10,9 @@
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, Bounds, Context, ElementId, KeyDownEvent, MouseButton, MouseDownEvent, Pixels,
-    Rgba, Window, canvas, div, fill, point, prelude::*, px,
+    AnyElement, Bounds, ColorSpace, Context, ElementId, KeyDownEvent, MouseButton, MouseDownEvent,
+    Pixels, Rgba, Window, canvas, div, fill, linear_color_stop, linear_gradient, point, prelude::*,
+    px,
 };
 
 use crate::color::{OklchHue, oklch_to_color};
@@ -88,6 +89,7 @@ pub fn saturation_slider<V: ControlHost>(
 /// How many chroma steps the pad paints across. A step of a fortieth of
 /// the range is below what anyone can see.
 const PAD_COLUMNS: usize = 40;
+const PAD_GRADIENT_STRIPS: usize = 8;
 const MAX_PAD_ROWS: usize = 120;
 
 #[derive(Default)]
@@ -163,6 +165,7 @@ fn pad_colors(hue: f64, columns: usize, rows: usize) -> Rc<[Rgba]> {
 /// to right and lightness bottom to top. Neighbours share their edges
 /// exactly — the same expression on both sides — so snapping to device
 /// pixels can never open a seam between them.
+#[cfg(test)]
 fn cells_with_colors(
     bounds: Bounds<Pixels>,
     colors: &[Rgba],
@@ -185,16 +188,43 @@ fn cells_with_colors(
         })
 }
 
+/// Neighbouring strips share an endpoint colour. sRGB interpolation keeps
+/// every colour inside the display gamut, including at the pad's dark edge.
+fn gradient_cells(
+    bounds: Bounds<Pixels>,
+    colors: &[Rgba],
+    columns: usize,
+    rows: usize,
+) -> impl Iterator<Item = (Bounds<Pixels>, gpui::Background)> + '_ {
+    let x = move |strip| {
+        bounds.origin.x + bounds.size.width * (strip as f32 / PAD_GRADIENT_STRIPS as f32)
+    };
+    let y = move |row| bounds.origin.y + bounds.size.height * (row as f32 / rows as f32);
+    (0..PAD_GRADIENT_STRIPS).flat_map(move |strip| {
+        let left = strip * columns / PAD_GRADIENT_STRIPS;
+        let right = ((strip + 1) * columns / PAD_GRADIENT_STRIPS).min(columns - 1);
+        (0..rows).map(move |row| {
+            let bounds =
+                Bounds::from_corners(point(x(strip), y(row)), point(x(strip + 1), y(row + 1)));
+            let gradient = linear_gradient(
+                90.0,
+                linear_color_stop(colors[left * rows + row], 0.0),
+                linear_color_stop(colors[right * rows + row], 1.0),
+            )
+            .color_space(ColorSpace::Srgb);
+            (bounds, gradient)
+        })
+    })
+}
+
 /// Saturation and lightness pad for one hue: chroma left to right, lightness
 /// bottom to top, with a ring on the current colour.
 ///
-/// Painted as a grid of flat cells straight into the scene, because gpui has
-/// no two-dimensional gradient. Flat cells rather than gradient ones on
-/// purpose: gpui mixes gradients in Oklab on the GPU, and between two
-/// gamut-clipped stops that mix leaves the gamut and comes back as `NaN`,
-/// which paints black. Straight into the scene rather than as elements
-/// because a few thousand cells is nothing to the GPU and far too much for
-/// layout to do again on every pointer move.
+/// Painted straight into the scene as narrow sRGB gradient strips. GPUI's
+/// default Oklab interpolation can leave the gamut between clipped stops,
+/// while a flat cell per colour makes every frame issue thousands of paint
+/// calls on the CPU. These strips keep the sampled colours and use a small
+/// fraction of those calls without adding layout elements.
 pub fn color_pad<V: ControlHost>(
     id: ComboId,
     color: Oklch,
@@ -249,8 +279,8 @@ pub fn color_pad<V: ControlHost>(
         move |bounds, colors, window, _cx| {
             let Some(colors) = colors else { return };
             let rows = colors.len() / PAD_COLUMNS;
-            for (cell, fill_color) in cells_with_colors(bounds, &colors, PAD_COLUMNS, rows) {
-                window.paint_quad(fill(cell, fill_color));
+            for (cell, gradient) in gradient_cells(bounds, &colors, PAD_COLUMNS, rows) {
+                window.paint_quad(fill(cell, gradient));
             }
         },
     )
@@ -410,9 +440,12 @@ pub fn hue_wheel(lightness: f64, chroma: f64) -> Vec<Oklch> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PAD_COLUMNS, PadCache, cells_with_colors, pad_colors, pad_rows};
+    use super::{
+        PAD_COLUMNS, PAD_GRADIENT_STRIPS, PadCache, cells_with_colors, gradient_cells, pad_colors,
+        pad_rows,
+    };
     use crate::color::{channels, relative_luminance};
-    use gpui::{Bounds, point, px, size};
+    use gpui::{Bounds, ColorSpace, point, px, size};
     use std::rc::Rc;
 
     fn pad_cells(
@@ -483,6 +516,29 @@ mod tests {
         let (last, _) = cells[cells.len() - 1];
         assert_eq!(first.origin, bounds.origin);
         assert_eq!(last.bottom_right(), bounds.bottom_right());
+    }
+
+    #[test]
+    fn gradient_strips_tile_the_pad_in_srgb() {
+        let bounds = pad();
+        let rows = pad_rows(140.0);
+        let colors = pad_colors(200.0, PAD_COLUMNS, rows);
+        let strips: Vec<_> = gradient_cells(bounds, &colors, PAD_COLUMNS, rows).collect();
+        assert_eq!(strips.len(), PAD_GRADIENT_STRIPS * rows);
+        assert!(
+            strips
+                .iter()
+                .all(|(_, background)| background.interpolation_space() == ColorSpace::Srgb)
+        );
+        for strip in 0..PAD_GRADIENT_STRIPS {
+            let first = strips[strip * rows].0;
+            let last = strips[strip * rows + rows - 1].0;
+            assert_eq!(first.top(), bounds.top());
+            assert_eq!(last.bottom(), bounds.bottom());
+            if strip > 0 {
+                assert_eq!(strips[(strip - 1) * rows].0.right(), first.left());
+            }
+        }
     }
 
     #[test]

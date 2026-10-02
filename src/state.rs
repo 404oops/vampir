@@ -177,18 +177,20 @@ enum Kind {
     Streak,
     List,
     Bounds,
+    Reveal,
 }
 
 impl Kind {
     fn slot(self, tag: Tag) -> Tag {
         // XOR with a constant is a bijection, so a well-mixed tag stays
         // well-mixed for the table's sake.
-        const SALT: [u64; 5] = [
+        const SALT: [u64; 6] = [
             0x9E37_79B9_7F4A_7C15,
             0xD1B5_4A32_D192_ED03,
             0x8CB9_2BA7_2F3D_8DD7,
             0x5851_F42D_4C95_7F2D,
             0x2545_F491_4F6C_DD1D,
+            0xA24B_1CD7_95E8_6F03,
         ];
         Tag(tag.0 ^ SALT[self as usize])
     }
@@ -216,11 +218,40 @@ enum Record {
     },
     /// A group of rows: the frame its current run of frames began in.
     Streak { started: u32 },
-    /// The keyboard's row in a filtering list, and a hash of the query the
-    /// row belongs to.
-    List { highlight: usize, query: u64 },
+    /// The keyboard's row in a filtering list, a hash of the query the row
+    /// belongs to, the tag of the result it was on when the list was last
+    /// drawn (zero before it has been drawn with ids), and whether anyone
+    /// has moved it since the query last changed.
+    List {
+        highlight: usize,
+        query: u64,
+        item: u64,
+        chosen: bool,
+    },
     /// Where something painted last frame.
     Bounds(Bounds<Pixels>),
+    /// A selected tab needs its bar painted, in the layout it is shown in,
+    /// before it can be scrolled into view. Once acknowledged, manual
+    /// scrolling must stay in the user's control until the selection or
+    /// layout changes again.
+    Reveal {
+        selection: Tag,
+        pending: bool,
+        retries: u8,
+    },
+}
+
+/// What [`ControlState::follow_list`] did to a list's keyboard row, which
+/// tells a scrolling list what to do with its scroll.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ListChange {
+    /// The row is where it was.
+    Same,
+    /// A new query, or the highlighted result went away: back to the
+    /// first row, and the list back to its top.
+    Reset,
+    /// The highlighted result moved, and the row went with it.
+    Moved,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -294,6 +325,8 @@ pub struct TrackDrag {
 #[derive(Clone, Copy, Debug)]
 pub struct TabDrag {
     pub bar: ComboId,
+    /// The bar's direction; horizontal tabs read x, vertical tabs read y.
+    pub axis: TrackAxis,
     /// Where the tab started.
     pub from: usize,
     /// Where it would land if released now.
@@ -303,13 +336,27 @@ pub struct TabDrag {
     /// reorder: a real click almost always wobbles a pixel between press and
     /// release, and that must still select the tab.
     pub moved: bool,
-    /// How far into the tab the pointer took hold, in window x, so the tab
+    /// How far into the tab the pointer took hold, along the bar, so the tab
     /// rides under the hand where it was grabbed rather than by its edge.
     pub grab: f32,
-    /// Where the pointer was pressed, in window x.
+    /// Where the pointer was pressed, along the bar.
     pub pressed: f32,
-    /// Where the pointer is now, in window x.
+    /// Where the pointer is now, along the bar.
     pub pointer: f32,
+}
+
+fn tab_start(bounds: Bounds<Pixels>, axis: TrackAxis) -> f32 {
+    match axis {
+        TrackAxis::Vertical => f32::from(bounds.top()),
+        _ => f32::from(bounds.left()),
+    }
+}
+
+fn tab_end(bounds: Bounds<Pixels>, axis: TrackAxis) -> f32 {
+    match axis {
+        TrackAxis::Vertical => f32::from(bounds.bottom()),
+        _ => f32::from(bounds.right()),
+    }
 }
 
 /// How far a pressed tab has to travel before the press becomes a drag.
@@ -361,6 +408,26 @@ pub struct OpenMenu {
     /// activated — headers and separators are passed over rather than landed
     /// on, because arrowing onto something inert reads as a stuck key.
     pub highlight: Option<usize>,
+    /// The submenu rows taken from the root to the visible level. Each one
+    /// retains its reachable-row position so Back restores the cursor to the
+    /// row that opened that level.
+    pub(crate) levels: Vec<MenuBranch>,
+    /// When the visible level last changed. The rows of a new level slide in
+    /// under a pointer that was aimed at the old one, so they take no clicks
+    /// until they have arrived.
+    pub(crate) level_changed_at: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct MenuBranch {
+    pub index: usize,
+    pub highlight: usize,
+    /// Fingerprint of this branch's label and its own rows. An index alone
+    /// could point into a different submenu after the host rebuilds rows.
+    pub identity: u64,
+    /// How far the parent level was scrolled, so coming back out lands
+    /// where the reader left it rather than at the top.
+    pub scroll: Point<Pixels>,
 }
 
 /// A modal dialog that is open, or on its way out.
@@ -492,6 +559,8 @@ pub struct ControlState {
 
     /// The gesture in flight, if any.
     drag: Option<Drag>,
+    /// A rendered tab bar changed axis while its drag was in flight.
+    tab_drag_invalidated: Cell<bool>,
 }
 
 impl Default for ControlState {
@@ -526,6 +595,7 @@ impl ControlState {
             recording_activation: None,
             ring_hidden: false,
             drag: None,
+            tab_drag_invalidated: Cell::new(false),
         }
     }
 
@@ -809,7 +879,9 @@ impl ControlState {
             opened_at: Instant::now(),
             return_focus,
         });
-        self.highlight_list(id, 0);
+        self.set_list_highlight(id.into(), 0, 0, false);
+        let scroll = self.scroll((id, "list"));
+        scroll.set_offset(Point::default());
         query.update(cx, |input, cx| input.set_text("", cx));
         let focus = query.read(cx).focus_handle.clone();
         window.focus(&focus, cx);
@@ -863,17 +935,94 @@ impl ControlState {
                 record: Record::List {
                     highlight: 0,
                     query: hash,
+                    item: 0,
+                    chosen: false,
                 },
             });
         entry.touched = frame;
-        let Record::List { highlight, query } = &mut entry.record else {
+        let Record::List {
+            highlight,
+            query,
+            item,
+            chosen,
+        } = &mut entry.record
+        else {
             return 0;
         };
         if *query != hash {
             *query = hash;
             *highlight = 0;
+            *item = 0;
+            *chosen = false;
         }
         *highlight
+    }
+
+    /// [`list_highlight`](Self::list_highlight) for a list that knows its
+    /// rows' ids. A new query goes back to the first row. Until the
+    /// highlight is moved it stays on the first row as results change under
+    /// the same query, so the best match is still the one Enter picks when
+    /// a better one arrives. Once it has been moved — by the keys, or by
+    /// [`highlight_list`](Self::highlight_list) — it stays on the result it
+    /// was moved to as results arrive or re-rank, so Enter never picks
+    /// something the person did not choose; only if that result has gone
+    /// does it fall back to the first row.
+    pub(crate) fn follow_list(
+        &self,
+        list: impl Into<Tag>,
+        query: &str,
+        ids: &[SharedString],
+    ) -> (usize, ListChange) {
+        let hash = Tag::new(query).0;
+        let tag = |id: &SharedString| Tag::from(id).0;
+        let frame = self.frame.get();
+        let mut records = self.records.borrow_mut();
+        let slot = Kind::List.slot(list.into());
+        // A list arriving afresh starts at the top, wherever a scroll
+        // handle that outlived its last showing was left.
+        let fresh = !records.contains_key(&slot);
+        let entry = records.entry(slot).or_insert(Entry {
+            touched: frame,
+            record: Record::List {
+                highlight: 0,
+                query: hash,
+                item: 0,
+                chosen: false,
+            },
+        });
+        entry.touched = frame;
+        let Record::List {
+            highlight,
+            query,
+            item,
+            chosen,
+        } = &mut entry.record
+        else {
+            return (0, ListChange::Same);
+        };
+        let change = if fresh || *query != hash {
+            *query = hash;
+            *highlight = 0;
+            *chosen = false;
+            ListChange::Reset
+        } else if *chosen && *item != 0 && ids.get(*highlight).map(tag) != Some(*item) {
+            match ids.iter().position(|id| tag(id) == *item) {
+                Some(index) => {
+                    *highlight = index;
+                    ListChange::Moved
+                }
+                None => {
+                    *highlight = 0;
+                    *chosen = false;
+                    ListChange::Reset
+                }
+            }
+        } else {
+            ListChange::Same
+        };
+        *highlight = (*highlight).min(ids.len().saturating_sub(1));
+        *item = ids.get(*highlight).map_or(0, tag);
+        (*highlight, change)
     }
 
     /// The keyboard's row in list `list` as last set, whatever the query.
@@ -889,20 +1038,45 @@ impl ControlState {
 
     /// Puts the keyboard on row `index` of list `list`.
     pub fn highlight_list(&self, list: impl Into<Tag>, index: usize) {
+        self.set_list_highlight(list.into(), index, 0, true);
+    }
+
+    /// Puts the keyboard on row `index` of list `list`, which shows result
+    /// `id` there. Naming the result as well as the row lets
+    /// [`follow_list`](Self::follow_list) keep the keyboard on it even if
+    /// the results change before the list is next drawn.
+    pub(crate) fn highlight_list_item(
+        &self,
+        list: impl Into<Tag>,
+        index: usize,
+        id: &SharedString,
+    ) {
+        self.set_list_highlight(list.into(), index, Tag::from(id).0, true);
+    }
+
+    fn set_list_highlight(&self, list: Tag, index: usize, to: u64, moved: bool) {
         let frame = self.frame.get();
         let mut records = self.records.borrow_mut();
-        let entry = records
-            .entry(Kind::List.slot(list.into()))
-            .or_insert(Entry {
-                touched: frame,
-                record: Record::List {
-                    highlight: index,
-                    query: Tag::new("").0,
-                },
-            });
+        let entry = records.entry(Kind::List.slot(list)).or_insert(Entry {
+            touched: frame,
+            record: Record::List {
+                highlight: index,
+                query: Tag::new("").0,
+                item: to,
+                chosen: moved,
+            },
+        });
         entry.touched = frame;
-        if let Record::List { highlight, .. } = &mut entry.record {
+        if let Record::List {
+            highlight,
+            item,
+            chosen,
+            ..
+        } = &mut entry.record
+        {
             *highlight = index;
+            *item = to;
+            *chosen = moved;
         }
     }
 
@@ -1112,8 +1286,67 @@ impl ControlState {
             .clone()
     }
 
-    /// True while a fade or slide still needs frames. A host folds this into
-    /// whatever decides to request the next frame.
+    /// Whether a selected tab still needs to be brought into view. Its first
+    /// render has nothing painted to measure, so the request survives until
+    /// a render that has.
+    /// A completed request stays completed through ordinary manual scrolls.
+    pub(crate) fn tab_reveal_pending(&self, bar: ComboId, selection: impl Hash) -> bool {
+        let selection = Tag::new(selection);
+        let frame = self.frame.get();
+        let mut records = self.records.borrow_mut();
+        let entry = records
+            .entry(Kind::Reveal.slot(Tag::new((bar, "selected-tab"))))
+            .or_insert(Entry {
+                touched: frame,
+                record: Record::Reveal {
+                    selection,
+                    pending: true,
+                    retries: 0,
+                },
+            });
+        entry.touched = frame;
+        let Record::Reveal {
+            selection: shown,
+            pending,
+            retries,
+        } = &mut entry.record
+        else {
+            return false;
+        };
+        if *shown != selection {
+            *shown = selection;
+            *pending = true;
+            *retries = 0;
+        }
+        if *pending {
+            *retries = retries.saturating_add(1);
+        }
+        *pending
+    }
+
+    /// A successful reveal is one shot: the selected tab can later be
+    /// scrolled away by hand without being pulled back on the next frame.
+    pub(crate) fn finish_tab_reveal(&self, bar: ComboId, selection: impl Hash) {
+        let selection = Tag::new(selection);
+        let mut records = self.records.borrow_mut();
+        if let Some(Entry {
+            record:
+                Record::Reveal {
+                    selection: shown,
+                    pending,
+                    ..
+                },
+            ..
+        }) = records.get_mut(&Kind::Reveal.slot(Tag::new((bar, "selected-tab"))))
+            && *shown == selection
+        {
+            *pending = false;
+        }
+    }
+
+    /// True while a fade or slide still needs frames, or a selected tab is
+    /// waiting for its first painted bounds. A host folds this into whatever
+    /// decides to request the next frame.
     ///
     /// Also the end of a frame's bookkeeping: it is called once per render,
     /// after everything has been built, so it counts frames, and retires the
@@ -1139,6 +1372,9 @@ impl ControlState {
                 | Record::Tween {
                     since, duration, ..
                 } => now.saturating_sub(since) < u64::from(duration),
+                Record::Reveal {
+                    pending, retries, ..
+                } => pending && retries <= 3,
                 _ => false,
             };
             true
@@ -1303,7 +1539,17 @@ impl ControlState {
 
     /// Starts a tab reorder.
     pub fn begin_tab_drag(&mut self, drag: TabDrag) {
+        self.tab_drag_invalidated.set(false);
         self.drag = Some(Drag::Tab(drag));
+    }
+
+    /// A tab bar can change orientation while a press is held. Remember
+    /// that its old positions cannot be used for a reorder on release.
+    pub(crate) fn note_tab_axis(&self, bar: ComboId, axis: TrackAxis) -> bool {
+        if matches!(&self.drag, Some(Drag::Tab(drag)) if drag.bar == bar && drag.axis != axis) {
+            self.tab_drag_invalidated.set(true);
+        }
+        !self.tab_drag_invalidated.get()
     }
 
     /// Where along the dragged track a pointer position falls, each
@@ -1362,9 +1608,16 @@ impl ControlState {
     /// a fling that clears several tabs in one event lands where the hand
     /// stopped rather than one slot along.
     pub fn drag_tab_to(&mut self, position: Point<Pixels>) -> bool {
-        let pointer = f32::from(position.x);
+        if self.tab_drag_invalidated.get() {
+            return false;
+        }
         let Some(Drag::Tab(drag)) = &self.drag else {
             return false;
+        };
+        let axis = drag.axis;
+        let pointer = match axis {
+            TrackAxis::Vertical => f32::from(position.y),
+            _ => f32::from(position.x),
         };
         if !drag.moved && (pointer - drag.pressed).abs() < TAB_DRAG_THRESHOLD {
             return false;
@@ -1372,17 +1625,17 @@ impl ControlState {
         let (bar, mut to) = (drag.bar, drag.to);
         // Only walk one way: slots are last frame's geometry, and walking
         // back over ground just covered could otherwise loop for ever.
-        let leftwards = self
+        let backwards = self
             .slot(bar, to)
-            .is_some_and(|current| pointer < f32::from(current.left()));
+            .is_some_and(|current| pointer < tab_start(current, axis));
         while let Some(current) = self.slot(bar, to) {
-            let next = if leftwards {
-                if pointer >= f32::from(current.left()) || to == 0 {
+            let next = if backwards {
+                if pointer >= tab_start(current, axis) || to == 0 {
                     break;
                 }
                 to - 1
             } else {
-                if pointer <= f32::from(current.right()) {
+                if pointer <= tab_end(current, axis) {
                     break;
                 }
                 to + 1
@@ -1390,8 +1643,8 @@ impl ControlState {
             let Some(neighbour) = self.slot(bar, next) else {
                 break;
             };
-            let centre = f32::from(neighbour.center().x);
-            let past = if leftwards {
+            let centre = (tab_start(neighbour, axis) + tab_end(neighbour, axis)) / 2.0;
+            let past = if backwards {
                 pointer < centre
             } else {
                 pointer > centre
@@ -1426,8 +1679,9 @@ impl ControlState {
         // A marker no toggle consumed (the click landed elsewhere) must not
         // eat some later toggle click.
         self.combo_dismissed = None;
+        let invalidated = self.tab_drag_invalidated.replace(false);
         match self.drag.take()? {
-            Drag::Tab(drag) if drag.moved && drag.from != drag.to => {
+            Drag::Tab(drag) if !invalidated && drag.moved && drag.from != drag.to => {
                 Some((drag.bar, drag.from, drag.to))
             }
             _ => None,
@@ -1452,7 +1706,10 @@ impl ControlState {
             target: target.into(),
             opened_at: Instant::now(),
             highlight: None,
+            levels: Vec::new(),
+            level_changed_at: None,
         });
+        self.menu_scroll(id).set_offset(Point::default());
     }
 
     /// Opens a menu hanging beneath an element rather than at the pointer,
@@ -1471,7 +1728,10 @@ impl ControlState {
             target: target.into(),
             opened_at: Instant::now(),
             highlight: None,
+            levels: Vec::new(),
+            level_changed_at: None,
         });
+        self.menu_scroll(id).set_offset(Point::default());
     }
 
     // ---- Focus ----
@@ -1615,6 +1875,83 @@ impl ControlState {
     /// Which row of the open menu the keyboard is on.
     pub fn menu_highlight(&self) -> Option<usize> {
         self.menu.as_ref().and_then(|menu| menu.highlight)
+    }
+
+    /// Enters an enabled submenu. The menu opening, target and focus handle
+    /// stay put; only the visible level and its keyboard row change.
+    ///
+    /// A level entered from the keyboard starts on its first row, so the
+    /// next Enter has something to act on. One entered with the pointer
+    /// starts on nothing, as the root does: the hand is still over the row
+    /// it clicked, and a wash on a row it never touched would be a guess.
+    pub(crate) fn enter_menu(
+        &mut self,
+        index: usize,
+        highlight: usize,
+        identity: u64,
+        by_keyboard: bool,
+    ) {
+        let Some(id) = self.menu.as_ref().map(|menu| menu.id) else {
+            return;
+        };
+        let scroll = self.menu_scroll(id).offset();
+        if let Some(menu) = self.menu.as_mut() {
+            menu.levels.push(MenuBranch {
+                index,
+                highlight,
+                identity,
+                scroll,
+            });
+            menu.highlight = by_keyboard.then_some(0);
+        }
+        self.menu_level_changed(Point::default());
+    }
+
+    /// Returns to the parent level, restoring the row that opened it.
+    /// Returns false when the menu is already at its root.
+    pub(crate) fn back_menu(&mut self) -> bool {
+        let Some(menu) = self.menu.as_mut() else {
+            return false;
+        };
+        let Some(branch) = menu.levels.pop() else {
+            return false;
+        };
+        menu.highlight = Some(branch.highlight);
+        self.menu_level_changed(branch.scroll);
+        true
+    }
+
+    /// The open menu's scroll handle. Keyed by the menu alone, not by the
+    /// opening or the level, so a session of menus holds one handle rather
+    /// than one per level ever shown; each change of level sets its offset
+    /// instead.
+    pub(crate) fn menu_scroll(&self, id: ComboId) -> ScrollHandle {
+        self.scroll((id, "menu-scroll"))
+    }
+
+    /// Notes that the open menu now shows another level, scrolled to
+    /// `offset`.
+    pub(crate) fn menu_level_changed(&mut self, offset: Point<Pixels>) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        menu.level_changed_at = Some(Instant::now());
+        let id = menu.id;
+        self.menu_scroll(id).set_offset(offset);
+    }
+
+    /// Whether a row click belongs to the opening `opened_at` and to the
+    /// level now on screen. The second click of a double-click on a submenu
+    /// row lands on whatever row of the new level slid under the pointer;
+    /// until the level has finished arriving, a click is the tail of one
+    /// aimed at the level before.
+    pub(crate) fn menu_takes_click(&self, opened_at: Instant) -> bool {
+        self.menu.as_ref().is_some_and(|menu| {
+            menu.opened_at == opened_at
+                && menu
+                    .level_changed_at
+                    .is_none_or(|changed| changed.elapsed() >= self.scaled(MOVE))
+        })
     }
 
     /// Closes whatever is showing over the view: a pop-up list, a context
@@ -1811,7 +2148,7 @@ pub fn end_drags<V: ControlHost>(host: &mut V, cx: &mut Context<V>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlState, Entry, Palette, SCHEME_FADE, TabDrag, Tag, TrackAxis};
+    use super::{ControlState, Entry, ListChange, Palette, SCHEME_FADE, TabDrag, Tag, TrackAxis};
     use gpui::{Bounds, ElementId, Point, SharedString, px, size};
 
     fn at(x: f32, y: f32) -> Point<gpui::Pixels> {
@@ -1894,6 +2231,79 @@ mod tests {
         state.close_menu();
         assert_eq!(state.menu_target(), None);
         assert_eq!(state.menu_opened_at(), None);
+    }
+
+    #[test]
+    fn submenu_navigation_keeps_the_opening_and_restores_its_parent_row() {
+        let mut state = ControlState::new();
+        state.open_menu("row", at(10.0, 20.0), "budget.csv");
+        let opening = state.menu_opened_at();
+
+        state.enter_menu(3, 1, 11, false);
+        state.highlight_menu(Some(2));
+        state.enter_menu(4, 2, 22, false);
+        assert_eq!(state.menu_target(), Some("budget.csv"));
+        assert_eq!(state.menu_opened_at(), opening);
+        assert_eq!(state.menu_highlight(), None);
+
+        assert!(state.back_menu());
+        assert_eq!(state.menu_highlight(), Some(2));
+        assert!(state.back_menu());
+        assert_eq!(state.menu_highlight(), Some(1));
+        assert!(!state.back_menu());
+        assert_eq!(state.menu_target(), Some("budget.csv"));
+    }
+
+    #[test]
+    fn a_level_entered_by_keyboard_starts_on_its_first_row() {
+        let mut state = ControlState::new();
+        state.open_menu("row", at(10.0, 20.0), "budget.csv");
+        state.enter_menu(3, 1, 11, true);
+        assert_eq!(state.menu_highlight(), Some(0));
+        assert!(state.back_menu());
+        state.enter_menu(3, 1, 11, false);
+        assert_eq!(state.menu_highlight(), None);
+    }
+
+    /// Back is the way out of a level, so it returns to the parent as it
+    /// was left: the same row lit and the same stretch scrolled into view,
+    /// while the level that opened in its place starts at the top.
+    #[test]
+    fn back_restores_the_parent_scroll_and_a_new_level_starts_at_the_top() {
+        let mut state = ControlState::new();
+        state.open_menu("row", at(10.0, 20.0), "budget.csv");
+        let scroll = state.menu_scroll("row");
+        scroll.set_offset(at(0.0, -120.0));
+        state.enter_menu(9, 4, 11, false);
+        assert_eq!(scroll.offset(), Point::default());
+
+        assert!(state.back_menu());
+        assert_eq!(scroll.offset(), at(0.0, -120.0));
+        assert_eq!(state.menu_highlight(), Some(4));
+        // At the root there is nothing to go back to, and Back says so
+        // rather than closing anything itself.
+        assert!(!state.back_menu());
+        assert!(state.is_menu_open("row"));
+
+        state.open_menu("row", at(10.0, 20.0), "notes.md");
+        assert_eq!(scroll.offset(), Point::default());
+    }
+
+    #[test]
+    fn rows_take_no_clicks_until_their_level_has_arrived() {
+        let mut state = ControlState::new();
+        state.open_menu("row", at(10.0, 20.0), "budget.csv");
+        let opening = state.menu_opened_at().expect("open");
+        assert!(state.menu_takes_click(opening));
+
+        state.enter_menu(3, 1, 11, false);
+        assert!(!state.menu_takes_click(opening));
+        state.set_time_scale(0.001);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert!(state.menu_takes_click(opening));
+
+        state.open_menu("row", at(10.0, 20.0), "notes.md");
+        assert!(!state.menu_takes_click(opening));
     }
 
     /// Reopening replaces the target rather than keeping the first one, so a
@@ -2222,6 +2632,7 @@ mod tests {
         assert!(state.is_dragging("volume") && state.track_dragging());
         state.begin_tab_drag(TabDrag {
             bar: "tabs",
+            axis: TrackAxis::Horizontal,
             from: 0,
             to: 0,
             moved: false,
@@ -2242,6 +2653,7 @@ mod tests {
         state.record_slot("tabs", 1, rect(82.0, 0.0, 80.0, 26.0));
         state.begin_tab_drag(TabDrag {
             bar: "tabs",
+            axis: TrackAxis::Horizontal,
             from: 0,
             to: 0,
             moved: false,
@@ -2279,6 +2691,7 @@ mod tests {
         }
         state.begin_tab_drag(TabDrag {
             bar: "tabs",
+            axis: TrackAxis::Horizontal,
             from: 0,
             to: 0,
             moved: false,
@@ -2298,6 +2711,91 @@ mod tests {
         assert_eq!(state.end_drag(), Some(("tabs", 0, 1)));
     }
 
+    #[test]
+    fn a_vertical_tab_drag_uses_y_and_crosses_row_midpoints() {
+        let mut state = ControlState::new();
+        for slot in 0..3 {
+            state.record_slot("sidebar", slot, rect(20.0, slot as f32 * 30.0, 160.0, 28.0));
+        }
+        state.begin_tab_drag(TabDrag {
+            bar: "sidebar",
+            axis: TrackAxis::Vertical,
+            from: 0,
+            to: 0,
+            moved: false,
+            grab: 10.0,
+            pressed: 10.0,
+            pointer: 10.0,
+        });
+        assert!(
+            !state.drag_tab_to(at(140.0, 11.0)),
+            "x motion does not drag a vertical tab"
+        );
+        state.drag_tab_to(at(140.0, 80.0));
+        assert_eq!(state.tab_drag().map(|drag| drag.to), Some(2));
+        state.drag_tab_to(at(140.0, 34.0));
+        assert_eq!(state.tab_drag().map(|drag| drag.to), Some(1));
+        assert_eq!(state.end_drag(), Some(("sidebar", 0, 1)));
+    }
+
+    #[test]
+    fn changing_a_tab_bars_axis_cancels_its_pending_reorder() {
+        let mut state = ControlState::new();
+        state.begin_tab_drag(TabDrag {
+            bar: "tabs",
+            axis: TrackAxis::Horizontal,
+            from: 0,
+            to: 1,
+            moved: true,
+            grab: 10.0,
+            pressed: 10.0,
+            pointer: 90.0,
+        });
+        assert!(state.note_tab_axis("other", TrackAxis::Vertical));
+        assert!(state.note_tab_axis("tabs", TrackAxis::Horizontal));
+        assert!(state.tab_drag().is_some());
+        assert!(!state.note_tab_axis("tabs", TrackAxis::Vertical));
+        assert!(!state.note_tab_axis("tabs", TrackAxis::Horizontal));
+        assert!(!state.drag_tab_to(at(200.0, 20.0)));
+        assert_eq!(state.end_drag(), None);
+        assert!(!state.dragging_anything());
+    }
+
+    #[test]
+    fn selected_tab_reveal_waits_for_bounds_then_leaves_manual_scroll_alone() {
+        let state = ControlState::new();
+        assert!(state.tab_reveal_pending("tabs", ("first", false)));
+        assert!(state.animating(), "pending bounds request another frame");
+        assert!(state.tab_reveal_pending("tabs", ("first", false)));
+
+        state.finish_tab_reveal("tabs", ("first", false));
+        assert!(!state.tab_reveal_pending("tabs", ("first", false)));
+        assert!(
+            !state.animating(),
+            "completed reveal stops asking for frames"
+        );
+        assert!(!state.tab_reveal_pending("tabs", ("first", false)));
+
+        assert!(state.tab_reveal_pending("tabs", ("second", false)));
+        state.finish_tab_reveal("tabs", ("first", false));
+        assert!(state.tab_reveal_pending("tabs", ("second", false)));
+        state.finish_tab_reveal("tabs", ("second", false));
+        assert!(state.tab_reveal_pending("tabs", ("second", true)));
+    }
+
+    #[test]
+    fn an_unpainted_tab_does_not_request_frames_forever() {
+        let state = ControlState::new();
+        for _ in 0..3 {
+            assert!(state.tab_reveal_pending("tabs", ("hidden", false)));
+            assert!(state.animating());
+        }
+        assert!(state.tab_reveal_pending("tabs", ("hidden", false)));
+        assert!(!state.animating());
+        // The request remains pending for a later render when the tab paints.
+        assert!(state.tab_reveal_pending("tabs", ("hidden", false)));
+    }
+
     /// A list's keyboard row survives frames while the query is the same,
     /// and goes back to the top when the query changes.
     #[test]
@@ -2312,6 +2810,96 @@ mod tests {
         state.highlight_list("commands", 4);
         assert_eq!(state.list_highlight("results", "rep"), 0);
         assert_eq!(state.list_position("commands"), 4);
+    }
+
+    fn ids(names: &[&'static str]) -> Vec<SharedString> {
+        names.iter().map(|name| SharedString::from(*name)).collect()
+    }
+
+    /// Arrowing to a result and then having a slow source land must leave
+    /// Enter on the result that was arrowed to, not on whatever is now in
+    /// its row.
+    #[test]
+    fn the_highlight_stays_on_its_result_as_sources_arrive() {
+        let state = ControlState::new();
+        let first = ids(&["tab", "bookmark", "file", "action"]);
+        assert_eq!(
+            state.follow_list("results", "des", &first).1,
+            ListChange::Reset
+        );
+        state.highlight_list_item("results", 3, &first[3]);
+
+        let appended = ids(&["tab", "bookmark", "file", "action", "remote"]);
+        assert_eq!(
+            state.follow_list("results", "des", &appended),
+            (3, ListChange::Same)
+        );
+
+        let ranked_above = ids(&["tab", "history", "bookmark", "file", "action", "remote"]);
+        assert_eq!(
+            state.follow_list("results", "des", &ranked_above),
+            (4, ListChange::Moved)
+        );
+        assert_eq!(
+            state.follow_list("results", "des", &ranked_above),
+            (4, ListChange::Same)
+        );
+
+        let gone = ids(&["tab", "history"]);
+        assert_eq!(
+            state.follow_list("results", "des", &gone),
+            (0, ListChange::Reset)
+        );
+    }
+
+    /// Until someone moves the highlight it belongs to the best match, so
+    /// a better result arriving takes it, the way a launcher's top hit does.
+    #[test]
+    fn an_untouched_highlight_stays_on_the_first_row_as_results_arrive() {
+        let state = ControlState::new();
+        let first = ids(&["review", "system"]);
+        state.follow_list("results", "design", &first);
+        let better = ids(&["notes", "review", "system"]);
+        assert_eq!(
+            state.follow_list("results", "design", &better),
+            (0, ListChange::Same)
+        );
+    }
+
+    #[test]
+    fn a_new_query_puts_a_followed_list_back_on_its_first_row() {
+        let state = ControlState::new();
+        let results = ids(&["tab", "bookmark", "file"]);
+        state.follow_list("results", "de", &results);
+        state.highlight_list_item("results", 2, &results[2]);
+        assert_eq!(
+            state.follow_list("results", "des", &results),
+            (0, ListChange::Reset)
+        );
+        let better = ids(&["notes", "tab", "bookmark", "file"]);
+        assert_eq!(
+            state.follow_list("results", "des", &better),
+            (0, ListChange::Same)
+        );
+    }
+
+    /// A host moving the highlight by row alone has it followed from the
+    /// next time the list is drawn.
+    #[test]
+    fn a_row_set_by_the_host_is_followed_once_drawn() {
+        let state = ControlState::new();
+        let results = ids(&["tab", "bookmark", "file"]);
+        state.follow_list("results", "", &results);
+        state.highlight_list("results", 1);
+        assert_eq!(
+            state.follow_list("results", "", &results),
+            (1, ListChange::Same)
+        );
+        let reordered = ids(&["bookmark", "tab", "file"]);
+        assert_eq!(
+            state.follow_list("results", "", &reordered),
+            (0, ListChange::Moved)
+        );
     }
 
     /// The theme's palette follows the truth rather than jumping to it,

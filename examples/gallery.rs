@@ -20,17 +20,18 @@ use gpui_ce_platform::application;
 #[cfg(feature = "app-icon")]
 use vampir::AppIcon;
 use vampir::{
-    BadgeTone, ButtonVariant, CONTROL_HEIGHT, ChipSelection, Choice, Chord, Column, ComboId,
-    Command, ControlHost, ControlState, DialogButton, Hint, InputStyle, MAX_CHROMA, MenuItem,
-    Oklch, Palette, Scheme, ScrollAxis, SliderTrack, SortDirection, Span, TEXT_SIZE,
-    TITLE_TEXT_SIZE, Tab, TextInput, Theme, TreeRow, WidgetContext, arriving, badge, bind_keys,
-    button, caption, card, checkbox, chip_group, collapsible, color_pad, column, combo,
-    command_palette, context_menu, dialog, edit_menu, fading_text, flatten_tree, glyph, ground,
-    hue_picker, hue_slider, hue_wheel, icon_button, labelled, lit, menu_button, menu_target,
-    progress_bar, radio_group, reorder, row, saturation_picker, scheme_picker, scroll_area,
-    search_list, segmented, separator, shortcut_recorder, slider, spinbox, spinner, split_area,
-    split_handle, swatch_grid, switch, tab_bar, table_header, table_row, text_area, text_field,
-    tree_row, ui_font,
+    BadgeTone, ButtonVariant, CARD_LIFT, CONTROL_HEIGHT, ChipSelection, Choice, Chord, Column,
+    ComboId, Command, ControlHost, ControlState, DialogButton, Hint, InputStyle, ListSelection,
+    MAX_CHROMA, MenuItem, Oklch, Palette, Scheme, ScrollAxis, SearchResult, SelectionIntent,
+    SliderTrack, SortDirection, Span, TEXT_SIZE, TITLE_TEXT_SIZE, Tab, TabBarLayout, TextInput,
+    Theme, TreeRow, WidgetContext, arriving, badge, bind_keys, button, caption, card, card_at,
+    checkbox, chip_group, collapsible, color_pad, column, combo, command_palette, context_menu,
+    dialog, edit_menu, fading_text, flatten_tree, glyph, ground, hue_picker, hue_slider, hue_wheel,
+    icon_button, labelled, lit, lit_stops, menu_button, menu_target, progress_bar, radio_group,
+    rank_results, ranked_command_palette, ranked_search_list, reorder, row, saturation_picker,
+    scheme_picker, scroll_area, search_list, segmented, selectable_list, separator,
+    shortcut_recorder, slider, spinbox, spinner, split_area, split_handle, swatch_grid, switch,
+    tab_bar, tab_bar_layout, table_header, table_row, text_area, text_field, tree_row, ui_font,
 };
 
 // The gallery is also the smallest complete *macOS* host, so it carries the
@@ -48,6 +49,7 @@ actions!(
         HideOthers,
         ShowAll,
         TogglePalette,
+        ToggleRankedPalette,
         UseSystemScheme,
         UseLight,
         UseDark,
@@ -201,6 +203,13 @@ struct Gallery {
     query: Entity<TextInput>,
     /// What the search field searches.
     search_items: Vec<Command>,
+    ranked_query: Entity<TextInput>,
+    ranked_palette_query: Entity<TextInput>,
+    ranked_items: Vec<SearchResult>,
+    history_loaded: bool,
+    /// Where the Ranked results card painted: a scroll handle records the
+    /// bounds of whatever tracks it, scrolling or not.
+    ranked_card: ScrollHandle,
     takes_edit: Entity<TextInput>,
     chord: Option<Chord>,
 
@@ -212,6 +221,7 @@ struct Gallery {
     sort: (SharedString, SortDirection),
     split: f32,
     details_open: bool,
+    selection: ListSelection,
     last_action: SharedString,
 
     // Colour page.
@@ -254,7 +264,7 @@ impl ControlHost for Gallery {
     fn tabs_reordered(&mut self, bar: ComboId, from: usize, to: usize, cx: &mut Context<Self>) {
         match bar {
             "pages" => reorder(&mut self.pages, &mut self.page, from, to),
-            "files" => reorder(&mut self.files, &mut self.file, from, to),
+            "files" | "files-vertical" => reorder(&mut self.files, &mut self.file, from, to),
             _ => return,
         }
         self.note(format!("Moved a tab from {from} to {to}"), cx);
@@ -307,6 +317,16 @@ impl Gallery {
             input
         });
         let query = cx.new(|cx| TextInput::new(cx, "Search", false, style(TEXT_SIZE)));
+        let ranked_query =
+            cx.new(|cx| TextInput::new(cx, "Search across sources", false, style(TEXT_SIZE)));
+        let ranked_palette_query = cx.new(|cx| {
+            TextInput::new(
+                cx,
+                "Search tabs, bookmarks and actions",
+                false,
+                style(TITLE_TEXT_SIZE),
+            )
+        });
         let takes_edit = cx.new(|cx| {
             let mut input = TextInput::new(cx, "", false, style(TEXT_SIZE));
             input.content = "24".into();
@@ -345,6 +365,72 @@ impl Gallery {
                 Command::new("keys", "Keyboard shortcuts").group("Settings"),
                 Command::new("notify", "Notifications").group("Settings"),
             ],
+            ranked_query,
+            ranked_palette_query,
+            ranked_items: vec![
+                SearchResult::new("tab-design", "Design review")
+                    .section("Open tabs")
+                    .detail("Project board · 2 minutes ago")
+                    .leading(|palette| glyph("▣").text_color(palette.accent)),
+                SearchResult::new("tab-release", "Release checklist")
+                    .section("Open tabs")
+                    .detail("Draft · Current window")
+                    .leading(|palette| glyph("▣").text_color(palette.accent)),
+                SearchResult::new("tab-insights", "Traffic insights")
+                    .section("Open tabs")
+                    .detail("Analytics · Current window")
+                    .leading(|palette| glyph("▣").text_color(palette.accent)),
+                SearchResult::new("tab-issues", "Issue tracker")
+                    .section("Open tabs")
+                    .detail("42 open tasks")
+                    .leading(|palette| glyph("▣").text_color(palette.accent)),
+                SearchResult::new("bookmark-system", "Design system")
+                    .section("Bookmarks")
+                    .detail("Components and colour recipes")
+                    .leading(|palette| glyph("★").text_color(palette.text_secondary)),
+                SearchResult::new("bookmark-keys", "Keyboard shortcuts")
+                    .section("Bookmarks")
+                    .detail("Reference · Documentation")
+                    .leading(|palette| glyph("★").text_color(palette.text_secondary)),
+                SearchResult::new("bookmark-api", "API reference")
+                    .section("Bookmarks")
+                    .detail("Framework documentation")
+                    .leading(|palette| glyph("★").text_color(palette.text_secondary)),
+                SearchResult::new("bookmark-roadmap", "Project roadmap")
+                    .section("Bookmarks")
+                    .detail("Milestones and plans")
+                    .leading(|palette| glyph("★").text_color(palette.text_secondary)),
+                SearchResult::new("file-budget", "Quarterly budget")
+                    .section("Files")
+                    .detail("Shared documents · Updated today")
+                    .leading(|palette| glyph("▤").text_color(palette.text_secondary)),
+                SearchResult::new("file-summary", "Meeting summary")
+                    .section("Files")
+                    .detail("Notes · Updated yesterday")
+                    .leading(|palette| glyph("▤").text_color(palette.text_secondary)),
+                SearchResult::new("history-notes", "Design notes")
+                    .section("History")
+                    .detail("Visited this morning")
+                    .leading(|palette| glyph("↶").text_color(palette.text_secondary)),
+                SearchResult::new("history-changelog", "Release notes")
+                    .section("History")
+                    .detail("Visited yesterday")
+                    .leading(|palette| glyph("↶").text_color(palette.text_secondary)),
+                SearchResult::new("action-settings", "Open settings")
+                    .section("Actions")
+                    .shortcut(vampir::display("secondary-,"))
+                    .leading(|palette| glyph("⚙").text_color(palette.text_secondary)),
+                SearchResult::new("action-invite", "Invite teammate")
+                    .section("Actions")
+                    .detail("Share this workspace")
+                    .leading(|palette| glyph("⚙").text_color(palette.text_secondary)),
+                SearchResult::new("action-export", "Export report")
+                    .section("Actions")
+                    .detail("Save a local copy")
+                    .leading(|palette| glyph("⚙").text_color(palette.text_secondary)),
+            ],
+            history_loaded: false,
+            ranked_card: ScrollHandle::new(),
             takes_edit,
             chord: Some(Chord {
                 keystroke: "secondary-shift-s".into(),
@@ -352,7 +438,12 @@ impl Gallery {
             }),
             files: vec![
                 Tab::new("Overview").closable(),
-                Tab::new("Details").badge("3").closable(),
+                Tab::new("Release planning").closable(),
+                Tab::new("Design system notes").closable(),
+                Tab::new("User research").closable(),
+                Tab::new("Build output").badge("3").closable(),
+                Tab::new("Accessibility review").closable(),
+                Tab::new("Localizations").closable(),
                 Tab::new("History").closable(),
             ],
             file: 0,
@@ -385,6 +476,7 @@ impl Gallery {
             sort: ("changed".into(), SortDirection::Descending),
             split: 0.42,
             details_open: true,
+            selection: ListSelection::new(),
             last_action: "—".into(),
             colour: Oklch::new(268.0, 0.11, 0.62),
             palette_query,
@@ -419,6 +511,17 @@ impl Gallery {
     fn toggle_palette(&mut self, _: &TogglePalette, window: &mut Window, cx: &mut Context<Self>) {
         self.controls
             .toggle_palette("commands", &self.palette_query, window, cx);
+        cx.notify();
+    }
+
+    fn toggle_ranked_palette(
+        &mut self,
+        _: &ToggleRankedPalette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.controls
+            .toggle_palette("ranked-commands", &self.ranked_palette_query, window, cx);
         cx.notify();
     }
 
@@ -490,6 +593,18 @@ impl Gallery {
         self.note(format!("Opened {label}"), cx);
     }
 
+    /// Every source's results, best first. History stands for a source
+    /// that answers late, and only joins once its button says it has.
+    fn ranked_results(&self, query: &str) -> Vec<SearchResult> {
+        let loaded: Vec<SearchResult> = self
+            .ranked_items
+            .iter()
+            .filter(|result| self.history_loaded || result.section.as_deref() != Some("History"))
+            .cloned()
+            .collect();
+        rank_results(query, &loaded)
+    }
+
     fn minimize(&mut self, _: &MinimizeWindow, window: &mut Window, _cx: &mut Context<Self>) {
         window.minimize_window();
     }
@@ -505,6 +620,18 @@ impl Gallery {
     fn note(&mut self, what: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.last_action = what.into();
         cx.notify();
+    }
+
+    fn close_file_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.files.len() {
+            return;
+        }
+        let label = self.files.remove(index).label;
+        if index < self.file {
+            self.file -= 1;
+        }
+        self.file = self.file.min(self.files.len().saturating_sub(1));
+        self.note(format!("Closed {label}"), cx);
     }
 }
 
@@ -546,23 +673,21 @@ impl Render for Gallery {
         let body = match page {
             Page::Controls => self.page_controls(palette, cx),
             Page::Fields => self.page_fields(palette, window, cx),
-            Page::Data => self.page_data(palette, cx),
+            Page::Data => self.page_data(palette, window, cx),
             Page::Colour => self.page_colour(palette, cx),
         };
         // Keyed by the page, not the tab's position, so reordering the tabs
         // is not a page change.
         let body = arriving("page", page as u64, &self.controls, body);
-
-        // Asked *after* the page is built, on purpose: a control notices its
-        // own state change while it renders. Fades and slides stop asking
-        // when they finish; the spinner requests its own frames while visible.
-        if self.controls.animating() {
-            window.request_animation_frame();
-        }
+        let ranked_palette_results = if self.controls.is_palette_open("ranked-commands") {
+            self.ranked_results(&self.ranked_palette_query.read(cx).text())
+        } else {
+            Vec::new()
+        };
 
         // The toolkit's handlers first — Tab, Shift-Tab, Escape, the drags,
         // the mouse taking over — and the gallery's own actions after them.
-        vampir::root(div().id("root"), self, cx)
+        let root = vampir::root(div().id("root"), self, cx)
             .size_full()
             .flex()
             .flex_col()
@@ -571,6 +696,7 @@ impl Render for Gallery {
             .bg(ground(palette.backdrop))
             .text_color(palette.text_primary)
             .on_action(cx.listener(Self::toggle_palette))
+            .on_action(cx.listener(Self::toggle_ranked_palette))
             .on_action(cx.listener(Self::use_system_scheme))
             .on_action(cx.listener(Self::use_light))
             .on_action(cx.listener(Self::use_dark))
@@ -613,6 +739,14 @@ impl Render for Gallery {
                 window,
                 |this, id, _window, cx| this.run_command(id, cx),
             ))
+            .children(ranked_command_palette(
+                "ranked-commands",
+                &self.ranked_palette_query,
+                &ranked_palette_results,
+                WidgetContext::new(palette, self, cx),
+                window,
+                |this, id, _window, cx| this.note(format!("Opened {id}"), cx),
+            ))
             .children(context_menu(
                 "row",
                 &self.row_menu(),
@@ -621,7 +755,13 @@ impl Render for Gallery {
                 cx,
                 |this, action, _window, cx| {
                     let target = this.controls.menu_target().unwrap_or("").to_string();
-                    this.note(format!("{action} → {target}"), cx);
+                    let description = match action {
+                        "move-documents" => "Move to Documents",
+                        "move-images" => "Move to Images",
+                        "duplicate" => "Duplicate",
+                        _ => action,
+                    };
+                    this.note(format!("{description} → {target}"), cx);
                 },
             ))
             .children(context_menu(
@@ -632,9 +772,26 @@ impl Render for Gallery {
                 cx,
                 |this, action, window, cx| {
                     match action {
-                        "system" => this.set_scheme(Scheme::System, cx),
-                        "light" => this.set_scheme(Scheme::Light, cx),
-                        "dark" => this.set_scheme(Scheme::Dark, cx),
+                        "system" => {
+                            this.set_scheme(Scheme::System, cx);
+                            this.note("Following system appearance", cx);
+                        }
+                        "light" => {
+                            this.set_scheme(Scheme::Light, cx);
+                            this.note("Light appearance", cx);
+                        }
+                        "dark" => {
+                            this.set_scheme(Scheme::Dark, cx);
+                            this.note("Dark appearance", cx);
+                        }
+                        "violet" => {
+                            this.controls.theme.hue = 268.0;
+                            this.note("Violet accent", cx);
+                        }
+                        "teal" => {
+                            this.controls.theme.hue = 186.0;
+                            this.note("Teal accent", cx);
+                        }
                         "palette" => {
                             this.controls
                                 .open_palette("commands", &this.palette_query, window, cx)
@@ -643,7 +800,13 @@ impl Render for Gallery {
                     }
                     cx.notify();
                 },
-            ))
+            ));
+        // A control notices a transition as it renders, including the
+        // footer and overlays, so ask for another frame after all of them.
+        if self.controls.animating() {
+            window.request_animation_frame();
+        }
+        root
     }
 }
 
@@ -1001,6 +1164,20 @@ impl Gallery {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let ranked_query = self.ranked_query.read(cx).text();
+        let ranked_results = self.ranked_results(&ranked_query);
+        // The card is a gradient, so each of the list's edge fades takes the
+        // card's colour at that edge, from where both painted last frame.
+        let on_card = {
+            let card = self.ranked_card.bounds();
+            move |y: gpui::Pixels| {
+                card_at(
+                    palette,
+                    f32::from(y - card.top()) / f32::from(card.size.height).max(1.0),
+                )
+            }
+        };
+        let list = self.controls.scroll(("ranked-search", "list")).bounds();
         column()
             .child(card(
                 palette,
@@ -1029,6 +1206,45 @@ impl Gallery {
                         ),
                     )),
             ))
+            .child(
+                card(
+                    palette,
+                    "Ranked results",
+                    column()
+                        .child(labelled(
+                            palette,
+                            "Several sources, ranked as you type — history arrives late",
+                            ranked_search_list(
+                                "ranked-search",
+                                &self.ranked_query,
+                                &ranked_results,
+                                on_card(list.top()),
+                                on_card(list.bottom()),
+                                WidgetContext::new(palette, self, cx),
+                                window,
+                                |this, id, _window, cx| this.note(format!("Opened {id}"), cx),
+                            ),
+                        ))
+                        .child(div().w(px(150.0)).child(button(
+                            "history-source",
+                            if self.history_loaded {
+                                "Remove history"
+                            } else {
+                                "Add history"
+                            },
+                            ButtonVariant::Soft,
+                            true,
+                            palette,
+                            cx,
+                            |this, _window, cx| {
+                                this.history_loaded = !this.history_loaded;
+                                cx.notify();
+                            },
+                        ))),
+                )
+                .id("ranked-card")
+                .track_scroll(&self.ranked_card),
+            )
             .child(card(
                 palette,
                 "Shortcut",
@@ -1076,6 +1292,23 @@ impl Gallery {
                                     );
                                     cx.notify();
                                 },
+                            )))
+                            .child(div().w(px(160.0)).child(button(
+                                "open-ranked-palette",
+                                "Results palette",
+                                ButtonVariant::Soft,
+                                true,
+                                palette,
+                                cx,
+                                |this, window, cx| {
+                                    this.controls.open_palette(
+                                        "ranked-commands",
+                                        &this.ranked_palette_query,
+                                        window,
+                                        cx,
+                                    );
+                                    cx.notify();
+                                },
                             ))),
                     ),
             ))
@@ -1084,7 +1317,12 @@ impl Gallery {
 }
 
 impl Gallery {
-    fn page_data(&mut self, palette: Palette, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn page_data(
+        &mut self,
+        palette: Palette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let columns = [
             Column::new("name", "Name"),
             Column::new("size", "Size").width(80.0).numeric(),
@@ -1184,30 +1422,98 @@ impl Gallery {
                 )
             }));
 
+        let selection_order: Vec<SharedString> = [
+            "Design notes",
+            "Budget",
+            "Launch plan",
+            "Research",
+            "Components",
+            "Typography",
+            "Motion study",
+            "Keyboard map",
+            "Accessibility",
+            "Integration tests",
+            "Screenshots",
+            "Translations",
+            "Release checklist",
+            "Archive",
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        // The fades land near enough on the card the list sits in; a flat
+        // surface colour would show as a band against its lit gradient.
+        let (card_top, card_bottom) = lit_stops(palette.area_surface, CARD_LIFT);
+        let selection_list = selectable_list(
+            "selectable-files",
+            &selection_order,
+            &self.selection,
+            card_top,
+            card_bottom,
+            WidgetContext::new(palette, self, cx),
+            window,
+            selection_order.iter().map(|label| {
+                div()
+                    .h(px(34.0))
+                    .px(px(10.0))
+                    .flex()
+                    .items_center()
+                    .child(label.clone())
+            }),
+            |this, order, intent, _window, cx| match intent {
+                SelectionIntent::Activate(id) => this.note(format!("Opened {id}"), cx),
+                intent => this.selection.apply(order, intent),
+            },
+        )
+        .h(px(196.0));
+
         column()
             .child(card(
                 palette,
-                "Tabs — drag one to reorder it",
-                tab_bar(
+                "Tabs — scroll sideways, close repeatedly, drag to reorder",
+                div().w_full().child(tab_bar_layout(
                     "files",
                     &self.files,
                     self.file,
+                    TabBarLayout::HorizontalUniform { width: 158.0 },
                     WidgetContext::new(palette, self, cx),
                     |this, index, _window, cx| {
                         this.file = index;
                         cx.notify();
                     },
-                    |this, index, _window, cx| {
-                        if this.files.len() > 1 {
-                            this.files.remove(index);
-                            if index < this.file {
-                                this.file -= 1;
-                            }
-                            this.file = this.file.min(this.files.len() - 1);
-                        }
-                        cx.notify();
-                    },
-                ),
+                    |this, index, _window, cx| this.close_file_tab(index, cx),
+                )),
+            ))
+            .child(card(
+                palette,
+                "Vertical tabs — scroll, select and reorder",
+                div()
+                    .flex()
+                    .items_start()
+                    .gap(px(16.0))
+                    .child(div().w(px(220.0)).h(px(166.0)).child(tab_bar_layout(
+                        "files-vertical",
+                        &self.files,
+                        self.file,
+                        TabBarLayout::Vertical,
+                        WidgetContext::new(palette, self, cx),
+                        |this, index, _window, cx| {
+                            this.file = index;
+                            cx.notify();
+                        },
+                        |this, index, _window, cx| this.close_file_tab(index, cx),
+                    )))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.0))
+                            .child(caption(palette, "Selected tab"))
+                            .child(self.files.get(self.file).map_or_else(
+                                || SharedString::from("No tab selected"),
+                                |tab| tab.label.clone(),
+                            )),
+                    ),
             ))
             .child(card(
                 palette,
@@ -1251,6 +1557,14 @@ impl Gallery {
                     this.details_open = expanded;
                     cx.notify();
                 },
+            ))
+            .child(card(
+                palette,
+                "Selection — click, ⇧ range, ⌘ toggle, arrows, ⌘A, End",
+                column().child(selection_list).child(caption(
+                    palette,
+                    &format!("{} selected", self.selection.len()),
+                )),
             ))
             .into_any_element()
     }
@@ -1416,6 +1730,19 @@ impl Gallery {
             MenuItem::separator(),
             MenuItem::action("pin", "Pin to top").checked(true),
             MenuItem::action("reveal", "Show in folder").disabled(),
+            MenuItem::submenu(
+                "Organize",
+                vec![
+                    MenuItem::submenu(
+                        "Move to",
+                        vec![
+                            MenuItem::action("move-documents", "Documents"),
+                            MenuItem::action("move-images", "Images"),
+                        ],
+                    ),
+                    MenuItem::action("duplicate", "Duplicate"),
+                ],
+            ),
             MenuItem::separator(),
             MenuItem::action("delete", "Delete").shortcut("⌫").danger(),
         ]
@@ -1424,10 +1751,22 @@ impl Gallery {
     fn view_menu(&self) -> Vec<MenuItem> {
         let scheme = self.controls.theme.scheme;
         vec![
-            MenuItem::header("Colour scheme"),
-            MenuItem::action("system", "System").checked(scheme == Scheme::System),
-            MenuItem::action("light", "Light").checked(scheme == Scheme::Light),
-            MenuItem::action("dark", "Dark").checked(scheme == Scheme::Dark),
+            MenuItem::submenu(
+                "Appearance",
+                vec![
+                    MenuItem::submenu(
+                        "Colour scheme",
+                        vec![
+                            MenuItem::action("system", "System").checked(scheme == Scheme::System),
+                            MenuItem::action("light", "Light").checked(scheme == Scheme::Light),
+                            MenuItem::action("dark", "Dark").checked(scheme == Scheme::Dark),
+                        ],
+                    ),
+                    MenuItem::separator(),
+                    MenuItem::action("violet", "Violet accent"),
+                    MenuItem::action("teal", "Teal accent"),
+                ],
+            ),
             MenuItem::separator(),
             MenuItem::action("palette", "Command palette…")
                 .shortcut(vampir::display("secondary-k")),
@@ -1511,6 +1850,7 @@ fn app_menus() -> Vec<Menu> {
             OsMenuItem::action("Dark", UseDark),
             OsMenuItem::separator(),
             OsMenuItem::action("Command Palette\u{2026}", TogglePalette),
+            OsMenuItem::action("Results Palette\u{2026}", ToggleRankedPalette),
         ]),
         // GPUI hands a menu named exactly "Window" to macOS as the windows
         // menu, which is what fills it with the window list.
@@ -1540,6 +1880,7 @@ fn main() {
             KeyBinding::new("secondary-q", Quit, None),
             KeyBinding::new("secondary-w", CloseWindow, None),
             KeyBinding::new("secondary-k", TogglePalette, None),
+            KeyBinding::new("secondary-shift-k", ToggleRankedPalette, None),
             KeyBinding::new("secondary-1", ShowControls, None),
             KeyBinding::new("secondary-2", ShowFields, None),
             KeyBinding::new("secondary-3", ShowData, None),
