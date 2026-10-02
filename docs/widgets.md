@@ -36,6 +36,10 @@ Every control animates its changes of state — the switch slides, the tick draw
 
 `HorizontalUniform` keeps each tab at the same width (clamped to 96–320), elides long labels, and scrolls sideways when the strip is full. Its close buttons stay at the same position within each tab as siblings close. `Vertical` fills the width its host gives it and scrolls down when its height is constrained. In every layout, tabs fade out into the well at an edge with more past it rather than being cut off there. Both layouts keep the same select, close and drag callbacks as `tab_bar`; arrow keys follow the layout's direction and bring the newly selected tab into view. A `Tab` is identified by its label unless `Tab::id` says otherwise, and everything the bar remembers about a tab follows that identity through a reorder. The gallery's Data page renders both dense horizontal and vertical bars over the same host-owned tabs.
 
+Closing the final tab leaves the bar empty and returns keyboard focus to the root, so host shortcuts still work. The gallery lets you close every tab to check this state.
+
+![The Data page after closing every tab](adaptive-tabs-empty.png)
+
 `split_area` is the invisible probe that turns a pointer position into a fraction. Put it inside the element the two panes share; the divider will not work without it. `reorder` is what a host does with a finished tab drag: it moves the item and keeps the selection on the item it was on.
 
 `dialog` is opened with `ControlState::open_dialog` and renders nothing otherwise. It fades in, takes the keyboard, keeps Tab among its buttons, and closes itself — fading out, handing the keyboard back — from a button, Enter, Escape or the scrim, before the host's callback runs.

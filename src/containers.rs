@@ -140,6 +140,10 @@ impl TabBarLayout {
     }
 }
 
+fn tab_scroll_kind(layout: TabBarLayout) -> (bool, bool) {
+    (layout.vertical(), layout.tab_width().is_some())
+}
+
 const TAB_HEIGHT: f32 = 26.0;
 const TAB_GAP: f32 = 2.0;
 const TAB_PAD: f32 = 2.0;
@@ -193,14 +197,18 @@ pub fn tab_bar_layout<V: ControlHost>(
     let uniform_width = layout.tab_width();
     let on_select = Rc::new(on_select);
     let on_close = Rc::new(on_close);
-    // Everything the bar measures is kept per layout. After a host switches
+    // Geometry the bar measures is kept per layout. After a host switches
     // layout, last frame's geometry belongs to the other one: a pill tweened
     // from it would sweep across the bar, a slide planned from uniform
     // widths would jump once natural ones arrive, and a reveal read from it
     // would scroll to a place that no longer exists. Keyed apart, the new
     // layout starts from nothing, at rest, and waits for its own paint.
     let geometry = (vertical, uniform_width.map(f32::to_bits));
-    let scroll = view.control_state().scroll((id, "tab-scroll", geometry));
+    // The scroll handle outlives rendered records. Widths may vary on every
+    // resize, so keep one handle per layout kind while measurements and
+    // tweens remain keyed by the exact width.
+    let scroll_kind = tab_scroll_kind(layout);
+    let scroll = view.control_state().scroll((id, "tab-scroll", scroll_kind));
     // One tab stop for the bar, not one per tab: a tab bar is a single
     // choice, so Tab passes it in one press and the arrows move between
     // tabs — which is what stops a twenty-tab editor swallowing twenty
@@ -208,6 +216,7 @@ pub fn tab_bar_layout<V: ControlHost>(
     // because that is the option the arrows are pointing at.
     let focus = view.control_state().focus(id, cx);
     let count = tabs.len();
+    let empty_focus = (count == 0).then(|| (focus.clone(), view.control_state().root_focus(cx)));
     let mut arrows = (count > 0).then(|| {
         let on_select = on_select.clone();
         cx.listener(move |this, event: &KeyDownEvent, window, cx| {
@@ -719,6 +728,20 @@ pub fn tab_bar_layout<V: ControlHost>(
                 ),
         )
         .child(fades)
+        .when_some(empty_focus, |el, (focus, root)| {
+            el.child(
+                canvas(
+                    move |_bounds, window, cx| {
+                        if focus.is_focused(window) {
+                            window.focus(&root, cx);
+                        }
+                    },
+                    |_bounds, _state, _window, _cx| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+        })
 }
 
 /// A tab's face without its behaviour: what both the tab in the bar and the
@@ -1605,10 +1628,27 @@ fn moved_selection(selected: usize, from: usize, to: usize) -> usize {
 mod layout_tests {
     use super::{
         ButtonVariant, TAB_HEIGHT, TAB_INSET, TabBarLayout, dialog_default, moved_selection,
-        reorder, reveal_delta, reveal_scroll, tab_content_len, tab_places, wheel_moved,
+        reorder, reveal_delta, reveal_scroll, tab_content_len, tab_places, tab_scroll_kind,
+        wheel_moved,
     };
     use crate::keyboard::Orientation;
     use crate::scroll::SCROLL_FADE;
+
+    #[test]
+    fn resizing_uniform_tabs_reuses_their_scroll_handle() {
+        assert_eq!(
+            tab_scroll_kind(TabBarLayout::HorizontalUniform { width: 96.0 }),
+            tab_scroll_kind(TabBarLayout::HorizontalUniform { width: 320.0 })
+        );
+        assert_ne!(
+            tab_scroll_kind(TabBarLayout::Horizontal),
+            tab_scroll_kind(TabBarLayout::HorizontalUniform { width: 160.0 })
+        );
+        assert_ne!(
+            tab_scroll_kind(TabBarLayout::Vertical),
+            tab_scroll_kind(TabBarLayout::HorizontalUniform { width: 160.0 })
+        );
+    }
 
     /// Closing a tab in a natural-width bar slides the next one into its
     /// place, but that tab is a different width, so its close target lands
