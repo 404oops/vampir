@@ -1,6 +1,7 @@
 //! Things that float above the view: tooltips and a command palette, and
 //! the search field with results that the palette is built from.
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
 use std::time::Instant;
@@ -370,15 +371,18 @@ pub fn rank_results(query: &str, results: &[SearchResult]) -> Vec<SearchResult> 
     };
     type Run<'a> = Vec<(Option<i32>, &'a SearchResult)>;
     let mut sections: Vec<(Option<&str>, Run)> = Vec::new();
+    let mut positions: HashMap<Option<&str>, usize> = HashMap::new();
     for result in results {
         let Some(rank) = rank(result) else {
             continue;
         };
         let section = result.section.as_deref();
-        match sections.iter_mut().find(|(name, _)| *name == section) {
-            Some((_, run)) => run.push((rank, result)),
-            None => sections.push((section, vec![(rank, result)])),
-        }
+        let index = *positions.entry(section).or_insert_with(|| {
+            let index = sections.len();
+            sections.push((section, Vec::new()));
+            index
+        });
+        sections[index].1.push((rank, result));
     }
     // Stable sorts, so ties keep the order the sources were assembled in.
     for (_, run) in &mut sections {
@@ -483,6 +487,8 @@ const PALETTE_RESULT_MAX_HEIGHT: f32 = 340.0;
 struct RowPlacement {
     /// Whether a section heading goes above this row.
     heading: bool,
+    /// Which run of this section the heading belongs to.
+    heading_run: usize,
     top: f32,
     height: f32,
 }
@@ -493,6 +499,7 @@ struct RowPlacement {
 /// changed, before anything has been laid out.
 fn row_layout(results: &[SearchResult]) -> Vec<RowPlacement> {
     let mut previous: Option<&str> = None;
+    let mut runs: HashMap<&str, usize> = HashMap::new();
     let mut top = 0.0;
     results
         .iter()
@@ -500,6 +507,16 @@ fn row_layout(results: &[SearchResult]) -> Vec<RowPlacement> {
             let section = result.section.as_deref();
             let heading = section.is_some() && section != previous;
             previous = section;
+            let heading_run = if heading {
+                let count = runs
+                    .entry(section.expect("a heading has a section"))
+                    .or_default();
+                let run = *count;
+                *count += 1;
+                run
+            } else {
+                0
+            };
             if heading {
                 top += SECTION_HEIGHT + ROW_GAP;
             }
@@ -510,6 +527,7 @@ fn row_layout(results: &[SearchResult]) -> Vec<RowPlacement> {
             };
             let placement = RowPlacement {
                 heading,
+                heading_run,
                 top,
                 height,
             };
@@ -548,7 +566,6 @@ fn result_rows<V: ControlHost>(
     let has_leading = results.iter().any(|result| result.leading.is_some());
     let mut elements: Vec<AnyElement> = Vec::with_capacity(results.len());
     let mut extents = Vec::with_capacity(results.len());
-    let mut headed: Vec<&str> = Vec::new();
     for (index, (result, placement)) in results.iter().zip(row_layout(results)).enumerate() {
         if placement.heading
             && let Some(section) = &result.section
@@ -557,12 +574,7 @@ fn result_rows<V: ControlHost>(
             // a host split one, rather than by the result under it: whichever
             // result leads the run, it is the same heading, and it fades in
             // once and slides with the rows.
-            let run = headed
-                .iter()
-                .filter(|&&name| name == section.as_ref())
-                .count();
-            headed.push(section);
-            let key = |part: &'static str| Tag::new((id, part, section, run));
+            let key = |part: &'static str| Tag::new((id, part, section, placement.heading_run));
             let shown = arrival(state, key("section-shown"), fresh);
             let top = placement.top - SECTION_HEIGHT - ROW_GAP;
             let offset = state.tween(key("section-place"), top, MOVE) - top;
@@ -594,6 +606,87 @@ fn result_rows<V: ControlHost>(
         extents.push(placement.top..placement.top + placement.height);
     }
     (elements, extents)
+}
+
+/// Keep one viewport of spare rows on either side, so a wheel step or a
+/// short place tween never exposes an unbuilt edge. The scroll container's
+/// full height is kept separately from these visible children.
+fn visible_result_range(placements: &[RowPlacement], offset: f32, viewport: f32) -> Range<usize> {
+    let viewport = viewport.max(1.0);
+    let scroll_top = (-offset).max(0.0);
+    let start = scroll_top - viewport - SECTION_HEIGHT;
+    let end = scroll_top + 2.0 * viewport + SECTION_HEIGHT;
+    placements.partition_point(|row| row.top + row.height < start)
+        ..placements.partition_point(|row| row.top <= end)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn visible_result_rows<V: ControlHost>(
+    id: &'static str,
+    emphasis: &str,
+    results: &[SearchResult],
+    placements: &[RowPlacement],
+    visible: Range<usize>,
+    highlighted: usize,
+    ctx: WidgetContext<'_, '_, '_, V>,
+    on_activate: Activate<V>,
+) -> Vec<AnyElement> {
+    let WidgetContext { palette, view, cx } = ctx;
+    let state = view.control_state();
+    let fresh = !state.present(id);
+    let has_leading = results.iter().any(|result| result.leading.is_some());
+    let mut elements = Vec::with_capacity(2 * visible.len());
+    for index in visible {
+        let (result, placement) = (&results[index], &placements[index]);
+        if placement.heading
+            && let Some(section) = &result.section
+        {
+            let key = |part: &'static str| Tag::new((id, part, section, placement.heading_run));
+            let shown = arrival(state, key("section-shown"), fresh);
+            let top = placement.top - SECTION_HEIGHT - ROW_GAP;
+            let offset = state.tween(key("section-place"), top, MOVE) - top;
+            elements.push(
+                div()
+                    .absolute()
+                    .top(px(top))
+                    .left_0()
+                    .right_0()
+                    .child(section_heading(
+                        section,
+                        has_leading,
+                        shown,
+                        offset,
+                        palette,
+                    ))
+                    .into_any_element(),
+            );
+        }
+        let look = RowLook {
+            active: index == highlighted,
+            has_leading,
+            fresh,
+            palette,
+        };
+        elements.push(
+            div()
+                .absolute()
+                .top(px(placement.top))
+                .left_0()
+                .right_0()
+                .child(result_row(
+                    id,
+                    result,
+                    emphasis,
+                    placement,
+                    look,
+                    state,
+                    cx,
+                    on_activate.clone(),
+                ))
+                .into_any_element(),
+        );
+    }
+    elements
 }
 
 fn section_heading(
@@ -908,7 +1001,11 @@ fn result_list<V: ControlHost>(
     let state = ctx.view.control_state();
     let (highlighted, change) = state.follow_list(id, query, &ids);
     let scroll = state.scroll((id, "list"));
-    let (elements, rows) = result_rows(id, emphasis, results, highlighted, ctx, on_activate);
+    let placements = row_layout(results);
+    let rows = placements
+        .iter()
+        .map(|placement| placement.top..placement.top + placement.height)
+        .collect();
     let navigation = Rc::new(ResultNavigation {
         scroll,
         rows,
@@ -919,6 +1016,27 @@ fn result_list<V: ControlHost>(
         ListChange::Moved => navigation.reveal(highlighted),
         ListChange::Same => {}
     }
+    let painted_height = f32::from(navigation.scroll.bounds().size.height);
+    let viewport = if painted_height > 0.0 {
+        painted_height
+    } else {
+        max_height
+    };
+    let visible = visible_result_range(
+        &placements,
+        f32::from(navigation.scroll.offset().y),
+        viewport,
+    );
+    let elements = visible_result_rows(
+        id,
+        emphasis,
+        results,
+        &placements,
+        visible,
+        highlighted,
+        ctx,
+        on_activate,
+    );
     ResultList {
         elements,
         ids,
@@ -937,7 +1055,7 @@ fn result_viewport(
     palette: Palette,
     state: &ControlState,
 ) -> Div {
-    let empty = rows.is_empty();
+    let empty = navigation.rows.is_empty();
     div()
         .relative()
         .child(
@@ -946,11 +1064,16 @@ fn result_viewport(
                 .max_h(px(navigation.max_height))
                 .flex()
                 .flex_col()
-                .gap(px(ROW_GAP))
                 .overflow_y_scroll()
                 .restrict_scroll_to_axis()
                 .track_scroll(&navigation.scroll)
-                .children(rows)
+                .child(
+                    div()
+                        .relative()
+                        .w_full()
+                        .h(px(navigation.content_height()))
+                        .children(rows),
+                )
                 .when(empty, |el| {
                     el.child(
                         div()
@@ -1547,6 +1670,19 @@ mod tests {
     }
 
     #[test]
+    fn many_distinct_sections_keep_source_order() {
+        let results: Vec<_> = (0..2_000)
+            .map(|index| {
+                SearchResult::new(format!("item-{index}"), "Entry")
+                    .section(format!("Section {index}"))
+            })
+            .collect();
+        let ranked = rank_results("", &results);
+        assert_eq!(ranked.len(), results.len());
+        assert!(ranked.iter().zip(&results).all(|(a, b)| a.id == b.id));
+    }
+
+    #[test]
     fn ranking_scores_the_label_not_the_length_of_the_detail() {
         let results = [
             SearchResult::new("long", "Design review")
@@ -1591,6 +1727,19 @@ mod tests {
                 DETAIL_ROW_HEIGHT
             ]
         );
+    }
+
+    #[test]
+    fn a_long_result_list_builds_only_the_window_around_its_scroll() {
+        let results: Vec<_> = (0..10_000)
+            .map(|index| SearchResult::new(format!("item-{index}"), "Entry"))
+            .collect();
+        let layout = row_layout(&results);
+        let target = 5_000;
+        let visible = visible_result_range(&layout, -layout[target].top, 300.0);
+        assert!(visible.contains(&target));
+        assert!(visible.len() < 40, "offscreen rows must stay unbuilt");
+        assert_eq!(visible_result_range(&layout, 0.0, 300.0).start, 0);
     }
 
     #[test]
