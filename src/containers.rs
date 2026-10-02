@@ -230,13 +230,12 @@ pub fn tab_bar_layout<V: ControlHost>(
             }
         })
     });
+    let drag_valid = view.control_state().note_tab_axis(id, track_axis(vertical));
     let dragging_here: Option<TabDrag> = view
         .control_state()
         .tab_drag()
-        // A drag reads the axis it started on. If the host switched layout
-        // under it, its positions are along the other axis and mean nothing
-        // against these tabs, so the bar draws as if nothing were held.
-        .filter(|drag| drag.bar == id && drag.axis == track_axis(vertical))
+        // A drag still held after an axis change is never drawn or applied.
+        .filter(|drag| drag_valid && drag.bar == id && drag.axis == track_axis(vertical))
         .copied();
     let weak = cx.entity().downgrade();
 
@@ -522,10 +521,10 @@ pub fn tab_bar_layout<V: ControlHost>(
                         // drag is a click on it. A release here after a
                         // press elsewhere (the well, a slider, the ✕) is
                         // not.
-                        let clicked = this
-                            .control_state()
-                            .tab_drag()
-                            .is_some_and(|drag| drag.bar == id && drag.from == slot && !drag.moved);
+                        let clicked = drag_valid
+                            && this.control_state().tab_drag().is_some_and(|drag| {
+                                drag.bar == id && drag.from == slot && !drag.moved
+                            });
                         if clicked {
                             // Clicking a tab puts the keyboard on the bar, so
                             // Tab carries on from the tab just chosen.
