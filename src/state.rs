@@ -559,6 +559,8 @@ pub struct ControlState {
 
     /// The gesture in flight, if any.
     drag: Option<Drag>,
+    /// A rendered tab bar changed axis while its drag was in flight.
+    tab_drag_invalidated: Cell<bool>,
 }
 
 impl Default for ControlState {
@@ -593,6 +595,7 @@ impl ControlState {
             recording_activation: None,
             ring_hidden: false,
             drag: None,
+            tab_drag_invalidated: Cell::new(false),
         }
     }
 
@@ -1536,7 +1539,17 @@ impl ControlState {
 
     /// Starts a tab reorder.
     pub fn begin_tab_drag(&mut self, drag: TabDrag) {
+        self.tab_drag_invalidated.set(false);
         self.drag = Some(Drag::Tab(drag));
+    }
+
+    /// A tab bar can change orientation while a press is held. Remember
+    /// that its old positions cannot be used for a reorder on release.
+    pub(crate) fn note_tab_axis(&self, bar: ComboId, axis: TrackAxis) -> bool {
+        if matches!(&self.drag, Some(Drag::Tab(drag)) if drag.bar == bar && drag.axis != axis) {
+            self.tab_drag_invalidated.set(true);
+        }
+        !self.tab_drag_invalidated.get()
     }
 
     /// Where along the dragged track a pointer position falls, each
@@ -1595,6 +1608,9 @@ impl ControlState {
     /// a fling that clears several tabs in one event lands where the hand
     /// stopped rather than one slot along.
     pub fn drag_tab_to(&mut self, position: Point<Pixels>) -> bool {
+        if self.tab_drag_invalidated.get() {
+            return false;
+        }
         let Some(Drag::Tab(drag)) = &self.drag else {
             return false;
         };
@@ -1663,8 +1679,9 @@ impl ControlState {
         // A marker no toggle consumed (the click landed elsewhere) must not
         // eat some later toggle click.
         self.combo_dismissed = None;
+        let invalidated = self.tab_drag_invalidated.replace(false);
         match self.drag.take()? {
-            Drag::Tab(drag) if drag.moved && drag.from != drag.to => {
+            Drag::Tab(drag) if !invalidated && drag.moved && drag.from != drag.to => {
                 Some((drag.bar, drag.from, drag.to))
             }
             _ => None,
@@ -2719,6 +2736,29 @@ mod tests {
         state.drag_tab_to(at(140.0, 34.0));
         assert_eq!(state.tab_drag().map(|drag| drag.to), Some(1));
         assert_eq!(state.end_drag(), Some(("sidebar", 0, 1)));
+    }
+
+    #[test]
+    fn changing_a_tab_bars_axis_cancels_its_pending_reorder() {
+        let mut state = ControlState::new();
+        state.begin_tab_drag(TabDrag {
+            bar: "tabs",
+            axis: TrackAxis::Horizontal,
+            from: 0,
+            to: 1,
+            moved: true,
+            grab: 10.0,
+            pressed: 10.0,
+            pointer: 90.0,
+        });
+        assert!(state.note_tab_axis("other", TrackAxis::Vertical));
+        assert!(state.note_tab_axis("tabs", TrackAxis::Horizontal));
+        assert!(state.tab_drag().is_some());
+        assert!(!state.note_tab_axis("tabs", TrackAxis::Vertical));
+        assert!(!state.note_tab_axis("tabs", TrackAxis::Horizontal));
+        assert!(!state.drag_tab_to(at(200.0, 20.0)));
+        assert_eq!(state.end_drag(), None);
+        assert!(!state.dragging_anything());
     }
 
     #[test]
