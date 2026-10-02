@@ -623,14 +623,14 @@ impl Gallery {
     }
 
     fn close_file_tab(&mut self, index: usize, cx: &mut Context<Self>) {
-        if self.files.len() <= 1 || index >= self.files.len() {
+        if index >= self.files.len() {
             return;
         }
         let label = self.files.remove(index).label;
         if index < self.file {
             self.file -= 1;
         }
-        self.file = self.file.min(self.files.len() - 1);
+        self.file = self.file.min(self.files.len().saturating_sub(1));
         self.note(format!("Closed {label}"), cx);
     }
 }
@@ -1509,7 +1509,10 @@ impl Gallery {
                             .flex_col()
                             .gap(px(6.0))
                             .child(caption(palette, "Selected tab"))
-                            .child(self.files[self.file].label.clone()),
+                            .child(self.files.get(self.file).map_or_else(
+                                || SharedString::from("No tab selected"),
+                                |tab| tab.label.clone(),
+                            )),
                     ),
             ))
             .child(card(
