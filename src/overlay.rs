@@ -1070,6 +1070,9 @@ fn result_viewport(
                 .child(
                     div()
                         .relative()
+                        // A flex child otherwise shrinks to the viewport,
+                        // leaving the scroll handle with no distance to move.
+                        .flex_none()
                         .w_full()
                         .h(px(navigation.content_height()))
                         .children(rows),
