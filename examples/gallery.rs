@@ -11,9 +11,9 @@
 //! the menu bar and shortcuts a real application owns.
 
 use gpui::{
-    App, Bounds, Context, Entity, KeyBinding, Menu, MenuItem as OsMenuItem, Point, ScrollHandle,
-    SharedString, SystemMenuType, TitlebarOptions, Window, WindowBounds, WindowOptions, actions,
-    div, prelude::*, px, size,
+    App, Bounds, Context, Div, Entity, KeyBinding, Menu, MenuItem as OsMenuItem, Point,
+    ScrollHandle, SharedString, SystemMenuType, TitlebarOptions, Window, WindowBounds,
+    WindowOptions, actions, div, prelude::*, px, size,
 };
 use gpui_ce_platform::application;
 
@@ -223,6 +223,8 @@ struct Gallery {
     details_open: bool,
     selection: ListSelection,
     last_action: SharedString,
+    /// What the floating menu's checked row toggles.
+    pinned: bool,
 
     // Colour page.
     colour: Oklch,
@@ -478,6 +480,7 @@ impl Gallery {
             details_open: true,
             selection: ListSelection::new(),
             last_action: "—".into(),
+            pinned: true,
             colour: Oklch::new(268.0, 0.11, 0.62),
             palette_query,
             commands: vec![
@@ -1468,6 +1471,7 @@ impl Gallery {
         .h(px(196.0));
 
         column()
+            .children(self.floating_menu_card(palette, cx))
             .child(card(
                 palette,
                 "Tabs — scroll sideways, close repeatedly, drag to reorder",
@@ -1771,6 +1775,122 @@ impl Gallery {
             MenuItem::action("palette", "Command palette…")
                 .shortcut(vampir::display("secondary-k")),
         ]
+    }
+
+    /// A menu in a pop-up window of its own, for a host whose window has a
+    /// native view over it. macOS only: it rides on the `native` feature.
+    #[cfg(all(target_os = "macos", feature = "native"))]
+    fn floating_menu_card(&mut self, palette: Palette, cx: &mut Context<Self>) -> Option<Div> {
+        use vampir::{MenuEntry, MenuIcon, floating_menu};
+
+        fn glyph_icon(character: &'static str) -> MenuIcon {
+            MenuIcon::new(move |size, color| {
+                glyph(character)
+                    .text_size(px(size * 0.85))
+                    .text_color(color)
+                    .into_any_element()
+            })
+        }
+
+        fn entries(pinned: bool) -> Vec<MenuEntry> {
+            vec![
+                MenuEntry::item("Open").with_icon(glyph_icon("▣")),
+                MenuEntry::item("Open in New Window").with_icon(glyph_icon("⧉")),
+                MenuEntry::Separator,
+                MenuEntry::checked("Pinned", pinned).with_icon(glyph_icon("★")),
+                MenuEntry::disabled("Show in Folder").with_icon(glyph_icon("▤")),
+                MenuEntry::submenu(
+                    "Move to",
+                    vec![
+                        MenuEntry::item("Documents"),
+                        MenuEntry::item("Images"),
+                        MenuEntry::Separator,
+                        MenuEntry::item("A folder with a much longer name than the rest"),
+                    ],
+                )
+                .with_icon(glyph_icon("▥")),
+                MenuEntry::Separator,
+                MenuEntry::item("Delete").with_icon(glyph_icon("✕")),
+            ]
+        }
+
+        /// Every row's label in the order the menu answers with.
+        fn labels(entries: &[MenuEntry]) -> Vec<String> {
+            let mut out = Vec::new();
+            for entry in entries {
+                match entry {
+                    MenuEntry::Separator => out.push(String::new()),
+                    MenuEntry::Item { label, .. } => out.push(label.clone()),
+                    MenuEntry::Submenu { label, entries, .. } => {
+                        out.push(label.clone());
+                        out.extend(labels(entries));
+                    }
+                }
+            }
+            out
+        }
+
+        let open = move |above: bool| {
+            move |this: &mut Gallery, window: &mut Window, cx: &mut Context<Gallery>| {
+                let entries = entries(this.pinned);
+                let names = labels(&entries);
+                let answer = if above {
+                    floating_menu::open_above(cx, window, window.mouse_position(), entries, palette)
+                } else {
+                    floating_menu::open(cx, window, window.mouse_position(), entries, palette)
+                };
+                cx.spawn_in(window, async move |this, cx| {
+                    let Ok(answer) = answer.recv().await else {
+                        return;
+                    };
+                    let _ = this.update(cx, |this, cx| match answer {
+                        Some(3) => {
+                            this.pinned = !this.pinned;
+                            this.note(if this.pinned { "Pinned" } else { "Unpinned" }, cx);
+                        }
+                        Some(row) => {
+                            let name = names.get(row).cloned().unwrap_or_default();
+                            this.note(format!("Floating menu: {name}"), cx);
+                        }
+                        None => this.note("Floating menu dismissed", cx),
+                    });
+                })
+                .detach();
+            }
+        };
+        Some(card(
+            palette,
+            "Floating menu — a window of its own, above a native view",
+            row()
+                .child(div().w(px(180.0)).child(button(
+                    "floating-menu",
+                    "Open at the pointer",
+                    ButtonVariant::Soft,
+                    true,
+                    palette,
+                    cx,
+                    open(false),
+                )))
+                .child(div().w(px(180.0)).child(button(
+                    "floating-menu-above",
+                    "Open upward",
+                    ButtonVariant::Soft,
+                    true,
+                    palette,
+                    cx,
+                    open(true),
+                )))
+                .child(
+                    div().text_color(palette.text_secondary).child(
+                        "Arrows walk it, Enter runs a row, letters find one, Escape closes.",
+                    ),
+                ),
+        ))
+    }
+
+    #[cfg(not(all(target_os = "macos", feature = "native")))]
+    fn floating_menu_card(&mut self, _palette: Palette, _cx: &mut Context<Self>) -> Option<Div> {
+        None
     }
 
     fn render_dialog(

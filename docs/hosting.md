@@ -136,6 +136,10 @@ Which pop-up is open lives in `ControlState`, and so do the two overlays a host 
 
 A host that removes whatever has focus — switching pages, say — calls `self.controls.focus_root(window, cx)` first. GPUI dispatches nothing from a handle that is no longer in the tree, not even the root's own shortcuts, so a shortcut that "stopped working" is almost always focus left on something that has gone.
 
+## Native views
+
+A host that embeds a live native view — a `WKWebView`, a video player — has a problem the toolkit's overlays cannot solve from inside the window: the view is composited over everything GPUI draws, so a menu or a tooltip that opens where the view is simply does not show. The `native` feature (on by default, macOS only, empty elsewhere) carries what such a host needs, in `vampir::native`: `floating_menu`, a context menu in a transparent pop-up window of its own that never takes the keyboard; `ns_window_of`, which finds the AppKit window and GPUI's view behind a GPUI window; and `event_in`, which tells one window's events from another's in an app-wide event monitor. See [Widgets › Menus](widgets.md#menus--vampirmenu).
+
 ## Key bindings and menus
 
 The keys that are the same in every application are the toolkit's. `vampir::bind_keys(cx)`, once at start-up, binds Tab, Shift-Tab and Escape to the toolkit's `FocusNext`, `FocusPrevious` and `Dismiss` actions, and the text-editing keymap (`Backspace`, `SelectAll`, `Copy`, …) in the `"TextInput"` context, in the dialect the platform expects. `vampir::root` puts the handlers on the root; see [Keyboard and focus](keyboard.md#what-the-host-has-to-do). `standard_bindings()` is the list on its own, for a host that wants to leave some out.

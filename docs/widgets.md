@@ -70,6 +70,10 @@ Submenus drill into the same panel. Click a submenu row, or press Right or Enter
 
 These are in-window menus drawn by the toolkit. The macOS menu bar is a different thing entirely and belongs to GPUI — see [Shipping a macOS app](macos-apps.md).
 
+![The floating menu open over the Data page, a row lit from the keyboard](floating-menu.png)
+
+`floating_menu` (macOS, `native` feature) is the same menu in a transparent pop-up window of its own, for a host whose window has a live native view — a web view, a video player — composited over it, where anything drawn inside the window is hidden. `floating_menu::open(cx, window, position, entries, palette)` opens it at a window position and answers on an `async_channel::Receiver<Option<usize>>` with the chosen row's index in reading order, submenus' rows after their own, or `None` when it was dismissed; `open_above` opens it upward from a trigger on a shelf, and a menu near the bottom of the screen opens upward of its own accord. Rows are `MenuEntry::item`, `disabled`, `checked` and `submenu`, each able to carry a `MenuIcon` — whatever the host draws at a size in a colour — with `with_icon`. The window never becomes key, so the field or page being typed in keeps its caret; a press anywhere else in the app closes it and goes no further, as with a native menu; and submenus open in place with a row at the top that leads back. It is as wide as its longest row, within 184 to 340 points, and scrolls past 520. The gallery's Data page opens one from a button.
+
 ## Overlays — `vampir::overlay`
 
 ![The command palette open over the fields page](overlays.png)

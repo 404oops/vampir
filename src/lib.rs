@@ -44,6 +44,8 @@ pub mod icon;
 pub mod keyboard;
 pub mod lighting;
 pub mod menu;
+#[cfg(all(target_os = "macos", feature = "native"))]
+pub mod native;
 pub mod overlay;
 pub mod palette;
 pub mod scroll;
@@ -69,7 +71,7 @@ pub use data::{
     Column, SortDirection, TABLE_ROW_HEIGHT, TreeMove, TreeRow, flatten_tree, table_cell,
     table_header, table_row, tree_row, tree_step,
 };
-pub use easing::{ease_in_cubic, ease_out_cubic, modal_opacity};
+pub use easing::{ease_in_cubic, ease_out_cubic, modal_opacity, slowed};
 #[cfg(feature = "app-icon")]
 pub use icon::AppIcon;
 pub use keyboard::{
@@ -80,6 +82,11 @@ pub use lighting::{
     glow, ground, ground_at, lit, lit_at, lit_mix, lit_stops, panel, raised, recessed, rim, shade,
 };
 pub use menu::{ContextMenu, MenuAction, MenuItem, context_menu, menu_button, menu_target};
+#[cfg(all(target_os = "macos", feature = "native"))]
+pub use native::{
+    floating_menu::{self, MenuEntry, MenuIcon},
+    ns_window_of,
+};
 pub use overlay::{
     Command, Hint, SearchResult, Tooltip, command_list, command_palette, fuzzy_filter, fuzzy_score,
     rank_results, ranked_command_palette, ranked_search_list, search_list,
