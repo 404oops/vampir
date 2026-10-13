@@ -1899,12 +1899,111 @@ impl Gallery {
                     cx,
                     open(true),
                 )))
+                .child(div().w(px(180.0)).child(button(
+                    "native-menu",
+                    "Adopt an AppKit menu",
+                    ButtonVariant::Soft,
+                    true,
+                    palette,
+                    cx,
+                    Self::open_native_menu,
+                )))
                 .child(
                     div().text_color(palette.text_secondary).child(
                         "Arrows walk it, Enter runs a row, letters find one, Escape closes.",
                     ),
                 ),
         ))
+    }
+
+    /// An `NSMenu` a native view might propose, adopted as the toolkit's
+    /// rows and shown in the floating menu; choosing a row runs the
+    /// AppKit action behind it, which here reports back through a note.
+    #[cfg(all(target_os = "macos", feature = "native"))]
+    fn open_native_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use objc2::rc::Retained;
+        use objc2::runtime::AnyObject;
+        use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
+        use objc2_app_kit::{NSMenu, NSMenuItem};
+        use objc2_foundation::{NSObject, NSObjectProtocol, NSString};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use vampir::{NativeMenu, floating_menu};
+
+        define_class!(
+            #[unsafe(super(NSObject))]
+            #[thread_kind = MainThreadOnly]
+            #[ivars = Rc<RefCell<Option<String>>>]
+            struct Ran;
+            unsafe impl NSObjectProtocol for Ran {}
+            impl Ran {
+                #[unsafe(method(selected:))]
+                fn selected(&self, sender: &AnyObject) {
+                    let item: &NSMenuItem = unsafe { &*(sender as *const AnyObject).cast() };
+                    *self.ivars().borrow_mut() = Some(item.title().to_string());
+                }
+            }
+        );
+
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let ran = Rc::new(RefCell::new(None));
+        let target = Ran::alloc(mtm).set_ivars(ran.clone());
+        let target: Retained<Ran> = unsafe { msg_send![super(target), init] };
+        let menu = NSMenu::new(mtm);
+        menu.setAutoenablesItems(false);
+        let row = |title: &str, enabled: bool| {
+            let item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &NSString::from_str(title),
+                    Some(sel!(selected:)),
+                    &NSString::from_str(""),
+                )
+            };
+            unsafe { item.setTarget(Some(&target)) };
+            item.setEnabled(enabled);
+            item
+        };
+        menu.addItem(&row("Back", false));
+        menu.addItem(&row("Reload", true));
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        let speech = NSMenu::new(mtm);
+        speech.setAutoenablesItems(false);
+        speech.addItem(&row("Start Speaking", true));
+        speech.addItem(&row("Stop Speaking", false));
+        let parent = row("Speech", true);
+        parent.setSubmenu(Some(&speech));
+        menu.addItem(&parent);
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        menu.addItem(&row("Inspect Element", true));
+        let adopted = NativeMenu::adopt(&menu, |item| {
+            (item.title().to_string() == "Reload").then(|| glyph_icon("↻"))
+        });
+        let host = cx.entity().downgrade();
+        let palette = self.controls.palette();
+        floating_menu::open_with(
+            cx,
+            window,
+            window.mouse_position(),
+            adopted.items().to_vec(),
+            palette,
+            move |choice, _window, cx| {
+                let Some(host) = host.upgrade() else {
+                    return;
+                };
+                let ran = match choice {
+                    Some(id) if adopted.run(id) => ran.borrow_mut().take(),
+                    _ => None,
+                };
+                drop(target);
+                host.update(cx, |this, cx| match ran {
+                    Some(title) => this.note(format!("AppKit ran {title}"), cx),
+                    None => this.note("AppKit menu dismissed", cx),
+                });
+            },
+        );
     }
 
     #[cfg(not(all(target_os = "macos", feature = "native")))]

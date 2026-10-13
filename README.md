@@ -109,7 +109,7 @@ The gallery supports both colour schemes:
 
 **Containers** — `tab_bar` and `tab_bar_layout` (natural, uniform-width horizontal, or vertical tabs; drag to reorder and optional close buttons) with `reorder`, `split_handle` + `split_area`, `collapsible`, `dialog`, `card` with `card_at`, `labelled`, `row` / `column`, `scroll_area`, `arriving`.
 
-**Menus and overlays** — `context_menu` over one `MenuItem` tree with nested `submenu` levels, icons and typed ids, `menu_button`, `menu_target`, `floating_menu` (the same menu in a pop-up window of its own, above a native view; macOS), `Tooltip`, `command_palette` and `search_list` with `fuzzy_filter` / `fuzzy_score`, and `ranked_command_palette` / `ranked_search_list` for host-ranked `SearchResult`s with sections, details and leading visuals, and `rank_results` to rank them.
+**Menus and overlays** — `context_menu` over one `MenuItem` tree with nested `submenu` levels, icons and typed ids, `menu_button`, `menu_target`, `floating_menu` (the same menu in a pop-up window of its own, above a native view; macOS), `NativeMenu` (an AppKit menu adopted as those rows; macOS), `Tooltip`, `command_palette` and `search_list` with `fuzzy_filter` / `fuzzy_score`, and `ranked_command_palette` / `ranked_search_list` for host-ranked `SearchResult`s with sections, details and leading visuals, and `rank_results` to rank them.
 
 **Data** — `tree_row` with `flatten_tree`, `selectable_list` with host-owned `ListSelection`, `table_header` and `table_row` with `Column` and `SortDirection`.
 

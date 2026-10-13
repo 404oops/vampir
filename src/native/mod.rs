@@ -14,6 +14,7 @@ use objc2::rc::Retained;
 use objc2_app_kit::{NSEvent, NSView, NSWindow};
 
 pub mod floating_menu;
+pub mod ns_menu;
 
 /// The AppKit window behind a GPUI window, and GPUI's own view in it, as
 /// addresses: the window to tell events apart by, the view to give the

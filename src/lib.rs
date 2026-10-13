@@ -85,7 +85,11 @@ pub use menu::{
     ContextMenu, MenuAction, MenuIcon, MenuItem, context_menu, menu_button, menu_target,
 };
 #[cfg(all(target_os = "macos", feature = "native"))]
-pub use native::{floating_menu, ns_window_of};
+pub use native::{
+    floating_menu,
+    ns_menu::{NativeAction, NativeMenu},
+    ns_window_of,
+};
 pub use overlay::{
     Command, Hint, SearchResult, Tooltip, command_list, command_palette, fuzzy_filter, fuzzy_score,
     rank_results, ranked_command_palette, ranked_search_list, search_list,

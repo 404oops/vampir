@@ -240,6 +240,26 @@ impl<I> MenuItem<I> {
     pub fn any_icon(items: &[MenuItem<I>]) -> bool {
         items.iter().any(|item| item.icon_of().is_some())
     }
+
+    /// The first action in the tree that `matches`, at any depth, to edit
+    /// in place.
+    pub fn action_mut(
+        items: &mut [MenuItem<I>],
+        matches: impl Fn(&MenuAction<I>) -> bool + Copy,
+    ) -> Option<&mut MenuAction<I>> {
+        for item in items {
+            match item {
+                MenuItem::Action(action) if matches(action) => return Some(action),
+                MenuItem::Submenu { items, .. } => {
+                    if let Some(found) = MenuItem::action_mut(items, matches) {
+                        return Some(found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
 }
 
 /// Identity is the branch's label and the shape of its own rows: the labels
@@ -1688,5 +1708,17 @@ mod tests {
         assert!(plain[1].icon_of().is_none());
         assert_eq!(plain[1].label(), Some("Move to"));
         assert_eq!(MenuItem::<&str>::separator().label(), None);
+    }
+
+    #[test]
+    fn an_action_is_found_at_any_depth_to_relabel() {
+        let mut items = tree(&["inbox"], &["red"]);
+        assert!(MenuItem::action_mut(&mut items, |action| action.id == "none").is_none());
+        let inbox =
+            MenuItem::action_mut(&mut items, |action| action.id == "inbox").expect("nested");
+        inbox.label = "Move to Inbox".into();
+        let organize = children(&items[1]);
+        let moved = children(&organize[1]);
+        assert_eq!(moved[0].label(), Some("Move to Inbox"));
     }
 }

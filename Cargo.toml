@@ -130,3 +130,10 @@ path = "examples/gallery.rs"
 
 [profile.release]
 lto = "thin"
+
+# AppKit objects must be exercised on the main thread, so the native menu
+# regressions run without the Rust test harness.
+[[test]]
+name = "native_menu"
+path = "tests/native-menu.rs"
+harness = false
