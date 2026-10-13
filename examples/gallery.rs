@@ -1723,17 +1723,33 @@ impl Gallery {
     }
 }
 
+/// A menu icon drawn from a glyph, for rows that carry one.
+fn glyph_icon(character: &'static str) -> vampir::MenuIcon {
+    vampir::MenuIcon::new(move |size, color| {
+        glyph(character)
+            .text_size(px(size * 0.85))
+            .text_color(color)
+            .into_any_element()
+    })
+}
+
 // ---- Overlays ---------------------------------------------------------------
 
 impl Gallery {
     fn row_menu(&self) -> Vec<MenuItem> {
         vec![
             MenuItem::header(self.controls.menu_target().unwrap_or("Item").to_string()),
-            MenuItem::action("open", "Open").shortcut("⏎"),
-            MenuItem::action("rename", "Rename").shortcut("F2"),
+            MenuItem::action("open", "Open")
+                .shortcut("⏎")
+                .icon(glyph_icon("▣")),
+            MenuItem::action("rename", "Rename")
+                .shortcut("F2")
+                .icon(glyph_icon("✎")),
             MenuItem::separator(),
             MenuItem::action("pin", "Pin to top").checked(true),
-            MenuItem::action("reveal", "Show in folder").disabled(),
+            MenuItem::action("reveal", "Show in folder")
+                .disabled()
+                .icon(glyph_icon("▤")),
             MenuItem::submenu(
                 "Organize",
                 vec![
@@ -1748,7 +1764,10 @@ impl Gallery {
                 ],
             ),
             MenuItem::separator(),
-            MenuItem::action("delete", "Delete").shortcut("⌫").danger(),
+            MenuItem::action("delete", "Delete")
+                .shortcut("⌫")
+                .danger()
+                .icon(glyph_icon("✕")),
         ]
     }
 
@@ -1779,83 +1798,83 @@ impl Gallery {
 
     /// A menu in a pop-up window of its own, for a host whose window has a
     /// native view over it. macOS only: it rides on the `native` feature.
+    /// The rows are the same `MenuItem`s the in-window menu takes, here
+    /// with the host's own command type as their ids.
     #[cfg(all(target_os = "macos", feature = "native"))]
     fn floating_menu_card(&mut self, palette: Palette, cx: &mut Context<Self>) -> Option<Div> {
-        use vampir::{MenuEntry, MenuIcon, floating_menu};
+        use vampir::floating_menu;
 
-        fn glyph_icon(character: &'static str) -> MenuIcon {
-            MenuIcon::new(move |size, color| {
-                glyph(character)
-                    .text_size(px(size * 0.85))
-                    .text_color(color)
-                    .into_any_element()
-            })
+        #[derive(Clone, Copy, Debug)]
+        enum Pick {
+            Open,
+            OpenInWindow,
+            Pin,
+            Reveal,
+            MoveTo(&'static str),
+            Delete,
         }
 
-        fn entries(pinned: bool) -> Vec<MenuEntry> {
+        fn items(pinned: bool) -> Vec<MenuItem<Pick>> {
             vec![
-                MenuEntry::item("Open").with_icon(glyph_icon("▣")),
-                MenuEntry::item("Open in New Window").with_icon(glyph_icon("⧉")),
-                MenuEntry::Separator,
-                MenuEntry::checked("Pinned", pinned).with_icon(glyph_icon("★")),
-                MenuEntry::disabled("Show in Folder").with_icon(glyph_icon("▤")),
-                MenuEntry::submenu(
+                MenuItem::action(Pick::Open, "Open")
+                    .shortcut("⏎")
+                    .icon(glyph_icon("▣")),
+                MenuItem::action(Pick::OpenInWindow, "Open in New Window").icon(glyph_icon("⧉")),
+                MenuItem::separator(),
+                MenuItem::action(Pick::Pin, "Pinned")
+                    .checked(pinned)
+                    .icon(glyph_icon("★")),
+                MenuItem::action(Pick::Reveal, "Show in Folder")
+                    .disabled()
+                    .icon(glyph_icon("▤")),
+                MenuItem::submenu(
                     "Move to",
                     vec![
-                        MenuEntry::item("Documents"),
-                        MenuEntry::item("Images"),
-                        MenuEntry::Separator,
-                        MenuEntry::item("A folder with a much longer name than the rest"),
+                        MenuItem::header("Folders"),
+                        MenuItem::action(Pick::MoveTo("Documents"), "Documents"),
+                        MenuItem::action(Pick::MoveTo("Images"), "Images"),
+                        MenuItem::separator(),
+                        MenuItem::action(
+                            Pick::MoveTo("Archive"),
+                            "A folder with a much longer name than the rest",
+                        ),
                     ],
                 )
-                .with_icon(glyph_icon("▥")),
-                MenuEntry::Separator,
-                MenuEntry::item("Delete").with_icon(glyph_icon("✕")),
+                .icon(glyph_icon("▥")),
+                MenuItem::separator(),
+                MenuItem::action(Pick::Delete, "Delete")
+                    .shortcut("⌫")
+                    .danger()
+                    .icon(glyph_icon("✕")),
             ]
-        }
-
-        /// Every row's label in the order the menu answers with.
-        fn labels(entries: &[MenuEntry]) -> Vec<String> {
-            let mut out = Vec::new();
-            for entry in entries {
-                match entry {
-                    MenuEntry::Separator => out.push(String::new()),
-                    MenuEntry::Item { label, .. } => out.push(label.clone()),
-                    MenuEntry::Submenu { label, entries, .. } => {
-                        out.push(label.clone());
-                        out.extend(labels(entries));
-                    }
-                }
-            }
-            out
         }
 
         let open = move |above: bool| {
             move |this: &mut Gallery, window: &mut Window, cx: &mut Context<Gallery>| {
-                let entries = entries(this.pinned);
-                let names = labels(&entries);
-                let answer = if above {
-                    floating_menu::open_above(cx, window, window.mouse_position(), entries, palette)
-                } else {
-                    floating_menu::open(cx, window, window.mouse_position(), entries, palette)
-                };
-                cx.spawn_in(window, async move |this, cx| {
-                    let Ok(answer) = answer.recv().await else {
+                let items = items(this.pinned);
+                let host = cx.entity().downgrade();
+                let on_choice = move |choice: Option<Pick>, _window: &mut Window, cx: &mut App| {
+                    let Some(host) = host.upgrade() else {
                         return;
                     };
-                    let _ = this.update(cx, |this, cx| match answer {
-                        Some(3) => {
+                    host.update(cx, |this, cx| match choice {
+                        Some(Pick::Pin) => {
                             this.pinned = !this.pinned;
                             this.note(if this.pinned { "Pinned" } else { "Unpinned" }, cx);
                         }
-                        Some(row) => {
-                            let name = names.get(row).cloned().unwrap_or_default();
-                            this.note(format!("Floating menu: {name}"), cx);
+                        Some(Pick::MoveTo(folder)) => {
+                            this.note(format!("Floating menu: move to {folder}"), cx)
                         }
+                        Some(pick) => this.note(format!("Floating menu: {pick:?}"), cx),
                         None => this.note("Floating menu dismissed", cx),
                     });
-                })
-                .detach();
+                };
+                let at = window.mouse_position();
+                if above {
+                    floating_menu::open_above_with(cx, window, at, items, palette, on_choice);
+                } else {
+                    floating_menu::open_with(cx, window, at, items, palette, on_choice);
+                }
             }
         };
         Some(card(

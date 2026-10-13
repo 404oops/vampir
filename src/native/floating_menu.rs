@@ -10,22 +10,25 @@
 //! Left go into a submenu and out again, and typing a label's first
 //! letters lands on it.
 //!
+//! The rows are the same [`MenuItem`] tree the in-window
+//! [`context_menu`](crate::context_menu) takes, so a host builds a menu
+//! once and shows it whichever way the window allows.
+//!
 //! ```ignore
-//! let answer = floating_menu::open(cx, window, event.position, entries, palette);
-//! cx.spawn_in(window, async move |this, cx| {
-//!     if let Ok(Some(row)) = answer.recv().await {
-//!         let _ = this.update_in(cx, |host, window, cx| host.run_row(row, window, cx));
-//!     }
-//! })
-//! .detach();
+//! floating_menu::open_with(cx, window, event.position, items, palette,
+//!     |choice, window, cx| {
+//!         if let Some(command) = choice {
+//!             let _ = host.update(cx, |host, cx| host.run(command, window, cx));
+//!         }
+//!     });
 //! ```
 //!
-//! The answer is the chosen row's index in reading order, submenus' rows
-//! after their own row; `None` when the menu was dismissed.
+//! The answer is the chosen action's id; `None` when the menu was
+//! dismissed. [`open`] and [`open_above`] answer on a channel instead, for
+//! a host that would rather await it.
 
 use std::{
     cell::{Cell, RefCell},
-    fmt,
     ptr::NonNull,
     rc::Rc,
     time::{Duration, Instant},
@@ -35,8 +38,8 @@ use async_channel::{Receiver, Sender};
 use block2::RcBlock;
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Bounds, Context, DisplayId, FontWeight, Point,
-    Render, Rgba, ScrollHandle, Task, Window, WindowBackgroundAppearance, WindowBounds, WindowKind,
-    WindowOptions, canvas, div, point, prelude::*, px, size,
+    Render, Rgba, ScrollHandle, SharedString, Task, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowKind, WindowOptions, canvas, div, point, prelude::*, px, size,
 };
 use objc2::{
     rc::Retained,
@@ -50,6 +53,7 @@ use crate::{
     easing::slowed,
     keyboard::{self, Key, Orientation},
     lighting,
+    menu::{MenuIcon, MenuItem},
     palette::Palette,
     state::{ControlHost, ControlState},
     typography::ui_font,
@@ -61,6 +65,7 @@ use super::{event_in, ns_window_of};
 const MIN_WIDTH: f32 = 184.0;
 const MAX_WIDTH: f32 = 340.0;
 const ROW_HEIGHT: f32 = 28.0;
+const HEADER_HEIGHT: f32 = 22.0;
 /// A separator's hairline and the room either side of it.
 const SEPARATOR_HEIGHT: f32 = 11.0;
 /// Between the panel's edge and its rows.
@@ -74,6 +79,7 @@ const EDGE_GUTTER: f32 = 32.0;
 /// Between a row's highlight and what's in it.
 const ROW_INSET: f32 = 8.0;
 const TEXT_SIZE: f32 = 13.0;
+const SHORTCUT_SIZE: f32 = 11.5;
 const ICON_SIZE: f32 = 15.0;
 /// The column icons sit in, and the one checks and chevrons sit in.
 const ICON_SLOT: f32 = 18.0;
@@ -87,6 +93,8 @@ const MAX_HEIGHT: f32 = 520.0;
 /// window instead of to the view. A menu never becomes key, so its rows
 /// stay below that band.
 const TITLE_BAND: f32 = 28.0;
+/// The back row's key among a level's rows, which are keyed by index.
+const BACK_ROW: usize = usize::MAX;
 
 /// How long the panel opens, its rows sweep, and its size changes.
 const SWEEP: Duration = Duration::from_millis(190);
@@ -95,124 +103,6 @@ const RESIZE: Duration = Duration::from_millis(170);
 const HOVER: Duration = Duration::from_millis(120);
 /// Letters typed this close together are one search for a row.
 const TYPE_AHEAD_RESET: Duration = Duration::from_millis(1000);
-
-// ---- Entries ----------------------------------------------------------------
-
-/// An icon drawn ahead of a row's label: whatever the host draws at a size
-/// in a colour. The menu never looks inside it.
-///
-/// A host with an icon enum of its own converts it once —
-/// `impl From<Icon> for MenuIcon` — and `MenuEntry::with_icon` takes it
-/// from there.
-#[derive(Clone)]
-pub struct MenuIcon(Rc<dyn Fn(f32, Rgba) -> AnyElement>);
-
-impl MenuIcon {
-    pub fn new(draw: impl Fn(f32, Rgba) -> AnyElement + 'static) -> Self {
-        Self(Rc::new(draw))
-    }
-
-    /// The icon, `size` points square, in `color`.
-    pub fn draw(&self, size: f32, color: Rgba) -> AnyElement {
-        (self.0)(size, color)
-    }
-}
-
-impl fmt::Debug for MenuIcon {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("MenuIcon")
-    }
-}
-
-/// One row of a floating menu.
-#[derive(Clone, Debug)]
-pub enum MenuEntry {
-    Item {
-        label: String,
-        enabled: bool,
-        checked: bool,
-        /// Drawn ahead of the label, so a row can be found by its shape.
-        icon: Option<MenuIcon>,
-    },
-    Separator,
-    /// A row that opens another menu.
-    Submenu {
-        label: String,
-        entries: Vec<MenuEntry>,
-        icon: Option<MenuIcon>,
-    },
-}
-
-impl MenuEntry {
-    pub fn item(label: impl Into<String>) -> Self {
-        MenuEntry::Item {
-            label: label.into(),
-            enabled: true,
-            checked: false,
-            icon: None,
-        }
-    }
-
-    pub fn disabled(label: impl Into<String>) -> Self {
-        MenuEntry::Item {
-            label: label.into(),
-            enabled: false,
-            checked: false,
-            icon: None,
-        }
-    }
-
-    pub fn checked(label: impl Into<String>, checked: bool) -> Self {
-        MenuEntry::Item {
-            label: label.into(),
-            enabled: true,
-            checked,
-            icon: None,
-        }
-    }
-
-    pub fn submenu(label: impl Into<String>, entries: Vec<MenuEntry>) -> Self {
-        MenuEntry::Submenu {
-            label: label.into(),
-            entries,
-            icon: None,
-        }
-    }
-
-    /// The same row with `icon` ahead of its label.
-    pub fn with_icon(mut self, with: impl Into<MenuIcon>) -> Self {
-        match &mut self {
-            MenuEntry::Item { icon, .. } | MenuEntry::Submenu { icon, .. } => {
-                *icon = Some(with.into())
-            }
-            MenuEntry::Separator => {}
-        }
-        self
-    }
-
-    pub fn icon(&self) -> Option<&MenuIcon> {
-        match self {
-            MenuEntry::Item { icon, .. } | MenuEntry::Submenu { icon, .. } => icon.as_ref(),
-            MenuEntry::Separator => None,
-        }
-    }
-
-    pub fn label(&self) -> Option<&str> {
-        match self {
-            MenuEntry::Item { label, .. } | MenuEntry::Submenu { label, .. } => Some(label),
-            MenuEntry::Separator => None,
-        }
-    }
-
-    /// Whether the keyboard can land on it.
-    fn reachable(&self) -> bool {
-        match self {
-            MenuEntry::Item { enabled, .. } => *enabled,
-            MenuEntry::Submenu { .. } => true,
-            MenuEntry::Separator => false,
-        }
-    }
-}
 
 // ---- Geometry ---------------------------------------------------------------
 
@@ -248,56 +138,33 @@ impl Sweep {
 
 /// One level of a menu: the top, or a submenu opened from it.
 #[derive(Clone)]
-struct Level {
-    entries: Vec<MenuEntry>,
-    // The first index after its parent row. Native menu numbering
-    // included submenu rows and separators, so keep that scheme.
-    base: usize,
+struct Level<I> {
+    items: Vec<MenuItem<I>>,
     /// The row that opened it, shown at the top as the way back.
-    title: Option<String>,
-}
-
-fn width_of(entry: &MenuEntry) -> usize {
-    match entry {
-        MenuEntry::Submenu { entries, .. } => 1 + entries.iter().map(width_of).sum::<usize>(),
-        _ => 1,
-    }
-}
-
-/// Each row's index in reading order, submenus' rows after their own.
-fn row_indices(level: &Level) -> Vec<usize> {
-    let mut next = level.base;
-    level
-        .entries
-        .iter()
-        .map(|entry| {
-            let index = next;
-            next += width_of(entry);
-            index
-        })
-        .collect()
+    title: Option<SharedString>,
 }
 
 /// The rows of `level` the keyboard can land on, in order.
-fn reachable_rows(level: &Level) -> Vec<usize> {
+fn reachable_rows<I>(level: &Level<I>) -> Vec<usize> {
     level
-        .entries
+        .items
         .iter()
         .enumerate()
-        .filter_map(|(row, entry)| entry.reachable().then_some(row))
+        .filter_map(|(row, item)| item.reachable().then_some(row))
         .collect()
 }
 
 /// The height `level` needs, with its way back if it's nested.
-fn height_of(level: &Level) -> f32 {
-    height_of_entries(&level.entries, level.title.is_some())
+fn height_of<I>(level: &Level<I>) -> f32 {
+    height_of_items(&level.items, level.title.is_some())
 }
 
-fn height_of_entries(entries: &[MenuEntry], has_title: bool) -> f32 {
-    let rows: f32 = entries
+fn height_of_items<I>(items: &[MenuItem<I>], has_title: bool) -> f32 {
+    let rows: f32 = items
         .iter()
-        .map(|entry| match entry {
-            MenuEntry::Separator => SEPARATOR_HEIGHT,
+        .map(|item| match item {
+            MenuItem::Separator => SEPARATOR_HEIGHT,
+            MenuItem::Header(_) => HEADER_HEIGHT,
             _ => ROW_HEIGHT,
         })
         .sum();
@@ -309,37 +176,45 @@ fn height_of_entries(entries: &[MenuEntry], has_title: bool) -> f32 {
     (rows + back + 2.0 * (PADDING + BORDER)).min(MAX_HEIGHT)
 }
 
-/// Whether any row of `entries` has an icon, so every label lines up after
+/// Whether any row of `items` has an icon, so every label lines up after
 /// the icon column; and whether any has a check or a chevron after it.
-fn columns(entries: &[MenuEntry]) -> (bool, bool) {
-    let icons = entries.iter().any(|entry| entry.icon().is_some());
-    let trailing = entries.iter().any(|entry| {
-        matches!(
-            entry,
-            MenuEntry::Submenu { .. } | MenuEntry::Item { checked: true, .. }
-        )
+fn columns<I>(items: &[MenuItem<I>]) -> (bool, bool) {
+    let icons = MenuItem::any_icon(items);
+    let trailing = items.iter().any(|item| match item {
+        MenuItem::Submenu { .. } => true,
+        MenuItem::Action(action) => action.checked,
+        _ => false,
     });
     (icons, trailing)
 }
 
 /// The width that fits `level`'s longest row, given how wide `measure`
 /// finds a label at a weight.
-fn width_of_level(level: &Level, measure: impl Fn(&str, FontWeight) -> f32) -> f32 {
-    width_of_entries(&level.entries, level.title.as_deref(), measure)
+fn width_of_level<I>(level: &Level<I>, measure: impl Fn(&str, FontWeight) -> f32) -> f32 {
+    width_of_items(&level.items, level.title.as_deref(), measure)
 }
 
-fn width_of_entries(
-    entries: &[MenuEntry],
+fn width_of_items<I>(
+    items: &[MenuItem<I>],
     title: Option<&str>,
     measure: impl Fn(&str, FontWeight) -> f32,
 ) -> f32 {
-    let (icons, trailing) = columns(entries);
-    let label = entries
+    let (icons, trailing) = columns(items);
+    let label = items
         .iter()
-        .filter_map(|entry| {
-            entry
-                .label()
-                .map(|label| measure(label, FontWeight::NORMAL))
+        .filter_map(|item| {
+            let label = item.label()?;
+            Some(match item {
+                MenuItem::Header(_) => measure(label, FontWeight::MEDIUM),
+                MenuItem::Action(action) => {
+                    let shortcut = action
+                        .shortcut
+                        .as_deref()
+                        .map_or(0.0, |shortcut| measure(shortcut, FontWeight::NORMAL) + GAP);
+                    measure(label, FontWeight::NORMAL) + shortcut
+                }
+                _ => measure(label, FontWeight::NORMAL),
+            })
         })
         .fold(0.0, f32::max);
     let mut row = label;
@@ -382,26 +257,26 @@ fn measure(cx: &App, text: &str, weight: FontWeight) -> f32 {
 
 /// A transparent popup large enough for any level, so changing levels does
 /// not resize its native window.
-fn level_sizes(
-    level: &Level,
+fn level_sizes<I>(
+    level: &Level<I>,
     measure: impl Fn(&str, FontWeight) -> f32 + Copy,
 ) -> ((f32, f32), (f32, f32)) {
     let root = (width_of_level(level, measure), height_of(level));
-    (root, maximum_size_from(&level.entries, root, measure))
+    (root, maximum_size_from(&level.items, root, measure))
 }
 
-fn maximum_size_from(
-    entries: &[MenuEntry],
+fn maximum_size_from<I>(
+    items: &[MenuItem<I>],
     (mut width, mut height): (f32, f32),
     measure: impl Fn(&str, FontWeight) -> f32 + Copy,
 ) -> (f32, f32) {
-    for entry in entries {
-        if let MenuEntry::Submenu { label, entries, .. } = entry {
+    for item in items {
+        if let MenuItem::Submenu { label, items, .. } = item {
             let child = (
-                width_of_entries(entries, Some(label), measure),
-                height_of_entries(entries, true),
+                width_of_items(items, Some(label), measure),
+                height_of_items(items, true),
             );
-            let (child_width, child_height) = maximum_size_from(entries, child, measure);
+            let (child_width, child_height) = maximum_size_from(items, child, measure);
             width = width.max(child_width);
             height = height.max(child_height);
         }
@@ -560,15 +435,13 @@ thread_local! {
     static OPEN: RefCell<Option<OpenMenu>> = const { RefCell::new(None) };
 }
 
-struct Menu {
+struct Menu<I> {
     controls: ControlState,
     palette: Palette,
-    levels: Vec<Level>,
-    /// Flattened command index for each row in the current level.
-    row_indices: Vec<usize>,
+    levels: Vec<Level<I>>,
     /// The rows of the current level the keyboard can land on.
     reachable: Vec<usize>,
-    answer: Sender<Option<usize>>,
+    answer: Sender<Option<I>>,
     ns_window: usize,
     watch: Option<Watch>,
     done: bool,
@@ -582,7 +455,7 @@ struct Menu {
     width: f32,
     height: f32,
     /// The row under the pointer or the keyboard, whose icon takes the
-    /// accent, by its flattened index.
+    /// accent, by its index in the level; `BACK_ROW` for the way back.
     hovered: Option<usize>,
     scroll: ScrollHandle,
     /// Letters typed towards a row, and when the last came.
@@ -591,7 +464,7 @@ struct Menu {
     _dismiss: Option<Task<()>>,
 }
 
-impl ControlHost for Menu {
+impl<I: 'static> ControlHost for Menu<I> {
     fn control_state(&self) -> &ControlState {
         &self.controls
     }
@@ -718,8 +591,31 @@ enum Trail {
     Chevron,
 }
 
-impl Menu {
-    fn finish(&mut self, choice: Option<usize>, window: &mut Window) {
+/// What a row shows, apart from where it is.
+struct Look {
+    label: SharedString,
+    icon: Option<MenuIcon>,
+    trail: Trail,
+    shortcut: Option<SharedString>,
+    enabled: bool,
+    danger: bool,
+}
+
+impl Look {
+    fn plain(label: SharedString, icon: Option<MenuIcon>, trail: Trail) -> Self {
+        Look {
+            label,
+            icon,
+            trail,
+            shortcut: None,
+            enabled: true,
+            danger: false,
+        }
+    }
+}
+
+impl<I: Clone + 'static> Menu<I> {
+    fn finish(&mut self, choice: Option<I>, window: &mut Window) {
         if std::mem::replace(&mut self.done, true) {
             return;
         }
@@ -740,31 +636,19 @@ impl Menu {
         window.remove_window();
     }
 
-    fn stop_watching(&mut self) {
-        let Some(watch) = self.watch.take() else {
-            return;
-        };
-        if let Some(monitor) = watch.monitor {
-            // SAFETY: the token AppKit returned for this monitor.
-            unsafe { NSEvent::removeMonitor(&monitor) };
-        }
-        // SAFETY: the observer the notification center returned.
-        unsafe {
-            NSNotificationCenter::defaultCenter()
-                .removeObserver(ProtocolObject::as_ref(&*watch.resign))
-        };
-    }
-
     /// Shows the next level in the same popup, resizing it to fit.
-    fn show_level(&mut self, row: usize, base: usize, cx: &mut Context<Self>) {
-        let Some(MenuEntry::Submenu { label, entries, .. }) =
-            self.levels.last().and_then(|level| level.entries.get(row))
+    fn show_level(&mut self, row: usize, cx: &mut Context<Self>) {
+        let Some(MenuItem::Submenu {
+            label,
+            items,
+            enabled: true,
+            ..
+        }) = self.levels.last().and_then(|level| level.items.get(row))
         else {
             return;
         };
         self.levels.push(Level {
-            entries: entries.clone(),
-            base,
+            items: items.clone(),
             title: Some(label.clone()),
         });
         self.change_level(Sweep::Forward, cx);
@@ -781,7 +665,6 @@ impl Menu {
         let level = self.levels.last().expect("menu has a level");
         self.width = width_of_level(level, |text, weight| measure(cx, text, weight));
         self.height = height_of(level);
-        self.row_indices = row_indices(level);
         self.reachable = reachable_rows(level);
         self.sweep = sweep;
         self.hovered = None;
@@ -793,9 +676,7 @@ impl Menu {
     /// Where the keyboard is, as a position among the reachable rows.
     fn at(&self) -> Option<usize> {
         let hovered = self.hovered?;
-        self.reachable
-            .iter()
-            .position(|&row| self.row_indices[row] == hovered)
+        self.reachable.iter().position(|&row| row == hovered)
     }
 
     /// Lights the reachable row at `at` and scrolls it into view.
@@ -803,7 +684,7 @@ impl Menu {
         let Some(&row) = self.reachable.get(at) else {
             return;
         };
-        self.hovered = Some(self.row_indices[row]);
+        self.hovered = Some(row);
         let back_rows = if self
             .levels
             .last()
@@ -817,16 +698,18 @@ impl Menu {
         cx.notify();
     }
 
-    /// Runs the lit row: an item answers with it, a submenu opens.
+    /// Runs the lit row: an action answers with its id, a submenu opens.
     fn activate(&mut self, enter_only: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(at) = self.at() else {
             return;
         };
         let row = self.reachable[at];
-        let index = self.row_indices[row];
-        match self.levels.last().and_then(|level| level.entries.get(row)) {
-            Some(MenuEntry::Item { .. }) if !enter_only => self.finish(Some(index), window),
-            Some(MenuEntry::Submenu { .. }) => self.show_level(row, index + 1, cx),
+        match self.levels.last().and_then(|level| level.items.get(row)) {
+            Some(MenuItem::Action(action)) if !enter_only => {
+                let id = action.id.clone();
+                self.finish(Some(id), window)
+            }
+            Some(MenuItem::Submenu { .. }) => self.show_level(row, cx),
             _ => {}
         }
     }
@@ -865,7 +748,7 @@ impl Menu {
         let labels: Vec<&str> = self
             .reachable
             .iter()
-            .filter_map(|&row| level.entries[row].label())
+            .filter_map(|&row| level.items[row].label())
             .collect();
         if let Some(at) = type_ahead(&labels, &self.typed, self.at()) {
             self.light(at, cx);
@@ -875,18 +758,22 @@ impl Menu {
     /// A row: `key` tells it apart for hovering, `icons` and `trailing` say
     /// whether the level keeps a column for an icon before the label and
     /// for a check or chevron after it.
-    #[allow(clippy::too_many_arguments)]
     fn row(
         &self,
         key: usize,
-        label: String,
-        glyph: Option<MenuIcon>,
+        look: Look,
         (icons, trailing): (bool, bool),
-        trail: Trail,
-        enabled: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let palette = self.palette;
+        let Look {
+            label,
+            icon,
+            trail,
+            shortcut,
+            enabled,
+            danger,
+        } = look;
         let hovered = enabled && self.hovered == Some(key);
         let hover = if cx.reduce_motion() {
             self.controls
@@ -895,7 +782,16 @@ impl Menu {
             self.controls
                 .blend(("menu-row-hover", key), hovered, slowed(HOVER))
         };
-        let tint = color::lerp(palette.text_secondary, palette.accent, hover);
+        let (rest, lit, wash) = if danger {
+            (
+                palette.danger_label,
+                palette.danger_label,
+                palette.danger_fill,
+            )
+        } else {
+            (palette.text_secondary, palette.accent, palette.soft_fill)
+        };
+        let tint = color::lerp(rest, lit, hover);
         div()
             .id(("menu-row", key))
             .flex_none()
@@ -905,8 +801,13 @@ impl Menu {
             .items_center()
             .gap(px(GAP))
             .rounded(px(ROW_RADIUS))
+            .when(danger, |el| el.text_color(palette.danger_label))
             .when(hover > 0.0, |el| {
-                el.bg(lighting::lit_at(palette.soft_fill, 0.035, hover))
+                el.bg(lighting::lit_at(
+                    wash,
+                    if danger { 0.08 } else { 0.035 },
+                    hover,
+                ))
             })
             .when(enabled, |el| el.cursor_pointer())
             .when(!enabled, |el| el.opacity(0.4))
@@ -927,10 +828,17 @@ impl Menu {
                         .w(px(ICON_SLOT))
                         .flex()
                         .justify_center()
-                        .children(glyph.map(|glyph| glyph.draw(ICON_SIZE, tint))),
+                        .children(icon.map(|glyph| glyph.draw(ICON_SIZE, tint))),
                 )
             })
             .child(div().flex_1().min_w(px(0.0)).truncate().child(label))
+            .children(shortcut.map(|shortcut| {
+                div()
+                    .flex_none()
+                    .text_size(px(SHORTCUT_SIZE))
+                    .text_color(palette.text_secondary)
+                    .child(shortcut)
+            }))
             .when(trailing, |el| {
                 el.child(
                     div()
@@ -948,10 +856,27 @@ impl Menu {
     }
 }
 
-impl Drop for Menu {
+impl<I> Drop for Menu<I> {
     fn drop(&mut self) {
         self.stop_watching();
         allow_key(self.ns_window);
+    }
+}
+
+impl<I> Menu<I> {
+    fn stop_watching(&mut self) {
+        let Some(watch) = self.watch.take() else {
+            return;
+        };
+        if let Some(monitor) = watch.monitor {
+            // SAFETY: the token AppKit returned for this monitor.
+            unsafe { NSEvent::removeMonitor(&monitor) };
+        }
+        // SAFETY: the observer the notification center returned.
+        unsafe {
+            NSNotificationCenter::defaultCenter()
+                .removeObserver(ProtocolObject::as_ref(&*watch.resign))
+        };
     }
 }
 
@@ -966,12 +891,12 @@ fn raised(palette: Palette) -> Rgba {
     }
 }
 
-impl Render for Menu {
+impl<I: Clone + 'static> Render for Menu<I> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
         let palette = self.palette;
         let sweep = self.sweep;
         let level = self.levels.last().expect("menu has a level");
-        let columns = columns(&level.entries);
+        let columns = columns(&level.items);
         let line = palette.area_border;
         let separator = move || {
             div()
@@ -981,17 +906,18 @@ impl Render for Menu {
                 .my(px((SEPARATOR_HEIGHT - 1.0) / 2.0))
                 .bg(color::with_alpha(line, 0.8))
         };
-        let mut rows = Vec::with_capacity(level.entries.len() + 2);
+        let mut rows = Vec::with_capacity(level.items.len() + 2);
         if let Some(title) = &level.title {
             // The way back, headed with the row that led here.
             let back = self
                 .row(
-                    usize::MAX,
-                    title.clone(),
-                    Some(MenuIcon::new(|size, color| chevron(false, size, color))),
+                    BACK_ROW,
+                    Look::plain(
+                        title.clone(),
+                        Some(MenuIcon::new(|size, color| chevron(false, size, color))),
+                        Trail::Nothing,
+                    ),
                     (true, columns.1),
-                    Trail::Nothing,
-                    true,
                     cx,
                 )
                 .text_color(palette.text_secondary)
@@ -1000,55 +926,59 @@ impl Render for Menu {
             rows.push(back.into_any_element());
             rows.push(separator().into_any_element());
         }
-        for (row_index, entry) in level.entries.iter().enumerate() {
-            let index = self.row_indices[row_index];
-            let row = match entry {
-                MenuEntry::Separator => separator().into_any_element(),
-                MenuEntry::Item {
-                    label,
-                    enabled,
-                    checked,
-                    icon: glyph,
-                } => {
-                    let trail = if *checked {
-                        Trail::Check
-                    } else {
-                        Trail::Nothing
+        for (index, item) in level.items.iter().enumerate() {
+            let row = match item {
+                MenuItem::Separator => separator().into_any_element(),
+                MenuItem::Header(label) => div()
+                    .flex_none()
+                    .h(px(HEADER_HEIGHT))
+                    .px(px(ROW_INSET))
+                    .flex()
+                    .items_center()
+                    .text_size(px(SHORTCUT_SIZE))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(palette.text_secondary)
+                    .child(div().truncate().child(label.clone()))
+                    .into_any_element(),
+                MenuItem::Action(action) => {
+                    let id = action.id.clone();
+                    let look = Look {
+                        label: action.label.clone(),
+                        icon: action.icon.clone(),
+                        trail: if action.checked {
+                            Trail::Check
+                        } else {
+                            Trail::Nothing
+                        },
+                        shortcut: action.shortcut.clone(),
+                        enabled: action.enabled,
+                        danger: action.danger,
                     };
-                    let row = self
-                        .row(
-                            index,
-                            label.clone(),
-                            glyph.clone(),
-                            columns,
-                            trail,
-                            *enabled,
-                            cx,
-                        )
-                        .when(*enabled, |el| {
+                    self.row(index, look, columns, cx)
+                        .when(action.enabled, |el| {
                             el.on_click(cx.listener(move |this, _, window, _| {
-                                this.finish(Some(index), window)
+                                this.finish(Some(id.clone()), window)
                             }))
-                        });
-                    row.into_any_element()
+                        })
+                        .into_any_element()
                 }
-                MenuEntry::Submenu {
-                    label, icon: glyph, ..
+                MenuItem::Submenu {
+                    label,
+                    icon,
+                    enabled,
+                    ..
                 } => {
-                    let row = self
-                        .row(
-                            index,
-                            label.clone(),
-                            glyph.clone(),
-                            columns,
-                            Trail::Chevron,
-                            true,
-                            cx,
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.show_level(row_index, index + 1, cx);
-                        }));
-                    row.into_any_element()
+                    let look = Look {
+                        enabled: *enabled,
+                        ..Look::plain(label.clone(), icon.clone(), Trail::Chevron)
+                    };
+                    self.row(index, look, columns, cx)
+                        .when(*enabled, |el| {
+                            el.on_click(cx.listener(move |this, _, _, cx| {
+                                this.show_level(index, cx);
+                            }))
+                        })
+                        .into_any_element()
                 }
             };
             rows.push(row);
@@ -1155,39 +1085,84 @@ impl Render for Menu {
     }
 }
 
-/// Opens a menu of `entries` with its top-left corner at `position` in
-/// `window`, unrolling downward. Answers with the chosen row's index in
-/// reading order, or `None`.
-pub fn open(
+/// Opens a menu of `items` with its top-left corner at `position` in
+/// `window`, unrolling downward. Answers with the chosen action's id, or
+/// `None` when the menu was dismissed.
+pub fn open<I: Clone + 'static>(
     cx: &mut App,
     window: &Window,
     position: Point<gpui::Pixels>,
-    entries: Vec<MenuEntry>,
+    items: Vec<MenuItem<I>>,
     palette: Palette,
-) -> Receiver<Option<usize>> {
-    open_at(cx, window, position, entries, palette, false)
+) -> Receiver<Option<I>> {
+    open_at(cx, window, position, items, palette, false)
 }
 
 /// Opens a menu with its bottom edge at `position`, unrolling upward: for
 /// a trigger on a shelf along the bottom of the window.
-pub fn open_above(
+pub fn open_above<I: Clone + 'static>(
     cx: &mut App,
     window: &Window,
     position: Point<gpui::Pixels>,
-    entries: Vec<MenuEntry>,
+    items: Vec<MenuItem<I>>,
     palette: Palette,
-) -> Receiver<Option<usize>> {
-    open_at(cx, window, position, entries, palette, true)
+) -> Receiver<Option<I>> {
+    open_at(cx, window, position, items, palette, true)
 }
 
-fn open_at(
+/// [`open`], answering through `on_choice` in `window` instead of on a
+/// channel: the chosen action's id, or `None` when the menu was dismissed.
+pub fn open_with<I: Clone + 'static>(
     cx: &mut App,
     window: &Window,
     position: Point<gpui::Pixels>,
-    entries: Vec<MenuEntry>,
+    items: Vec<MenuItem<I>>,
+    palette: Palette,
+    on_choice: impl FnOnce(Option<I>, &mut Window, &mut App) + 'static,
+) {
+    let answer = open_at(cx, window, position, items, palette, false);
+    answer_with(cx, window, answer, on_choice);
+}
+
+/// [`open_above`], answering through `on_choice` in `window`.
+pub fn open_above_with<I: Clone + 'static>(
+    cx: &mut App,
+    window: &Window,
+    position: Point<gpui::Pixels>,
+    items: Vec<MenuItem<I>>,
+    palette: Palette,
+    on_choice: impl FnOnce(Option<I>, &mut Window, &mut App) + 'static,
+) {
+    let answer = open_at(cx, window, position, items, palette, true);
+    answer_with(cx, window, answer, on_choice);
+}
+
+/// Waits for the menu's answer and hands it to `on_choice` in the window
+/// the menu was opened for, if that window is still open.
+fn answer_with<I: 'static>(
+    cx: &mut App,
+    window: &Window,
+    answer: Receiver<Option<I>>,
+    on_choice: impl FnOnce(Option<I>, &mut Window, &mut App) + 'static,
+) {
+    let handle = window.window_handle();
+    cx.spawn(async move |cx| {
+        let Ok(choice) = answer.recv().await else {
+            return;
+        };
+        let _ = handle.update(cx, move |_, window, cx| on_choice(choice, window, cx));
+    })
+    .detach();
+}
+
+fn open_at<I: Clone + 'static>(
+    cx: &mut App,
+    window: &Window,
+    position: Point<gpui::Pixels>,
+    items: Vec<MenuItem<I>>,
     palette: Palette,
     anchored_above: bool,
-) -> Receiver<Option<usize>> {
+) -> Receiver<Option<I>> {
     // One menu at a time.
     dismiss_open();
     let (sender, receiver) = async_channel::bounded(1);
@@ -1197,11 +1172,7 @@ fn open_at(
         window
             .display(cx)
             .map(|display| (display.id(), display.bounds())),
-        vec![Level {
-            entries,
-            base: 0,
-            title: None,
-        }],
+        vec![Level { items, title: None }],
         sender,
         palette,
         anchored_above,
@@ -1209,12 +1180,12 @@ fn open_at(
     receiver
 }
 
-fn open_level(
+fn open_level<I: Clone + 'static>(
     cx: &mut App,
     pointer: Point<gpui::Pixels>,
     display: Option<(DisplayId, Bounds<gpui::Pixels>)>,
-    levels: Vec<Level>,
-    answer: Sender<Option<usize>>,
+    levels: Vec<Level<I>>,
+    answer: Sender<Option<I>>,
     palette: Palette,
     anchored_above: bool,
 ) {
@@ -1225,7 +1196,6 @@ fn open_level(
         level_sizes(level, |text, weight| measure(cx, text, weight));
     let popup_height = popup_height + TITLE_BAND + EDGE_GUTTER;
     let popup_width = popup_width + 2.0 * EDGE_GUTTER;
-    let initial_row_indices = row_indices(level);
     let initial_reachable = reachable_rows(level);
     let (origin, anchored_above) = place(
         point(f32::from(pointer.x), f32::from(pointer.y)),
@@ -1277,7 +1247,6 @@ fn open_level(
                 controls,
                 palette,
                 levels,
-                row_indices: initial_row_indices,
                 reachable: initial_reachable,
                 answer,
                 ns_window,
@@ -1459,31 +1428,24 @@ fn tick(size: f32, color: Rgba) -> AnyElement {
 mod tests {
     use super::*;
 
-    #[test]
-    fn indices_include_nested_rows() {
-        let entries = [
-            MenuEntry::item("A"),
-            MenuEntry::submenu("B", vec![MenuEntry::item("C"), MenuEntry::Separator]),
-            MenuEntry::item("D"),
-        ];
-        assert_eq!(entries.iter().map(width_of).sum::<usize>(), 5);
+    type Item = MenuItem<&'static str>;
+
+    fn level(items: Vec<Item>) -> Level<&'static str> {
+        Level { items, title: None }
     }
 
     #[test]
     fn menus_are_as_tall_as_their_rows() {
-        let mut level = Level {
-            entries: vec![
-                MenuEntry::item("A"),
-                MenuEntry::Separator,
-                MenuEntry::item("B"),
-            ],
-            base: 0,
-            title: None,
-        };
+        let mut level = level(vec![
+            Item::action("a", "A"),
+            Item::separator(),
+            Item::header("Group"),
+            Item::action("b", "B"),
+        ]);
         let top = height_of(&level);
         assert_eq!(
             top,
-            2.0 * ROW_HEIGHT + SEPARATOR_HEIGHT + 2.0 * (PADDING + BORDER)
+            2.0 * ROW_HEIGHT + SEPARATOR_HEIGHT + HEADER_HEIGHT + 2.0 * (PADDING + BORDER)
         );
         level.title = Some("Back to".into());
         assert_eq!(height_of(&level), top + ROW_HEIGHT + SEPARATOR_HEIGHT);
@@ -1492,50 +1454,42 @@ mod tests {
     #[test]
     fn menus_are_as_wide_as_their_longest_row() {
         let by_char = |text: &str, _: FontWeight| text.chars().count() as f32 * 7.0;
-        let short = Level {
-            entries: vec![MenuEntry::item("Open")],
-            base: 0,
-            title: None,
-        };
+        let short = level(vec![Item::action("open", "Open")]);
         assert_eq!(width_of_level(&short, by_char), MIN_WIDTH);
         let label = "Clear local storage and databases for every site you have visited";
-        let long = Level {
-            entries: vec![MenuEntry::item(label)],
-            base: 0,
-            title: None,
-        };
+        let long = level(vec![Item::action("clear", label)]);
         assert_eq!(width_of_level(&long, by_char), MAX_WIDTH);
         // An icon column and a check column make room for themselves.
-        let plain = Level {
-            entries: vec![MenuEntry::item("Close Tabs to the Right")],
-            base: 0,
-            title: None,
-        };
+        let plain = level(vec![Item::action("close", "Close Tabs to the Right")]);
         let icon = MenuIcon::new(tick);
-        let dressed = Level {
-            entries: vec![MenuEntry::checked("Close Tabs to the Right", true).with_icon(icon)],
-            base: 0,
-            title: None,
-        };
+        let dressed = level(vec![
+            Item::action("close", "Close Tabs to the Right")
+                .checked(true)
+                .icon(icon),
+        ]);
         assert_eq!(
             width_of_level(&dressed, by_char) - width_of_level(&plain, by_char),
             ICON_SLOT + TRAILING_SLOT + 2.0 * GAP
+        );
+        // So does a shortcut after the label.
+        let keyed = level(vec![
+            Item::action("close", "Close Tabs to the Right").shortcut("⌘W"),
+        ]);
+        assert_eq!(
+            width_of_level(&keyed, by_char) - width_of_level(&plain, by_char),
+            by_char("⌘W", FontWeight::NORMAL) + GAP
         );
     }
 
     #[test]
     fn popup_fits_submenus_before_they_open() {
-        let level = Level {
-            entries: vec![MenuEntry::submenu(
-                "Move to",
-                vec![
-                    MenuEntry::item("A longer destination than the parent row"),
-                    MenuEntry::item("Another destination"),
-                ],
-            )],
-            base: 0,
-            title: None,
-        };
+        let level = level(vec![Item::submenu(
+            "Move to",
+            vec![
+                Item::action("a", "A longer destination than the parent row"),
+                Item::action("b", "Another destination"),
+            ],
+        )]);
         let (_, (width, height)) = level_sizes(&level, |text, _| text.len() as f32 * 7.0);
         assert!(width > width_of_level(&level, |text, _| text.len() as f32 * 7.0));
         assert!(height > height_of(&level));
@@ -1545,54 +1499,51 @@ mod tests {
     fn preparation_borrows_nested_labels_and_measures_each_level_once() {
         let icon = MenuIcon::new(tick);
         let level = Level {
-            entries: vec![
-                MenuEntry::item("Open"),
-                MenuEntry::Separator,
-                MenuEntry::submenu(
+            items: vec![
+                Item::action("open", "Open"),
+                Item::separator(),
+                Item::submenu(
                     "Move to",
                     vec![
-                        MenuEntry::checked(
+                        Item::action(
+                            "far",
                             "A destination with a label wide enough to fill the panel",
-                            true,
                         )
-                        .with_icon(icon.clone()),
-                        MenuEntry::submenu(
+                        .checked(true)
+                        .icon(icon.clone()),
+                        Item::submenu(
                             "Nested",
-                            vec![MenuEntry::Separator, MenuEntry::item("Here")],
+                            vec![Item::separator(), Item::action("here", "Here")],
                         ),
                     ],
                 )
-                .with_icon(icon),
+                .icon(icon),
             ],
-            base: 0,
             title: Some("Parent".into()),
         };
-        let MenuEntry::Item { label: open, .. } = &level.entries[0] else {
+        let MenuItem::Action(open) = &level.items[0] else {
             unreachable!()
         };
-        let MenuEntry::Submenu {
+        let MenuItem::Submenu {
             label: move_to,
-            entries,
+            items,
             ..
-        } = &level.entries[2]
+        } = &level.items[2]
         else {
             unreachable!()
         };
-        let MenuEntry::Item {
-            label: destination, ..
-        } = &entries[0]
-        else {
+        let MenuItem::Action(destination) = &items[0] else {
             unreachable!()
         };
-        let MenuEntry::Submenu {
+        let MenuItem::Submenu {
             label: nested,
-            entries,
+            items,
             ..
-        } = &entries[1]
+        } = &items[1]
         else {
             unreachable!()
         };
-        let MenuEntry::Item { label: here, .. } = &entries[1] else {
+        let MenuItem::Action(here) = &items[1] else {
             unreachable!()
         };
         let parent = level.title.as_deref().unwrap();
@@ -1607,31 +1558,29 @@ mod tests {
         assert_eq!(
             *calls.borrow(),
             vec![
-                (open.as_ptr(), FontWeight::NORMAL),
+                (open.label.as_ptr(), FontWeight::NORMAL),
                 (move_to.as_ptr(), FontWeight::NORMAL),
                 (parent.as_ptr(), FontWeight::MEDIUM),
-                (destination.as_ptr(), FontWeight::NORMAL),
+                (destination.label.as_ptr(), FontWeight::NORMAL),
                 (nested.as_ptr(), FontWeight::NORMAL),
                 (move_to.as_ptr(), FontWeight::MEDIUM),
-                (here.as_ptr(), FontWeight::NORMAL),
+                (here.label.as_ptr(), FontWeight::NORMAL),
                 (nested.as_ptr(), FontWeight::MEDIUM),
             ]
         );
     }
 
     #[test]
-    fn the_keyboard_skips_separators_and_disabled_rows() {
-        let level = Level {
-            entries: vec![
-                MenuEntry::item("Open"),
-                MenuEntry::Separator,
-                MenuEntry::disabled("Closed"),
-                MenuEntry::submenu("Move to", vec![]),
-            ],
-            base: 0,
-            title: None,
-        };
-        assert_eq!(reachable_rows(&level), vec![0, 3]);
+    fn the_keyboard_skips_separators_headers_and_disabled_rows() {
+        let level = level(vec![
+            Item::action("open", "Open"),
+            Item::separator(),
+            Item::header("More"),
+            Item::action("closed", "Closed").disabled(),
+            Item::submenu("Move to", vec![]),
+            Item::submenu("Nowhere", vec![]).disabled(),
+        ]);
+        assert_eq!(reachable_rows(&level), vec![0, 4]);
         assert_eq!(step_row(Key::Down, None, 2), Some(0));
         assert_eq!(step_row(Key::Up, None, 2), Some(1));
         assert_eq!(step_row(Key::Down, Some(1), 2), Some(0));
