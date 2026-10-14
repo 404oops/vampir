@@ -2102,7 +2102,7 @@ impl Gallery {
                 host.update(cx, |this, cx| this.note(text, cx));
             }
         };
-        let (prompt_note, confirm_note) = (note.clone(), note);
+        let (prompt_note, confirm_note, choose_note) = (note.clone(), note.clone(), note);
         card(
             palette,
             "Dialog windows — a prompt, a confirmation or an alert above a native view",
@@ -2154,6 +2154,35 @@ impl Gallery {
                                 note(
                                     if accepted { "History cleared" } else { "Kept the history" }
                                         .to_string(),
+                                    cx,
+                                )
+                            },
+                        );
+                    },
+                )))
+                .child(div().w(px(160.0)).child(button(
+                    "dialog-window-choose",
+                    "Offer three ways",
+                    ButtonVariant::Soft,
+                    true,
+                    palette,
+                    cx,
+                    move |_this, _window, cx| {
+                        let note = choose_note.clone();
+                        vampir::dialog_window::choose(
+                            cx,
+                            palette,
+                            "Allow this site to use your camera?",
+                            "A saved choice can be changed from the site's icon in the address bar.",
+                            vec!["Block".into(), "Allow Once".into(), "Allow Always".into()],
+                            move |answer, cx| {
+                                note(
+                                    match answer {
+                                        Some(0) => "Camera blocked".to_string(),
+                                        Some(1) => "Camera allowed once".to_string(),
+                                        Some(_) => "Camera allowed always".to_string(),
+                                        None => "Camera prompt cancelled".to_string(),
+                                    },
                                     cx,
                                 )
                             },

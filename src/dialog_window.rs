@@ -71,17 +71,27 @@ enum Kind {
     Prompt(String),
     Confirm,
     Alert,
+    /// One of several ways to go on, the last of them the primary.
+    Choose,
 }
 
-type Answer = Box<dyn FnOnce(Option<String>, &mut App)>;
+/// What came back: the field's text, or which button, or nothing.
+enum Outcome {
+    Cancelled,
+    Text(String),
+    Button(usize),
+}
+
+type Answer = Box<dyn FnOnce(Outcome, &mut App)>;
 
 struct Dialog {
     controls: ControlState,
     palette: Palette,
     title: String,
     message: String,
-    button: String,
-    alert: bool,
+    /// The buttons, last is primary; a lone one is an alert's.
+    buttons: Vec<String>,
+    cancel: bool,
     input: Option<Entity<TextInput>>,
     answer: Option<Answer>,
 }
@@ -96,17 +106,25 @@ impl ControlHost for Dialog {
 }
 
 impl Dialog {
-    fn finish(&mut self, accepted: bool, window: &mut Window, cx: &mut Context<Self>) {
+    /// Closes with `outcome`: a chosen button's index, or none.
+    fn finish(&mut self, chosen: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(answer) = self.answer.take() else {
             return;
         };
-        let text = accepted.then(|| {
-            self.input
-                .as_ref()
-                .map_or_else(String::new, |input| input.read(cx).text())
-        });
+        let outcome = match chosen {
+            None => Outcome::Cancelled,
+            Some(button) => match &self.input {
+                Some(input) => Outcome::Text(input.read(cx).text()),
+                None => Outcome::Button(button),
+            },
+        };
         window.remove_window();
-        answer(text, cx);
+        answer(outcome, cx);
+    }
+
+    /// The primary button: the last.
+    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.finish(Some(self.buttons.len().saturating_sub(1)), window, cx);
     }
 }
 
@@ -116,24 +134,31 @@ impl Render for Dialog {
         let input = self.input.clone();
         let title = self.title.clone();
         let message = self.message.clone();
-        let alert = self.alert;
-        let mut buttons: Vec<DialogButton<Dialog>> = Vec::with_capacity(2);
-        if !alert {
+        let last = self.buttons.len().saturating_sub(1);
+        let mut buttons: Vec<DialogButton<Dialog>> = Vec::with_capacity(self.buttons.len() + 1);
+        if self.cancel {
             buttons.push(DialogButton::new(
                 "dialog-cancel",
                 "Cancel",
                 ButtonVariant::Soft,
-                |this: &mut Dialog, window, cx| this.finish(false, window, cx),
+                |this: &mut Dialog, window, cx| this.finish(None, window, cx),
             ));
         }
-        buttons.push(DialogButton::new(
-            "dialog-submit",
-            self.button.clone(),
-            ButtonVariant::Primary,
-            |this: &mut Dialog, window, cx| this.finish(true, window, cx),
-        ));
+        for (n, label) in self.buttons.iter().enumerate() {
+            buttons.push(DialogButton::new(
+                ("dialog-button", n),
+                label.clone(),
+                if n == last {
+                    ButtonVariant::Primary
+                } else {
+                    ButtonVariant::Soft
+                },
+                move |this: &mut Dialog, window, cx| this.finish(Some(n), window, cx),
+            ));
+        }
         let footer = div()
             .flex()
+            .flex_wrap()
             .justify_end()
             .gap(px(8.0))
             .children(buttons.into_iter().map(|spec| {
@@ -176,17 +201,17 @@ impl Render for Dialog {
             .text_color(palette.text_primary)
             .bg(palette.field_surface)
             .on_action(cx.listener(|this, _: &Dismiss, window, cx| {
-                this.finish(false, window, cx);
+                this.finish(None, window, cx);
             }))
             .on_action(cx.listener(|this, _: &text_input::Enter, window, cx| {
-                this.finish(true, window, cx);
+                this.submit(window, cx);
             }))
             // Enter is only an action inside a field; a confirmation or an
             // alert has none, so the key itself submits there.
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 if keyboard::key(event) == Some(keyboard::Key::Activate) {
                     cx.stop_propagation();
-                    this.finish(true, window, cx);
+                    this.submit(window, cx);
                 }
             }))
             .child(
@@ -235,9 +260,17 @@ pub fn prompt(
         palette,
         title.into(),
         message.into(),
-        button.into(),
         Kind::Prompt(initial.into()),
-        Box::new(on_answer),
+        vec![button.into()],
+        Box::new(move |outcome, cx| {
+            on_answer(
+                match outcome {
+                    Outcome::Text(text) => Some(text),
+                    _ => None,
+                },
+                cx,
+            )
+        }),
     );
 }
 
@@ -256,9 +289,39 @@ pub fn confirm(
         palette,
         title.into(),
         message.into(),
-        button.into(),
         Kind::Confirm,
-        Box::new(move |answer, cx| on_answer(answer.is_some(), cx)),
+        vec![button.into()],
+        Box::new(move |outcome, cx| on_answer(matches!(outcome, Outcome::Button(_)), cx)),
+    );
+}
+
+/// Offers several ways to go on, the last of `buttons` the primary one
+/// Enter chooses, beside Cancel. Answers with the chosen button's index,
+/// or `None` when cancelled.
+pub fn choose(
+    cx: &mut App,
+    palette: Palette,
+    title: impl Into<String>,
+    message: impl Into<String>,
+    buttons: Vec<String>,
+    on_answer: impl FnOnce(Option<usize>, &mut App) + 'static,
+) {
+    open(
+        cx,
+        palette,
+        title.into(),
+        message.into(),
+        Kind::Choose,
+        buttons,
+        Box::new(move |outcome, cx| {
+            on_answer(
+                match outcome {
+                    Outcome::Button(n) => Some(n),
+                    _ => None,
+                },
+                cx,
+            )
+        }),
     );
 }
 
@@ -269,8 +332,8 @@ pub fn alert(cx: &mut App, palette: Palette, title: impl Into<String>, message: 
         palette,
         title.into(),
         message.into(),
-        "OK".into(),
         Kind::Alert,
+        vec!["OK".into()],
         Box::new(|_, _| {}),
     );
 }
@@ -280,18 +343,18 @@ fn open(
     palette: Palette,
     title: String,
     message: String,
-    button: String,
     kind: Kind,
+    buttons: Vec<String>,
     answer: Answer,
 ) {
-    let alert = matches!(kind, Kind::Alert);
+    let cancel = !matches!(kind, Kind::Alert);
     let input = match kind {
         Kind::Prompt(initial) => Some(cx.new(|cx| {
             let mut input = TextInput::new(cx, "", false, InputStyle::from_palette(palette, 13.0));
             input.set_text(&initial, cx);
             input
         })),
-        Kind::Confirm | Kind::Alert => None,
+        Kind::Confirm | Kind::Alert | Kind::Choose => None,
     };
     let height = estimated_height(&message, input.is_some());
     let options = WindowOptions {
@@ -321,8 +384,8 @@ fn open(
             palette,
             title,
             message,
-            button,
-            alert,
+            buttons,
+            cancel,
             input,
             answer: answer.take(),
         })
@@ -330,7 +393,7 @@ fn open(
     if result.is_err()
         && let Some(answer) = answer
     {
-        answer(None, cx);
+        answer(Outcome::Cancelled, cx);
     }
 }
 
