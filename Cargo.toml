@@ -1,6 +1,6 @@
 [package]
 name = "vampir"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
@@ -18,7 +18,7 @@ default = ["app-icon", "native"]
 # Setting the application icon at runtime. The widgets need none of it, so
 # `default-features = false` gets back to a crate with two dependencies:
 #
-#   vampir = { version = "0.2", default-features = false }
+#   vampir = { version = "0.3", default-features = false }
 app-icon = ["dep:image", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
 # What a host that embeds a live native view needs: menus, hints and
 # dialogs in windows of their own, because a native view covers anything
