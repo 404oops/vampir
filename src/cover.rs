@@ -136,6 +136,15 @@ impl Cover {
         for still in self.let_go.drain(..) {
             match still {
                 ImageSource::Render(image) => cx.drop_image(image, Some(window)),
+                // An encoded still is decoded into GPUI's asset cache, and
+                // what the GPU holds is the decoded image's: forgetting the
+                // cache entry alone would leave the texture behind.
+                ImageSource::Image(image) => {
+                    if let Some(decoded) = image.clone().get_render_image(window, cx) {
+                        cx.drop_image(decoded, Some(window));
+                    }
+                    image.remove_asset(cx);
+                }
                 other => other.remove_asset(cx),
             }
         }

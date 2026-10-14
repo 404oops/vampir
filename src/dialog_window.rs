@@ -209,9 +209,10 @@ impl Render for Dialog {
                 this.submit(window, cx);
             }))
             // Enter is only an action inside a field; a confirmation or an
-            // alert has none, so the key itself submits there.
+            // alert has none, so the key itself submits there. Enter alone:
+            // Space activates too, and in a prompt it is a space.
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
-                if keyboard::key(event) == Some(keyboard::Key::Activate) {
+                if event.keystroke.key == "enter" && !event.keystroke.modifiers.modified() {
                     cx.stop_propagation();
                     this.submit(window, cx);
                 }
@@ -353,6 +354,8 @@ fn open(
         Kind::Prompt(initial) => Some(cx.new(|cx| {
             let mut input = TextInput::new(cx, "", false, InputStyle::from_palette(palette, 13.0));
             input.set_text(&initial, cx);
+            // Offered to be replaced: typing takes the place of it.
+            input.select_everything(cx);
             input
         })),
         Kind::Confirm | Kind::Alert | Kind::Choose => None,
@@ -380,7 +383,7 @@ fn open(
             Some(focus) => window.focus(focus, cx),
             None => controls.focus_root(window, cx),
         }
-        cx.new(|_| Dialog {
+        let dialog = cx.new(|_| Dialog {
             controls,
             palette,
             title,
@@ -389,7 +392,17 @@ fn open(
             cancel,
             input,
             answer: answer.take(),
-        })
+        });
+        // Closed by the platform — its close button, Alt-F4 — rather than
+        // by an answer: that is cancelling, and the caller hears so.
+        let weak = dialog.downgrade();
+        window.on_window_should_close(cx, move |_, cx| {
+            if let Ok(Some(answer)) = weak.update(cx, |dialog, _| dialog.answer.take()) {
+                answer(Outcome::Cancelled, cx);
+            }
+            true
+        });
+        dialog
     });
     if result.is_err()
         && let Some(answer) = answer

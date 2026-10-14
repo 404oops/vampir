@@ -93,8 +93,13 @@ const BORDER: f32 = 1.0;
 const RADIUS: f32 = 12.0;
 const ROW_RADIUS: f32 = 7.0;
 /// The shared panel shadow reaches three blur radii (30 points), plus
-/// its two-point downward offset. Keep its tail inside the popup.
-const EDGE_GUTTER: f32 = 32.0;
+/// its two-point downward offset. Keep its tail inside the popup, where
+/// the popup may have clear room around its panel at all.
+const EDGE_GUTTER: f32 = if crate::popup::CLEAR_MARGINS {
+    32.0
+} else {
+    0.0
+};
 /// Between a row's highlight and what's in it.
 const ROW_INSET: f32 = 8.0;
 const TEXT_SIZE: f32 = 13.0;
@@ -109,9 +114,13 @@ const MAX_HEIGHT: f32 = 520.0;
 /// Clear space the popup keeps above its panel. AppKit treats the top of
 /// any titled window, even one with no visible title bar, as its title
 /// bar: a click there in a window that isn't key goes to moving the
-/// window instead of to the view. The rows stay below that band on every
-/// platform, so the panel sits the same everywhere.
-const TITLE_BAND: f32 = 28.0;
+/// window instead of to the view. Only AppKit has the band, and only a
+/// window with clear margins can keep it empty.
+const TITLE_BAND: f32 = if crate::popup::CLEAR_MARGINS {
+    28.0
+} else {
+    0.0
+};
 /// The back row's key among a level's rows, which are keyed by index.
 const BACK_ROW: usize = usize::MAX;
 
@@ -441,9 +450,15 @@ pub(crate) enum Signal {
     Text(String),
 }
 
+/// The menu showing, and how to close it as dismissed from outside.
+struct Open {
+    window: AnyWindowHandle,
+    dismiss: Box<dyn FnOnce(&mut App)>,
+}
+
 thread_local! {
     /// The menu showing, if one is, and how to close it.
-    static OPEN: RefCell<Option<AnyWindowHandle>> = const { RefCell::new(None) };
+    static OPEN: RefCell<Option<Open>> = const { RefCell::new(None) };
 }
 
 pub(crate) struct Menu<I> {
@@ -468,6 +483,10 @@ pub(crate) struct Menu<I> {
     /// The visible panel's target size. The popup itself fits every level.
     width: f32,
     height: f32,
+    /// The size every level's panel takes, where the popup has no clear
+    /// room to show a smaller one in (see [`crate::popup::CLEAR_MARGINS`]):
+    /// the panel fills the popup, so no pixel of it is left uncovered.
+    fills: Option<(f32, f32)>,
     /// The row under the pointer or the keyboard, whose icon takes the
     /// accent, by its index in the level; `BACK_ROW` for the way back.
     hovered: Option<usize>,
@@ -488,13 +507,11 @@ impl<I: 'static> ControlHost for Menu<I> {
     }
 }
 
-/// Closes the menu showing, if there is one.
+/// Closes the menu showing, if there is one. It answers `None`, as a
+/// menu dismissed any other way does.
 pub fn dismiss_open(cx: &mut App) {
     if let Some(open) = OPEN.with(|slot| slot.borrow_mut().take()) {
-        let _ = open.update(cx, |_, window, _| {
-            platform::hide(window);
-            window.remove_window();
-        });
+        (open.dismiss)(cx);
     }
 }
 
@@ -542,14 +559,17 @@ impl<I: Clone + 'static> Menu<I> {
         let handle = window.window_handle();
         OPEN.with(|slot| {
             let mut slot = slot.borrow_mut();
-            if slot.as_ref().is_some_and(|open| *open == handle) {
+            if slot.as_ref().is_some_and(|open| open.window == handle) {
                 *slot = None;
             }
         });
         platform::hide(window);
         window.remove_window();
+        // After this update, not inside it: a menu dismissed because the
+        // host opened another is closed while the host's window is busy,
+        // and an answer given now could not reach it.
         if let Some(answer) = self.answer.take() {
-            answer(choice, cx);
+            cx.defer(move |cx| answer(choice, cx));
         }
     }
 
@@ -589,8 +609,12 @@ impl<I: Clone + 'static> Menu<I> {
 
     fn change_level(&mut self, sweep: Sweep, cx: &mut Context<Self>) {
         let level = self.levels.last().expect("menu has a level");
-        self.width = width_of_level(level, |text, weight| measure(cx, text, weight));
-        self.height = height_of(level);
+        (self.width, self.height) = self.fills.unwrap_or_else(|| {
+            (
+                width_of_level(level, |text, weight| measure(cx, text, weight)),
+                height_of(level),
+            )
+        });
         self.reachable = reachable_rows(level);
         self.sweep = sweep;
         self.hovered = None;
@@ -941,7 +965,7 @@ impl<I: Clone + 'static> Render for Menu<I> {
             .child(rows);
         // Keep the native popup fixed; only its visible panel unrolls or
         // resizes. Animation IDs survive hover redraws and finish once.
-        let panel = if self.animations_ready && sweep.unrolls() {
+        let panel = if self.animations_ready && sweep.unrolls() && self.fills.is_none() {
             panel
                 .with_animation(
                     "menu-unroll",
@@ -974,7 +998,7 @@ impl<I: Clone + 'static> Render for Menu<I> {
             )
             // Where the window has the keyboard, keys arrive here; a chord
             // or a key the menu has no use for closes it, as a native menu
-            // would, and goes on to the host.
+            // would. It goes no further: the host's window never had it.
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 let signal = match typed_event(event) {
                     Typed::Key(key) => Signal::Key(key),
@@ -1074,6 +1098,8 @@ fn open_level<I: Clone + 'static>(
     };
     let ((width, height), (popup_width, popup_height)) =
         level_sizes(level, |text, weight| measure(cx, text, weight));
+    let fills = (!crate::popup::CLEAR_MARGINS).then_some((popup_width, popup_height));
+    let (width, height) = fills.unwrap_or((width, height));
     let popup_height = popup_height + TITLE_BAND + EDGE_GUTTER;
     let popup_width = popup_width + 2.0 * EDGE_GUTTER;
     let initial_reachable = reachable_rows(level);
@@ -1109,6 +1135,10 @@ fn open_level<I: Clone + 'static>(
         is_minimizable: false,
         ..Default::default()
     };
+    // A menu that cannot open answers as dismissed, so the caller is
+    // never left waiting.
+    let mut answer = Some(answer);
+    let unanswered = &mut answer;
     let result = cx.open_window(options, move |window, cx| {
         let controls = ControlState::default();
         controls.snap("menu-width", width);
@@ -1122,7 +1152,7 @@ fn open_level<I: Clone + 'static>(
             palette,
             levels,
             reachable: initial_reachable,
-            answer: Some(answer),
+            answer: unanswered.take(),
             watch: None,
             _activation: None,
             was_active: false,
@@ -1137,6 +1167,7 @@ fn open_level<I: Clone + 'static>(
             animation_epoch: 0,
             width,
             height,
+            fills,
             hovered: None,
             scroll: ScrollHandle::new(),
             typed: String::new(),
@@ -1158,9 +1189,19 @@ fn open_level<I: Clone + 'static>(
         menu
     });
     let Ok(handle) = result else {
+        if let Some(answer) = answer {
+            cx.defer(move |cx| answer(None, cx));
+        }
         return;
     };
-    OPEN.with(|slot| *slot.borrow_mut() = Some(handle.into()));
+    OPEN.with(|slot| {
+        *slot.borrow_mut() = Some(Open {
+            window: handle.into(),
+            dismiss: Box::new(move |cx| {
+                let _ = handle.update(cx, |menu, window, cx| menu.finish(None, window, cx));
+            }),
+        })
+    });
     let watch = cx.update_window(handle.into(), |_, window, cx| {
         platform::watch(window, handle, cx)
     });
@@ -1415,7 +1456,10 @@ mod tests {
         let popup = (200.0, 300.0);
         // Room below: the panel's top edge sits at the pointer.
         let (origin, above) = place(point(100.0, 100.0), popup, screen, false);
-        assert_eq!((origin, above), (point(68.0, 100.0 - TITLE_BAND), false));
+        assert_eq!(
+            (origin, above),
+            (point(100.0 - EDGE_GUTTER, 100.0 - TITLE_BAND), false)
+        );
         // No room below but room above: it flips, bottom edge at the pointer.
         let (origin, above) = place(point(100.0, 850.0), popup, screen, false);
         assert!(above);

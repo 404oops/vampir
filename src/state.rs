@@ -570,8 +570,6 @@ pub struct ControlState {
     /// before its hint shows.
     pub(crate) hint_key: Option<Tag>,
     pub(crate) hint_timer: Option<gpui::Task<()>>,
-    /// The wait before a passing message goes away.
-    pub(crate) toast_timer: Option<gpui::Task<()>>,
 }
 
 impl Default for ControlState {
@@ -610,7 +608,6 @@ impl ControlState {
             floating_hints: false,
             hint_key: None,
             hint_timer: None,
-            toast_timer: None,
         }
     }
 

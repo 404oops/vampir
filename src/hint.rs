@@ -8,12 +8,16 @@
 //! uses [`attach`] when the host has asked for floating hints; a host
 //! reaches for [`toast`] itself, for a message that has nowhere else to go.
 
-use std::{cell::RefCell, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    thread::LocalKey,
+    time::Duration,
+};
 
 use gpui::{
     AnyWindowHandle, App, AppContext, Bounds, Context, Div, FontWeight, InteractiveElement,
     MouseButton, ParentElement, Pixels, Point, Render, SharedString, Stateful,
-    StatefulInteractiveElement, Styled, Window, WindowBackgroundAppearance, WindowBounds,
+    StatefulInteractiveElement, Styled, Window, WindowBackgroundAppearance, WindowBounds, WindowId,
     WindowKind, WindowOptions, canvas, div, point, px, size,
 };
 
@@ -36,13 +40,32 @@ const TEXT_SIZE: f32 = 11.5;
 const PAD_X: f32 = 8.0;
 const PAD_Y: f32 = 4.0;
 const LINE_HEIGHT: f32 = 16.0;
-/// Room around the panel for its shadow, inside the transparent window.
-const SHADOW: f32 = 24.0;
+/// Room around the panel for its shadow, inside the transparent window,
+/// where the window may have any (see [`crate::popup::CLEAR_MARGINS`]).
+/// It is more than [`GAP`], so the window overlaps what it names; only
+/// a pointer that passes through clear pixels leaves that alone.
+const SHADOW: f32 = if crate::popup::CLEAR_MARGINS {
+    24.0
+} else {
+    0.0
+};
+
+/// A hint or a message on screen, and the host window it was shown for:
+/// it goes when that window does.
+struct Shown {
+    window: AnyWindowHandle,
+    host: WindowId,
+}
+
+type Slot = &'static LocalKey<RefCell<Option<Shown>>>;
 
 thread_local! {
-    static HINT: RefCell<Option<AnyWindowHandle>> = const { RefCell::new(None) };
+    static HINT: RefCell<Option<Shown>> = const { RefCell::new(None) };
     /// A passing message's own window, so a hint doesn't take it away.
-    static TOAST_WINDOW: RefCell<Option<AnyWindowHandle>> = const { RefCell::new(None) };
+    static TOAST_WINDOW: RefCell<Option<Shown>> = const { RefCell::new(None) };
+    /// Whether closing a host window already takes its hint and message
+    /// with it.
+    static WATCHING_HOSTS: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Gives `element` a hint in a window of its own, shown after the pointer
@@ -166,10 +189,17 @@ pub fn toast<V: ControlHost>(
         window,
         cx,
     );
-    view.control_state_mut().toast_timer = Some(cx.spawn(async move |_, cx| {
+    // The wait belongs to this message, not to the view: it outlives a
+    // host that closes, and leaves alone a later message, from this view
+    // or another, that has taken the window's place.
+    let Some(shown) = TOAST_WINDOW.with(|slot| slot.borrow().as_ref().map(|s| s.window)) else {
+        return;
+    };
+    cx.spawn(async move |_, cx| {
         cx.background_executor().timer(TOAST).await;
-        cx.update(hide_toast);
-    }));
+        cx.update(|cx| close_where(&TOAST_WINDOW, |s| s.window == shown, cx));
+    })
+    .detach();
 }
 
 /// Takes the passing message away.
@@ -177,10 +207,40 @@ pub fn hide_toast(cx: &mut App) {
     close(&TOAST_WINDOW, cx);
 }
 
-fn close(slot: &'static std::thread::LocalKey<RefCell<Option<AnyWindowHandle>>>, cx: &mut App) {
-    if let Some(handle) = slot.with(|slot| slot.borrow_mut().take()) {
-        let _ = handle.update(cx, |_, window, _| window.remove_window());
+fn close(slot: Slot, cx: &mut App) {
+    close_where(slot, |_| true, cx);
+}
+
+/// Closes what `slot` shows, if `which` says it is the one.
+fn close_where(slot: Slot, which: impl FnOnce(&Shown) -> bool, cx: &mut App) {
+    let shown = slot.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_some_and(which) {
+            slot.take()
+        } else {
+            None
+        }
+    });
+    if let Some(shown) = shown {
+        let _ = shown
+            .window
+            .update(cx, |_, window, _| window.remove_window());
     }
+}
+
+/// From now on, a host window that closes takes its hint and its message
+/// with it: nothing else would, since the pointer never leaves an element
+/// that has gone.
+fn watch_hosts(cx: &mut App) {
+    if WATCHING_HOSTS.with(|watching| watching.replace(true)) {
+        return;
+    }
+    cx.on_window_closed(|cx, closed| {
+        for slot in [&HINT, &TOAST_WINDOW] {
+            close_where(slot, |s| s.host == closed, cx);
+        }
+    })
+    .detach();
 }
 
 /// The window's origin for `anchor` in a host window at `frame`, both in
@@ -204,10 +264,11 @@ fn place(
         ),
     };
     if let Some(screen) = screen {
-        x = x.clamp(
-            screen.origin.x + SCREEN_MARGIN,
-            screen.origin.x + screen.size.width - width - SCREEN_MARGIN,
-        );
+        // Not `clamp`, which panics on a hint wider than the screen: that
+        // one keeps its start on the screen and runs off the far side.
+        x = x
+            .min(screen.origin.x + screen.size.width - width - SCREEN_MARGIN)
+            .max(screen.origin.x + SCREEN_MARGIN);
         y = y.min(screen.origin.y + screen.size.height - height - SCREEN_MARGIN);
     }
     point(x, y)
@@ -258,7 +319,7 @@ impl Render for Panel {
 
 #[allow(clippy::too_many_arguments)]
 fn show_in(
-    slot: &'static std::thread::LocalKey<RefCell<Option<AnyWindowHandle>>>,
+    slot: Slot,
     text: SharedString,
     anchor: Bounds<Pixels>,
     side: HintSide,
@@ -268,6 +329,7 @@ fn show_in(
 ) {
     // A window cannot be moved once open, so each showing is a new one.
     close(slot, cx);
+    watch_hosts(cx);
     let width = text_width(cx, &text, TEXT_SIZE, FontWeight::NORMAL) + 2.0 * PAD_X + 2.0;
     let height = LINE_HEIGHT + 2.0 * PAD_Y + 2.0;
     let frame = crate::popup::content_origin(window);
@@ -306,7 +368,13 @@ fn show_in(
         ..Default::default()
     };
     if let Ok(handle) = cx.open_window(options, |_, cx| cx.new(|_| Panel { text, palette })) {
-        slot.with(|slot| *slot.borrow_mut() = Some(handle.into()));
+        let host = window.window_handle().window_id();
+        slot.with(|slot| {
+            *slot.borrow_mut() = Some(Shown {
+                window: handle.into(),
+                host,
+            })
+        });
         // The new window must not take the keyboard from the host's: a
         // platform that gives it to the newest window gets it back, so the
         // host's next click is a click and not the one that focuses it.
@@ -350,5 +418,19 @@ mod tests {
         let low = bounds(10.0, 290.0, 40.0, 10.0);
         let at = place(frame, low, (120.0, 24.0), HintSide::Below, screen);
         assert_eq!(at.y, 300.0 - 24.0 - SCREEN_MARGIN);
+    }
+
+    #[test]
+    fn a_hint_wider_than_the_screen_starts_on_it() {
+        let screen = Some(bounds(0.0, 0.0, 400.0, 300.0));
+        let anchor = bounds(100.0, 10.0, 40.0, 20.0);
+        let at = place(
+            point(0.0, 0.0),
+            anchor,
+            (900.0, 24.0),
+            HintSide::Below,
+            screen,
+        );
+        assert_eq!(at.x, SCREEN_MARGIN);
     }
 }
