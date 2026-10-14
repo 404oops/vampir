@@ -101,9 +101,9 @@ pub enum HintSide {
 }
 
 /// Gives `element` a hint: GPUI's tooltip, or when the host has asked for
-/// native-safe hints ([`ControlState::set_native_hints`]) a panel of its
+/// floating hints ([`ControlState::set_floating_hints`]) a window of its
 /// own beside the element, which a native view over the window cannot
-/// hide. `side` only matters to the panel; a tooltip goes where GPUI
+/// hide. `side` only matters to the window; a tooltip goes where GPUI
 /// puts it.
 ///
 /// ```ignore
@@ -118,11 +118,9 @@ pub fn hinted<V: ControlHost>(
 ) -> Stateful<Div> {
     let WidgetContext { palette, view, cx } = ctx;
     let hint = hint.into();
-    #[cfg(all(target_os = "macos", feature = "native"))]
-    if view.control_state().native_hints() {
-        return crate::native::hint::attach(element, hint, side, cx);
+    if view.control_state().floating_hints() {
+        return crate::hint::attach(element, hint, side, cx);
     }
-    let _ = (side, view, &cx);
     element.tooltip(hint.tooltip(palette))
 }
 

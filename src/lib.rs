@@ -38,7 +38,10 @@ pub mod color;
 pub mod containers;
 pub mod controls;
 pub mod data;
+pub mod dialog_window;
 pub mod easing;
+pub mod floating_menu;
+pub mod hint;
 #[cfg(feature = "app-icon")]
 pub mod icon;
 pub mod keyboard;
@@ -48,6 +51,7 @@ pub mod menu;
 pub mod native;
 pub mod overlay;
 pub mod palette;
+pub mod popup;
 pub mod scroll;
 pub mod selection;
 pub mod shortcut;
@@ -86,7 +90,6 @@ pub use menu::{
 };
 #[cfg(all(target_os = "macos", feature = "native"))]
 pub use native::{
-    floating_menu, hint as native_hint,
     ns_menu::{NativeAction, NativeMenu},
     ns_window_of,
 };

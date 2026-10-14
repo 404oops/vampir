@@ -1,14 +1,12 @@
 //! A context menu in a transparent pop-up window of its own, for a host
 //! whose GPUI window has a live native view over it.
 //!
-//! It behaves like a native menu: it floats above the window without
-//! taking the keyboard from it (the field or page being typed in keeps its
-//! caret), one is open at a time, and a click anywhere else in the app, a
-//! key it has no use for, or switching to another app closes it; that
-//! click does nothing else. Submenus open in place with a row at the top
-//! that leads back. The arrows walk the rows, Enter runs one, Right and
-//! Left go into a submenu and out again, and typing a label's first
-//! letters lands on it.
+//! It behaves like a native menu: it floats above the window, one is open
+//! at a time, and a click anywhere else, a key it has no use for, or
+//! switching to another window closes it. Submenus open in place with a
+//! row at the top that leads back. The arrows walk the rows, Enter runs
+//! one, Right and Left go into a submenu and out again, and typing a
+//! label's first letters lands on it.
 //!
 //! The rows are the same [`MenuItem`] tree the in-window
 //! [`context_menu`](crate::context_menu) takes, so a host builds a menu
@@ -24,29 +22,23 @@
 //! ```
 //!
 //! The answer is the chosen action's id; `None` when the menu was
-//! dismissed. [`open`] and [`open_above`] answer on a channel instead, for
-//! a host that would rather await it.
+//! dismissed. The window is a [`gpui::WindowKind::PopUp`], which every
+//! platform has. It takes the keyboard while it is open; on macOS with the
+//! `native` feature it instead watches the app's events, so the field or
+//! page being typed in keeps its caret and the click that closes the menu
+//! goes no further, as with a native menu.
 
 use std::{
-    cell::{Cell, RefCell},
-    ptr::NonNull,
-    rc::Rc,
+    cell::RefCell,
     time::{Duration, Instant},
 };
 
-use async_channel::{Receiver, Sender};
-use block2::RcBlock;
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, Bounds, Context, DisplayId, FontWeight, Point,
-    Render, Rgba, ScrollHandle, SharedString, Task, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowKind, WindowOptions, canvas, div, point, prelude::*, px, size,
+    Animation, AnimationExt, AnyElement, AnyWindowHandle, App, Bounds, Context, DisplayId,
+    FontWeight, KeyDownEvent, Point, Render, Rgba, ScrollHandle, SharedString, Subscription,
+    Window, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, canvas, div,
+    point, prelude::*, px, size,
 };
-use objc2::{
-    rc::Retained,
-    runtime::{AnyObject, ProtocolObject},
-};
-use objc2_app_kit::{NSEvent, NSEventMask, NSEventModifierFlags, NSEventType, NSWindow};
-use objc2_foundation::{NSNotificationCenter, NSObjectProtocol};
 
 use crate::{
     color,
@@ -59,7 +51,34 @@ use crate::{
     typography::ui_font,
 };
 
-use super::{event_in, ns_window_of};
+#[cfg(all(target_os = "macos", feature = "native"))]
+use crate::native::menu_watch as platform;
+
+/// What the platform does for a menu beyond what GPUI does everywhere:
+/// nothing, unless the `native` feature on macOS says otherwise.
+#[cfg(not(all(target_os = "macos", feature = "native")))]
+mod platform {
+    use gpui::{App, Window, WindowHandle};
+
+    /// Whether the menu's window keeps the keyboard away from the host's.
+    pub const KEYLESS: bool = false;
+    pub struct Watch;
+    pub fn watch<I: Clone + 'static>(
+        _window: &Window,
+        _menu: WindowHandle<super::Menu<I>>,
+        _cx: &App,
+    ) -> Option<Watch> {
+        None
+    }
+    /// Shows the window, opened hidden: its first draw has settled the
+    /// transparent gutter around the panel before the platform sees it,
+    /// so no window shadow is cast from the whole popup's outline.
+    pub fn shown(window: &mut Window, cx: &mut App) {
+        window.draw(cx).clear(cx);
+        window.activate_window();
+    }
+    pub fn hide(_window: &Window) {}
+}
 
 /// A menu is as wide as its longest row, within these.
 const MIN_WIDTH: f32 = 184.0;
@@ -74,7 +93,7 @@ const BORDER: f32 = 1.0;
 const RADIUS: f32 = 12.0;
 const ROW_RADIUS: f32 = 7.0;
 /// The shared panel shadow reaches three blur radii (30 points), plus
-/// its two-point downward offset. Keep its tail inside the native popup.
+/// its two-point downward offset. Keep its tail inside the popup.
 const EDGE_GUTTER: f32 = 32.0;
 /// Between a row's highlight and what's in it.
 const ROW_INSET: f32 = 8.0;
@@ -90,8 +109,8 @@ const MAX_HEIGHT: f32 = 520.0;
 /// Clear space the popup keeps above its panel. AppKit treats the top of
 /// any titled window, even one with no visible title bar, as its title
 /// bar: a click there in a window that isn't key goes to moving the
-/// window instead of to the view. A menu never becomes key, so its rows
-/// stay below that band.
+/// window instead of to the view. The rows stay below that band on every
+/// platform, so the panel sits the same everywhere.
 const TITLE_BAND: f32 = 28.0;
 /// The back row's key among a level's rows, which are keyed by index.
 const BACK_ROW: usize = usize::MAX;
@@ -238,21 +257,9 @@ fn width_of_items<I>(
     (row.max(back) + 2.0 * (PADDING + BORDER + ROW_INSET) + slack).clamp(MIN_WIDTH, MAX_WIDTH)
 }
 
-/// How wide `text` sets in the menu's font at `weight`, from its glyphs'
-/// advances.
+/// How wide `text` sets in the menu's font at `weight`.
 fn measure(cx: &App, text: &str, weight: FontWeight) -> f32 {
-    let system = cx.text_system();
-    let mut font = gpui::font(ui_font());
-    font.weight = weight;
-    let font = system.resolve_font(&font);
-    let size = px(TEXT_SIZE);
-    text.chars()
-        .map(|ch| {
-            system
-                .advance(font, size, ch)
-                .map_or(TEXT_SIZE * 0.6, |advance| f32::from(advance.width))
-        })
-        .sum()
+    crate::typography::text_width(cx, text, TEXT_SIZE, weight)
 }
 
 /// A transparent popup large enough for any level, so changing levels does
@@ -324,9 +331,9 @@ fn place(
 
 // ---- The keyboard -----------------------------------------------------------
 
-/// What a key the monitor saw means to the menu.
+/// What a key press means to the menu.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Typed {
+pub(crate) enum Typed {
     /// One of the keys the menu walks itself with.
     Key(Key),
     /// A letter towards a row's label.
@@ -336,37 +343,53 @@ enum Typed {
     Other,
 }
 
-/// Sorts a key press by its hardware code and the text it carries. A press
-/// with ⌘ or ⌃ is never the menu's: it is a shortcut the host may have,
-/// and a menu that swallowed ⌘Q would be a menu nobody could get past.
-fn typed(code: u16, text: Option<&str>, command: bool, control: bool) -> Typed {
-    if command || control {
+/// Sorts a key press by the key it names and the text it carries. A press
+/// with a platform or control modifier is never the menu's: it is a
+/// shortcut the host may have, and a menu that swallowed ⌘Q would be a
+/// menu nobody could get past.
+pub(crate) fn typed(key: Option<Key>, text: Option<&str>, chord: bool) -> Typed {
+    if chord {
         return Typed::Other;
     }
-    match code {
-        53 => return Typed::Key(Key::Dismiss),
-        36 | 76 | 49 => return Typed::Key(Key::Activate),
-        125 => return Typed::Key(Key::Down),
-        126 => return Typed::Key(Key::Up),
-        123 => return Typed::Key(Key::Left),
-        124 => return Typed::Key(Key::Right),
-        115 => return Typed::Key(Key::Home),
-        119 => return Typed::Key(Key::End),
-        116 => return Typed::Key(Key::PageUp),
-        121 => return Typed::Key(Key::PageDown),
-        _ => {}
+    if let Some(key) = key {
+        return Typed::Key(key);
     }
     match text {
         Some(text)
-            if text
-                .chars()
-                .all(|ch| !ch.is_control() && !ch.is_whitespace())
-                && !text.is_empty() =>
+            if !text.is_empty()
+                && text
+                    .chars()
+                    .all(|ch| !ch.is_control() && !ch.is_whitespace()) =>
         {
             Typed::Text(text.to_string())
         }
         _ => Typed::Other,
     }
+}
+
+/// [`typed`] for a key GPUI delivered to the menu's own window.
+fn typed_event(event: &KeyDownEvent) -> Typed {
+    let modifiers = &event.keystroke.modifiers;
+    let key = keyboard::key(event).filter(|key| {
+        matches!(
+            key,
+            Key::Dismiss
+                | Key::Activate
+                | Key::Up
+                | Key::Down
+                | Key::Left
+                | Key::Right
+                | Key::Home
+                | Key::End
+                | Key::PageUp
+                | Key::PageDown
+        )
+    });
+    typed(
+        key,
+        event.keystroke.key_char.as_deref(),
+        modifiers.platform || modifiers.control,
+    )
 }
 
 /// The row `typed` lands on, among `labels` in order, from `current`.
@@ -410,43 +433,34 @@ fn step_row(key: Key, at: Option<usize>, len: usize) -> Option<usize> {
 
 // ---- The window -------------------------------------------------------------
 
-/// What the watch tells a menu from outside it.
-enum Signal {
+/// What reaches a menu from outside its rows: the platform's watch, or
+/// GPUI's own key dispatch.
+pub(crate) enum Signal {
     Close,
     Key(Key),
     Text(String),
 }
 
-/// The menu showing, if one is.
-struct OpenMenu {
-    ns_window: usize,
-    dismiss: Sender<Signal>,
-    dismissed: Rc<Cell<bool>>,
-}
-
-/// What closes a menu from outside it: presses and keys anywhere else in
-/// the app, and the app going to the background.
-struct Watch {
-    monitor: Option<Retained<AnyObject>>,
-    resign: Retained<ProtocolObject<dyn NSObjectProtocol>>,
-}
-
 thread_local! {
-    static OPEN: RefCell<Option<OpenMenu>> = const { RefCell::new(None) };
+    /// The menu showing, if one is, and how to close it.
+    static OPEN: RefCell<Option<AnyWindowHandle>> = const { RefCell::new(None) };
 }
 
-struct Menu<I> {
+pub(crate) struct Menu<I> {
     controls: ControlState,
     palette: Palette,
     levels: Vec<Level<I>>,
     /// The rows of the current level the keyboard can land on.
     reachable: Vec<usize>,
-    answer: Sender<Option<I>>,
-    ns_window: usize,
-    watch: Option<Watch>,
+    answer: Option<Answer<I>>,
+    watch: Option<platform::Watch>,
+    _activation: Option<Subscription>,
+    /// Whether the window has been the active one: only then does losing
+    /// that mean the reader went elsewhere.
+    was_active: bool,
     done: bool,
-    /// GPUI draws once while the popup is hidden. Warm its text and icons
-    /// before starting the short opening animation.
+    /// The first draw warms text and icons; the short opening animation
+    /// starts after it.
     animations_ready: bool,
     sweep: Sweep,
     anchored_above: bool,
@@ -461,8 +475,9 @@ struct Menu<I> {
     /// Letters typed towards a row, and when the last came.
     typed: String,
     typed_at: Option<Instant>,
-    _dismiss: Option<Task<()>>,
 }
+
+type Answer<I> = Box<dyn FnOnce(Option<I>, &mut App)>;
 
 impl<I: 'static> ControlHost for Menu<I> {
     fn control_state(&self) -> &ControlState {
@@ -473,24 +488,13 @@ impl<I: 'static> ControlHost for Menu<I> {
     }
 }
 
-/// Takes the menu window off the screen at once, before GPUI gets round to
-/// closing it.
-fn hide(ns_window: usize) {
-    if ns_window == 0 {
-        return;
-    }
-    // SAFETY: the menu's own window, still open: it is only closed by
-    // `Menu::finish`, which forgets it first.
-    let window = unsafe { &*(ns_window as *const NSWindow) };
-    window.orderOut(None);
-}
-
 /// Closes the menu showing, if there is one.
-pub fn dismiss_open() {
+pub fn dismiss_open(cx: &mut App) {
     if let Some(open) = OPEN.with(|slot| slot.borrow_mut().take()) {
-        open.dismissed.set(true);
-        hide(open.ns_window);
-        let _ = open.dismiss.try_send(Signal::Close);
+        let _ = open.update(cx, |_, window, _| {
+            platform::hide(window);
+            window.remove_window();
+        });
     }
 }
 
@@ -499,92 +503,6 @@ pub fn is_open() -> bool {
     OPEN.with(|slot| slot.borrow().is_some())
 }
 
-/// Closes the menu at `ns_window` from outside it, at once.
-fn close_from_outside(ns_window: usize, dismiss: &Sender<Signal>, dismissed: &Cell<bool>) {
-    dismissed.set(true);
-    OPEN.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if slot
-            .as_ref()
-            .is_some_and(|open| open.ns_window == ns_window)
-        {
-            *slot = None;
-        }
-    });
-    hide(ns_window);
-    let _ = dismiss.try_send(Signal::Close);
-}
-
-/// Watches for what closes the menu at `ns_window`: a press outside it,
-/// which goes no further, as with a native menu; a key, which the menu
-/// walks itself with or closes on, Escape going no further; and the app
-/// going to the background.
-fn watch(ns_window: usize, dismiss: Sender<Signal>, dismissed: Rc<Cell<bool>>) -> Watch {
-    let (on_resign, resigned) = (dismiss.clone(), dismissed.clone());
-    let handler = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
-        // SAFETY: AppKit owns the event for the callback's duration.
-        let event_ref = unsafe { event.as_ref() };
-        if dismissed.get() {
-            return event.as_ptr();
-        }
-        if event_ref.r#type() == NSEventType::KeyDown {
-            let flags = event_ref.modifierFlags();
-            let text = event_ref.characters().map(|text| text.to_string());
-            return match typed(
-                event_ref.keyCode(),
-                text.as_deref(),
-                flags.contains(NSEventModifierFlags::Command),
-                flags.contains(NSEventModifierFlags::Control),
-            ) {
-                Typed::Key(key) => {
-                    let _ = dismiss.try_send(Signal::Key(key));
-                    std::ptr::null_mut()
-                }
-                Typed::Text(text) => {
-                    let _ = dismiss.try_send(Signal::Text(text));
-                    std::ptr::null_mut()
-                }
-                Typed::Other => {
-                    close_from_outside(ns_window, &dismiss, &dismissed);
-                    event.as_ptr()
-                }
-            };
-        }
-        if event_in(event_ref, ns_window) {
-            return event.as_ptr();
-        }
-        close_from_outside(ns_window, &dismiss, &dismissed);
-        std::ptr::null_mut()
-    });
-    // SAFETY: the block returns the live event or null, as AppKit requires.
-    let monitor = unsafe {
-        NSEvent::addLocalMonitorForEventsMatchingMask_handler(
-            NSEventMask::LeftMouseDown
-                | NSEventMask::RightMouseDown
-                | NSEventMask::OtherMouseDown
-                | NSEventMask::KeyDown,
-            &handler,
-        )
-    };
-    let block = RcBlock::new(move |_| {
-        if !resigned.get() {
-            close_from_outside(ns_window, &on_resign, &resigned);
-        }
-    });
-    // SAFETY: AppKit's own notification name and a block of the documented
-    // type; the observer is removed with the watch.
-    let resign = unsafe {
-        NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
-            Some(objc2_app_kit::NSApplicationDidResignActiveNotification),
-            None,
-            None,
-            &block,
-        )
-    };
-    Watch { monitor, resign }
-}
-
-/// What follows a row's label.
 enum Trail {
     Nothing,
     Check,
@@ -615,25 +533,33 @@ impl Look {
 }
 
 impl<I: Clone + 'static> Menu<I> {
-    fn finish(&mut self, choice: Option<I>, window: &mut Window) {
+    fn finish(&mut self, choice: Option<I>, window: &mut Window, cx: &mut App) {
         if std::mem::replace(&mut self.done, true) {
             return;
         }
-        let _ = self.answer.try_send(choice);
-        self.stop_watching();
-        let ns_window = self.ns_window;
-        allow_key(ns_window);
+        self.watch = None;
+        self._activation = None;
+        let handle = window.window_handle();
         OPEN.with(|slot| {
             let mut slot = slot.borrow_mut();
-            if slot
-                .as_ref()
-                .is_some_and(|open| open.ns_window == ns_window)
-            {
+            if slot.as_ref().is_some_and(|open| *open == handle) {
                 *slot = None;
             }
         });
-        hide(ns_window);
+        platform::hide(window);
         window.remove_window();
+        if let Some(answer) = self.answer.take() {
+            answer(choice, cx);
+        }
+    }
+
+    /// What the platform's watch, or a key in the window, has to say.
+    pub(crate) fn signal(&mut self, signal: Signal, window: &mut Window, cx: &mut Context<Self>) {
+        match signal {
+            Signal::Close => self.finish(None, window, cx),
+            Signal::Key(key) => self.key(key, window, cx),
+            Signal::Text(text) => self.text(&text, cx),
+        }
     }
 
     /// Shows the next level in the same popup, resizing it to fit.
@@ -707,7 +633,7 @@ impl<I: Clone + 'static> Menu<I> {
         match self.levels.last().and_then(|level| level.items.get(row)) {
             Some(MenuItem::Action(action)) if !enter_only => {
                 let id = action.id.clone();
-                self.finish(Some(id), window)
+                self.finish(Some(id), window, cx)
             }
             Some(MenuItem::Submenu { .. }) => self.show_level(row, cx),
             _ => {}
@@ -720,7 +646,7 @@ impl<I: Clone + 'static> Menu<I> {
                 if self.levels.len() > 1 {
                     self.back(cx);
                 } else {
-                    self.finish(None, window);
+                    self.finish(None, window, cx);
                 }
             }
             Key::Left => self.back(cx),
@@ -856,30 +782,6 @@ impl<I: Clone + 'static> Menu<I> {
     }
 }
 
-impl<I> Drop for Menu<I> {
-    fn drop(&mut self) {
-        self.stop_watching();
-        allow_key(self.ns_window);
-    }
-}
-
-impl<I> Menu<I> {
-    fn stop_watching(&mut self) {
-        let Some(watch) = self.watch.take() else {
-            return;
-        };
-        if let Some(monitor) = watch.monitor {
-            // SAFETY: the token AppKit returned for this monitor.
-            unsafe { NSEvent::removeMonitor(&monitor) };
-        }
-        // SAFETY: the observer the notification center returned.
-        unsafe {
-            NSNotificationCenter::defaultCenter()
-                .removeObserver(ProtocolObject::as_ref(&*watch.resign))
-        };
-    }
-}
-
 /// The lifted surface a floating panel sits on. The same recipe the
 /// in-window menu uses for its panel, lightened a little further in the
 /// dark scheme so it reads against a page.
@@ -956,8 +858,8 @@ impl<I: Clone + 'static> Render for Menu<I> {
                     };
                     self.row(index, look, columns, cx)
                         .when(action.enabled, |el| {
-                            el.on_click(cx.listener(move |this, _, window, _| {
-                                this.finish(Some(id.clone()), window)
+                            el.on_click(cx.listener(move |this, _, window, cx| {
+                                this.finish(Some(id.clone()), window, cx)
                             }))
                         })
                         .into_any_element()
@@ -1064,12 +966,27 @@ impl<I: Clone + 'static> Render for Menu<I> {
             .flex_col()
             .on_mouse_down(
                 gpui::MouseButton::Left,
-                cx.listener(|this, _, window, _| this.finish(None, window)),
+                cx.listener(|this, _, window, cx| this.finish(None, window, cx)),
             )
             .on_mouse_down(
                 gpui::MouseButton::Right,
-                cx.listener(|this, _, window, _| this.finish(None, window)),
+                cx.listener(|this, _, window, cx| this.finish(None, window, cx)),
             )
+            // Where the window has the keyboard, keys arrive here; a chord
+            // or a key the menu has no use for closes it, as a native menu
+            // would, and goes on to the host.
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                let signal = match typed_event(event) {
+                    Typed::Key(key) => Signal::Key(key),
+                    Typed::Text(text) => Signal::Text(text),
+                    Typed::Other => Signal::Close,
+                };
+                let taken = !matches!(signal, Signal::Close);
+                this.signal(signal, window, cx);
+                if taken {
+                    cx.stop_propagation();
+                }
+            }))
             .when(self.anchored_above, |el| el.justify_end())
             .font_family(ui_font())
             .text_size(px(TEXT_SIZE))
@@ -1086,32 +1003,8 @@ impl<I: Clone + 'static> Render for Menu<I> {
 }
 
 /// Opens a menu of `items` with its top-left corner at `position` in
-/// `window`, unrolling downward. Answers with the chosen action's id, or
-/// `None` when the menu was dismissed.
-pub fn open<I: Clone + 'static>(
-    cx: &mut App,
-    window: &Window,
-    position: Point<gpui::Pixels>,
-    items: Vec<MenuItem<I>>,
-    palette: Palette,
-) -> Receiver<Option<I>> {
-    open_at(cx, window, position, items, palette, false)
-}
-
-/// Opens a menu with its bottom edge at `position`, unrolling upward: for
-/// a trigger on a shelf along the bottom of the window.
-pub fn open_above<I: Clone + 'static>(
-    cx: &mut App,
-    window: &Window,
-    position: Point<gpui::Pixels>,
-    items: Vec<MenuItem<I>>,
-    palette: Palette,
-) -> Receiver<Option<I>> {
-    open_at(cx, window, position, items, palette, true)
-}
-
-/// [`open`], answering through `on_choice` in `window` instead of on a
-/// channel: the chosen action's id, or `None` when the menu was dismissed.
+/// `window`, unrolling downward, and calls `on_choice` with the chosen
+/// action's id — or `None` when the menu was dismissed — in `window`.
 pub fn open_with<I: Clone + 'static>(
     cx: &mut App,
     window: &Window,
@@ -1120,11 +1013,11 @@ pub fn open_with<I: Clone + 'static>(
     palette: Palette,
     on_choice: impl FnOnce(Option<I>, &mut Window, &mut App) + 'static,
 ) {
-    let answer = open_at(cx, window, position, items, palette, false);
-    answer_with(cx, window, answer, on_choice);
+    open_at(cx, window, position, items, palette, false, on_choice);
 }
 
-/// [`open_above`], answering through `on_choice` in `window`.
+/// Opens a menu with its bottom edge at `position`, unrolling upward: for
+/// a trigger on a shelf along the bottom of the window.
 pub fn open_above_with<I: Clone + 'static>(
     cx: &mut App,
     window: &Window,
@@ -1133,28 +1026,10 @@ pub fn open_above_with<I: Clone + 'static>(
     palette: Palette,
     on_choice: impl FnOnce(Option<I>, &mut Window, &mut App) + 'static,
 ) {
-    let answer = open_at(cx, window, position, items, palette, true);
-    answer_with(cx, window, answer, on_choice);
+    open_at(cx, window, position, items, palette, true, on_choice);
 }
 
-/// Waits for the menu's answer and hands it to `on_choice` in the window
-/// the menu was opened for, if that window is still open.
-fn answer_with<I: 'static>(
-    cx: &mut App,
-    window: &Window,
-    answer: Receiver<Option<I>>,
-    on_choice: impl FnOnce(Option<I>, &mut Window, &mut App) + 'static,
-) {
-    let handle = window.window_handle();
-    cx.spawn(async move |cx| {
-        let Ok(choice) = answer.recv().await else {
-            return;
-        };
-        let _ = handle.update(cx, move |_, window, cx| on_choice(choice, window, cx));
-    })
-    .detach();
-}
-
+#[allow(clippy::too_many_arguments)]
 fn open_at<I: Clone + 'static>(
     cx: &mut App,
     window: &Window,
@@ -1162,22 +1037,27 @@ fn open_at<I: Clone + 'static>(
     items: Vec<MenuItem<I>>,
     palette: Palette,
     anchored_above: bool,
-) -> Receiver<Option<I>> {
+    on_choice: impl FnOnce(Option<I>, &mut Window, &mut App) + 'static,
+) {
     // One menu at a time.
-    dismiss_open();
-    let (sender, receiver) = async_channel::bounded(1);
+    dismiss_open(cx);
+    // The answer is given in the window the menu was opened for, if that
+    // window is still open.
+    let host = window.window_handle();
+    let answer: Answer<I> = Box::new(move |choice, cx| {
+        let _ = host.update(cx, move |_, window, cx| on_choice(choice, window, cx));
+    });
     open_level(
         cx,
-        window.bounds().origin + position,
+        crate::popup::content_origin(window) + position,
         window
             .display(cx)
             .map(|display| (display.id(), display.bounds())),
         vec![Level { items, title: None }],
-        sender,
+        answer,
         palette,
         anchored_above,
     );
-    receiver
 }
 
 fn open_level<I: Clone + 'static>(
@@ -1185,7 +1065,7 @@ fn open_level<I: Clone + 'static>(
     pointer: Point<gpui::Pixels>,
     display: Option<(DisplayId, Bounds<gpui::Pixels>)>,
     levels: Vec<Level<I>>,
-    answer: Sender<Option<I>>,
+    answer: Answer<I>,
     palette: Palette,
     anchored_above: bool,
 ) {
@@ -1215,12 +1095,14 @@ fn open_level<I: Clone + 'static>(
             origin,
             size(px(popup_width), px(popup_height)),
         ))),
-        // Above everything, and it doesn't take the keyboard or make the
-        // window it's for look inactive.
+        // Above everything. It takes the keyboard so the arrows reach it,
+        // unless the platform's watch delivers them without.
         kind: WindowKind::PopUp,
-        focus: false,
+        focus: !platform::KEYLESS,
         // Clear around the panel's rounded corners and while it unrolls.
         window_background: WindowBackgroundAppearance::Transparent,
+        // Shown by `platform::shown` after a first hidden draw, which warms
+        // the text and icons and settles the transparent gutter.
         show: false,
         titlebar: None,
         is_resizable: false,
@@ -1228,149 +1110,67 @@ fn open_level<I: Clone + 'static>(
         ..Default::default()
     };
     let result = cx.open_window(options, move |window, cx| {
-        let (ns_window, _) = ns_window_of(window);
-        let (dismiss, signals) = async_channel::unbounded();
-        let dismissed = Rc::new(Cell::new(false));
-        let watch = watch(ns_window, dismiss.clone(), dismissed.clone());
-        OPEN.with(|slot| {
-            *slot.borrow_mut() = Some(OpenMenu {
-                ns_window,
-                dismiss,
-                dismissed,
-            })
+        let controls = ControlState::default();
+        controls.snap("menu-width", width);
+        controls.snap("menu-height", height);
+        // Where the window has the keyboard, its root answers the keys.
+        if !platform::KEYLESS {
+            controls.focus_root(window, cx);
+        }
+        let menu = cx.new(|_| Menu {
+            controls,
+            palette,
+            levels,
+            reachable: initial_reachable,
+            answer: Some(answer),
+            watch: None,
+            _activation: None,
+            was_active: false,
+            done: false,
+            animations_ready: false,
+            sweep: if anchored_above {
+                Sweep::Up
+            } else {
+                Sweep::Down
+            },
+            anchored_above,
+            animation_epoch: 0,
+            width,
+            height,
+            hovered: None,
+            scroll: ScrollHandle::new(),
+            typed: String::new(),
+            typed_at: None,
         });
-        let menu = cx.new(|_| {
-            let controls = ControlState::default();
-            controls.snap("menu-width", width);
-            controls.snap("menu-height", height);
-            Menu {
-                controls,
-                palette,
-                levels,
-                reachable: initial_reachable,
-                answer,
-                ns_window,
-                watch: Some(watch),
-                done: false,
-                animations_ready: false,
-                sweep: if anchored_above {
-                    Sweep::Up
-                } else {
-                    Sweep::Down
-                },
-                anchored_above,
-                animation_epoch: 0,
-                width,
-                height,
-                hovered: None,
-                scroll: ScrollHandle::new(),
-                typed: String::new(),
-                typed_at: None,
-                _dismiss: None,
-            }
-        });
+        // Going inactive after having been active is the reader clicking
+        // elsewhere, or switching away: the menu closes, as a native one
+        // would. A window that never takes the keyboard never activates,
+        // and its platform watch closes it instead.
         menu.update(cx, |menu, cx| {
-            menu._dismiss = Some(cx.spawn_in(window, async move |this, cx| {
-                while let Ok(signal) = signals.recv().await {
-                    let closing = matches!(signal, Signal::Close);
-                    let _ = this.update_in(cx, |menu, window, cx| match signal {
-                        Signal::Close => menu.finish(None, window),
-                        Signal::Key(key) => menu.key(key, window, cx),
-                        Signal::Text(text) => menu.text(&text, cx),
-                    });
-                    if closing {
-                        break;
-                    }
+            menu._activation = Some(cx.observe_window_activation(window, |this, window, cx| {
+                let active = window.is_window_active();
+                if this.was_active && !active {
+                    this.finish(None, window, cx);
                 }
+                this.was_active |= active;
             }));
         });
         menu
     });
-    if let Ok(handle) = result {
-        let _ = handle.update(cx, |menu, _, cx| {
-            menu.animations_ready = true;
-            cx.notify();
-        });
-        // End the Menu borrow before drawing it. Its required hidden draw
-        // has warmed text and icons; replace that scene with the animation's
-        // first frame before AppKit makes the popup visible.
-        let _ = cx.update_window(handle.into(), |_, window, cx| {
-            let (ns_window, _) = ns_window_of(window);
-            if ns_window == 0 {
-                return;
-            }
-            // SAFETY: the native window belongs to this live GPUI window.
-            let ns_window = unsafe { &*(ns_window as *const NSWindow) };
-            // The popup reserves transparent space for wider/taller
-            // submenus and the edge gutter. A native shadow would outline it.
-            ns_window.setHasShadow(false);
-            never_key(ns_window);
-            window.draw(cx).clear(cx);
-            ns_window.orderFront(None);
-        });
-    }
-}
-
-/// Keeps `window` from becoming the key window while it's a menu.
-///
-/// GPUI's panels answer `canBecomeKeyWindow` with YES, so any click that
-/// leaves the menu open — into a submenu, or back out of one — would take
-/// the keyboard from the host's window. `becomesKeyOnlyIfNeeded` isn't
-/// enough: AppKit still makes the panel key on a later click. So the
-/// panel class's answer is replaced with one that says NO for the windows
-/// in [`KEYLESS`], and what it said before for any other.
-fn never_key(window: &NSWindow) {
-    use objc2::runtime::{AnyObject, Bool, Sel};
-
-    type CanBecomeKey = unsafe extern "C-unwind" fn(&AnyObject, Sel) -> Bool;
-
-    unsafe extern "C-unwind" fn can_become_key(this: &AnyObject, sel: Sel) -> Bool {
-        let this_ptr = this as *const AnyObject as usize;
-        if KEYLESS.with(|set| set.borrow().contains(&this_ptr)) {
-            return Bool::NO;
-        }
-        let Some(original) = ORIGINAL_CAN_BECOME_KEY.with(Cell::get) else {
-            return Bool::YES;
-        };
-        // SAFETY: the implementation this one replaced, of the same shape.
-        let original: CanBecomeKey = unsafe { std::mem::transmute(original) };
-        unsafe { original(this, sel) }
-    }
-
-    KEYLESS.with(|set| set.borrow_mut().insert(window as *const NSWindow as usize));
-    if ORIGINAL_CAN_BECOME_KEY.with(Cell::get).is_some() {
-        return;
-    }
-    let Some(method) = window
-        .class()
-        .instance_method(objc2::sel!(canBecomeKeyWindow))
-    else {
+    let Ok(handle) = result else {
         return;
     };
-    let replacement: CanBecomeKey = can_become_key;
-    // SAFETY: `canBecomeKeyWindow` takes nothing and returns a BOOL, as
-    // the replacement does; the original is kept to answer for other
-    // windows of the class.
-    let original = unsafe {
-        method.set_implementation(std::mem::transmute::<CanBecomeKey, objc2::runtime::Imp>(
-            replacement,
-        ))
-    };
-    ORIGINAL_CAN_BECOME_KEY.with(|slot| slot.set(Some(original)));
-}
-
-/// Lets `ns_window` become key again, once it's no longer a menu.
-fn allow_key(ns_window: usize) {
-    KEYLESS.with(|set| set.borrow_mut().remove(&ns_window));
-}
-
-thread_local! {
-    /// The menu windows open: those answer `canBecomeKeyWindow` with NO.
-    static KEYLESS: RefCell<std::collections::HashSet<usize>> =
-        RefCell::new(std::collections::HashSet::new());
-    /// What GPUI's panel class answered `canBecomeKeyWindow` with, before
-    /// [`never_key`] replaced it.
-    static ORIGINAL_CAN_BECOME_KEY: Cell<Option<objc2::runtime::Imp>> = const { Cell::new(None) };
+    OPEN.with(|slot| *slot.borrow_mut() = Some(handle.into()));
+    let watch = cx.update_window(handle.into(), |_, window, cx| {
+        platform::watch(window, handle, cx)
+    });
+    let _ = handle.update(cx, |menu, _, cx| {
+        menu.watch = watch.ok().flatten();
+        menu.animations_ready = true;
+        cx.notify();
+    });
+    // End the Menu borrow before showing the window, which draws it.
+    let _ = cx.update_window(handle.into(), |_, window, cx| platform::shown(window, cx));
 }
 
 // ---- Glyphs -----------------------------------------------------------------
@@ -1384,12 +1184,7 @@ fn polyline(points: &'static [(f32, f32)], size: f32, color: Rgba) -> AnyElement
         move |bounds, _, window, _| {
             let scale = f32::from(bounds.size.width) / 16.0;
             let origin = bounds.origin;
-            let mut builder =
-                gpui::PathBuilder::stroke(px(1.5 * scale)).with_style(gpui::PathStyle::Stroke(
-                    gpui::StrokeOptions::default()
-                        .with_line_cap(lyon_tessellation::LineCap::Round)
-                        .with_line_join(lyon_tessellation::LineJoin::Round),
-                ));
+            let mut builder = gpui::PathBuilder::stroke(px(1.5 * scale));
             for (n, &(x, y)) in points.iter().enumerate() {
                 let at = point(origin.x + px(x * scale), origin.y + px(y * scale));
                 if n == 0 {
@@ -1588,20 +1383,17 @@ mod tests {
     }
 
     #[test]
-    fn keys_are_sorted_by_code_and_shortcuts_are_let_through() {
-        assert_eq!(typed(125, None, false, false), Typed::Key(Key::Down));
+    fn keys_are_sorted_and_shortcuts_are_let_through() {
+        assert_eq!(typed(Some(Key::Down), None, false), Typed::Key(Key::Down));
         assert_eq!(
-            typed(36, Some("\r"), false, false),
+            typed(Some(Key::Activate), Some("\r"), false),
             Typed::Key(Key::Activate)
         );
-        assert_eq!(
-            typed(53, Some("\u{1b}"), false, false),
-            Typed::Key(Key::Dismiss)
-        );
-        assert_eq!(typed(0, Some("a"), false, false), Typed::Text("a".into()));
-        assert_eq!(typed(0, Some("a"), true, false), Typed::Other);
-        assert_eq!(typed(48, Some("\t"), false, false), Typed::Other);
-        assert_eq!(typed(125, None, true, false), Typed::Other);
+        assert_eq!(typed(None, Some("a"), false), Typed::Text("a".into()));
+        assert_eq!(typed(None, Some("a"), true), Typed::Other);
+        assert_eq!(typed(None, Some("\t"), false), Typed::Other);
+        assert_eq!(typed(Some(Key::Down), None, true), Typed::Other);
+        assert_eq!(typed(None, None, false), Typed::Other);
     }
 
     #[test]

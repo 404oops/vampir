@@ -1,20 +1,21 @@
 //! What a host that embeds a live native view needs from AppKit.
 //!
-//! A native view — a web view, a video player — is composited over the
-//! GPUI window, so anything the toolkit draws inside that window is hidden
-//! wherever the view is. The pieces here get round that: a
-//! [`floating_menu`] in a transparent pop-up window of its own, and the
-//! handles the rest of the toolkit uses to find the AppKit window behind a
-//! GPUI one and tell its events from another window's.
+//! The toolkit's pop-up windows — [`crate::floating_menu`], [`crate::hint`],
+//! [`crate::dialog_window`] — are GPUI windows and work everywhere. What is
+//! here is the thin layer only AppKit can provide: adopting an `NSMenu` a
+//! native view proposes ([`NativeMenu`](ns_menu::NativeMenu)), the handles
+//! that find the AppKit window behind a GPUI one and tell its events from
+//! another window's, and the event monitor that lets the floating menu
+//! leave the keyboard with the host's window.
 //!
-//! macOS only, behind the `native` feature.
+//! macOS only, behind the `native` feature; the rest of the crate does not
+//! change without it.
 
 use gpui::Window;
 use objc2::rc::Retained;
 use objc2_app_kit::{NSEvent, NSView, NSWindow};
 
-pub mod floating_menu;
-pub mod hint;
+pub(crate) mod menu_watch;
 pub mod ns_menu;
 
 /// The AppKit window behind a GPUI window, and GPUI's own view in it, as

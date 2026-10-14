@@ -225,8 +225,6 @@ struct Gallery {
     selection: ListSelection,
     last_action: SharedString,
     /// What the floating menu's checked row toggles.
-    /// Toggled from the floating menu, which only the native build opens.
-    #[cfg_attr(not(all(target_os = "macos", feature = "native")), allow(dead_code))]
     pinned: bool,
 
     // Colour page.
@@ -1476,6 +1474,7 @@ impl Gallery {
         column()
             .children(self.floating_menu_card(palette, cx))
             .child(self.hint_card(palette, cx))
+            .child(self.dialog_window_card(palette, cx))
             .child(card(
                 palette,
                 "Tabs — scroll sideways, close repeatedly, drag to reorder",
@@ -1801,10 +1800,8 @@ impl Gallery {
     }
 
     /// A menu in a pop-up window of its own, for a host whose window has a
-    /// native view over it. macOS only: it rides on the `native` feature.
-    /// The rows are the same `MenuItem`s the in-window menu takes, here
-    /// with the host's own command type as their ids.
-    #[cfg(all(target_os = "macos", feature = "native"))]
+    /// native view over it. The rows are the same `MenuItem`s the in-window
+    /// menu takes, here with the host's own command type as their ids.
     fn floating_menu_card(&mut self, palette: Palette, cx: &mut Context<Self>) -> Option<Div> {
         use vampir::floating_menu;
 
@@ -1903,21 +1900,32 @@ impl Gallery {
                     cx,
                     open(true),
                 )))
-                .child(div().w(px(180.0)).child(button(
-                    "native-menu",
-                    "Adopt an AppKit menu",
-                    ButtonVariant::Soft,
-                    true,
-                    palette,
-                    cx,
-                    Self::open_native_menu,
-                )))
+                .children(self.native_menu_button(palette, cx))
                 .child(
                     div().text_color(palette.text_secondary).child(
                         "Arrows walk it, Enter runs a row, letters find one, Escape closes.",
                     ),
                 ),
         ))
+    }
+
+    /// The button that adopts an AppKit menu: only where there is AppKit.
+    #[cfg(all(target_os = "macos", feature = "native"))]
+    fn native_menu_button(&mut self, palette: Palette, cx: &mut Context<Self>) -> Option<Div> {
+        Some(div().w(px(180.0)).child(button(
+            "native-menu",
+            "Adopt an AppKit menu",
+            ButtonVariant::Soft,
+            true,
+            palette,
+            cx,
+            Self::open_native_menu,
+        )))
+    }
+
+    #[cfg(not(all(target_os = "macos", feature = "native")))]
+    fn native_menu_button(&mut self, _palette: Palette, _cx: &mut Context<Self>) -> Option<Div> {
+        None
     }
 
     /// An `NSMenu` a native view might propose, adopted as the toolkit's
@@ -2010,14 +2018,9 @@ impl Gallery {
         );
     }
 
-    #[cfg(not(all(target_os = "macos", feature = "native")))]
-    fn floating_menu_card(&mut self, _palette: Palette, _cx: &mut Context<Self>) -> Option<Div> {
-        None
-    }
-
     /// Hints that survive a native view over the window: the same `hinted`
-    /// call draws a tooltip, or with native hints on, a panel beside the
-    /// element. The toast is a passing message in a panel of its own.
+    /// call draws a tooltip, or with floating hints on, a window beside the
+    /// element. The toast is a passing message in a window of its own.
     fn hint_card(&mut self, palette: Palette, cx: &mut Context<Self>) -> Div {
         let tile = |id: &'static str,
                     character: &'static str,
@@ -2044,20 +2047,20 @@ impl Gallery {
                 WidgetContext::new(palette, this, cx),
             )
         };
-        let native = self.controls.native_hints();
+        let native = self.controls.floating_hints();
         card(
             palette,
-            "Hints — a tooltip, or a panel of its own beside a native view",
+            "Hints — a tooltip, or a window of its own beside a native view",
             row()
                 .gap(px(16.0))
                 .child(switch(
-                    "native-hints",
+                    "floating-hints",
                     native,
-                    Some("Native hints"),
+                    Some("Floating hints"),
                     true,
                     WidgetContext::new(palette, self, cx),
                     |this, on, _window, cx| {
-                        this.controls.set_native_hints(on);
+                        this.controls.set_floating_hints(on);
                         cx.notify();
                     },
                 ))
@@ -2089,7 +2092,94 @@ impl Gallery {
         )
     }
 
-    #[cfg(all(target_os = "macos", feature = "native"))]
+    /// Prompt, confirm and alert in a window of their own, for a host whose
+    /// window has a native view over it. The answer comes back through a
+    /// callback with the `App`, from which the host reaches itself.
+    fn dialog_window_card(&mut self, palette: Palette, cx: &mut Context<Self>) -> Div {
+        let host = cx.entity().downgrade();
+        let note = move |text: String, cx: &mut App| {
+            if let Some(host) = host.upgrade() {
+                host.update(cx, |this, cx| this.note(text, cx));
+            }
+        };
+        let (prompt_note, confirm_note) = (note.clone(), note);
+        card(
+            palette,
+            "Dialog windows — a prompt, a confirmation or an alert above a native view",
+            row()
+                .child(div().w(px(160.0)).child(button(
+                    "dialog-window-prompt",
+                    "Ask for a name",
+                    ButtonVariant::Soft,
+                    true,
+                    palette,
+                    cx,
+                    move |_this, _window, cx| {
+                        let note = prompt_note.clone();
+                        vampir::dialog_window::prompt(
+                            cx,
+                            palette,
+                            "New Folder",
+                            "A folder on the desktop, which you can rename later.",
+                            "Untitled Folder",
+                            "Create",
+                            move |answer, cx| {
+                                note(
+                                    match answer {
+                                        Some(name) => format!("Folder named {name:?}"),
+                                        None => "Prompt cancelled".to_string(),
+                                    },
+                                    cx,
+                                )
+                            },
+                        );
+                    },
+                )))
+                .child(div().w(px(160.0)).child(button(
+                    "dialog-window-confirm",
+                    "Confirm something",
+                    ButtonVariant::Soft,
+                    true,
+                    palette,
+                    cx,
+                    move |_this, _window, cx| {
+                        let note = confirm_note.clone();
+                        vampir::dialog_window::confirm(
+                            cx,
+                            palette,
+                            "Clear browsing history?",
+                            "Every page you have visited is forgotten. Bookmarks and downloads stay.",
+                            "Clear History",
+                            move |accepted, cx| {
+                                note(
+                                    if accepted { "History cleared" } else { "Kept the history" }
+                                        .to_string(),
+                                    cx,
+                                )
+                            },
+                        );
+                    },
+                )))
+                .child(div().w(px(160.0)).child(button(
+                    "dialog-window-alert",
+                    "Show an alert",
+                    ButtonVariant::Soft,
+                    true,
+                    palette,
+                    cx,
+                    move |this, _window, cx| {
+                        this.note("Alert shown", cx);
+                        vampir::dialog_window::alert(
+                            cx,
+                            palette,
+                            "Couldn't create the download folder",
+                            "The disk is full, or the folder is somewhere you cannot write.",
+                        );
+                    },
+                ))),
+        )
+    }
+
     fn toast_button(&mut self, palette: Palette, cx: &mut Context<Self>) -> Option<Div> {
         let weak = cx.entity().downgrade();
         Some(
@@ -2120,7 +2210,7 @@ impl Gallery {
                     cx,
                     |this, window, cx| {
                         if let Some(anchor) = this.controls.measured("toast-anchor") {
-                            vampir::native_hint::toast(
+                            vampir::hint::toast(
                                 this,
                                 "Copied to the clipboard",
                                 anchor,
@@ -2131,11 +2221,6 @@ impl Gallery {
                     },
                 )),
         )
-    }
-
-    #[cfg(not(all(target_os = "macos", feature = "native")))]
-    fn toast_button(&mut self, _palette: Palette, _cx: &mut Context<Self>) -> Option<Div> {
-        None
     }
 
     fn render_dialog(
