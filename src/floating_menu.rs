@@ -507,6 +507,19 @@ impl<I: 'static> ControlHost for Menu<I> {
     }
 }
 
+/// Closes the menu showing, unless `window` is its own: the reader
+/// pressed somewhere else in the app.
+pub(crate) fn dismiss_open_elsewhere(window: &Window, cx: &mut App) {
+    let here = window.window_handle();
+    if OPEN.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|open| open.window != here)
+    }) {
+        dismiss_open(cx);
+    }
+}
+
 /// Closes the menu showing, if there is one. It answers `None`, as a
 /// menu dismissed any other way does.
 pub fn dismiss_open(cx: &mut App) {

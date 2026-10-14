@@ -2107,8 +2107,16 @@ pub fn mouse_moved<V: ControlHost>(
 /// from the root. Put it on every `.occlude()`d surface too, because an
 /// occluding panel swallows the move stream a drag underneath it depends
 /// on. [`crate::root`] is this and [`crate::handle_keys`] together.
+///
+/// It also closes a floating menu on a press anywhere else in the app.
+/// The menu otherwise learns of such a press by losing the keyboard, and
+/// an X11 window manager that still counts the host window as focused
+/// hands nothing back when it is clicked.
 pub fn handle_mouse<E: InteractiveElement, V: ControlHost>(root: E, cx: &mut Context<V>) -> E {
-    root.on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+    root.capture_any_mouse_down(|_, window, cx| {
+        crate::floating_menu::dismiss_open_elsewhere(window, cx)
+    })
+    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
         if mouse_moved(this, event, cx) {
             cx.notify();
         }
