@@ -2052,6 +2052,8 @@ impl Gallery {
                     .bg(lit(palette.control_fill, 0.05))
                     .border_1()
                     .border_color(palette.field_border)
+                    // On the control fill, so the label made for it.
+                    .text_color(palette.control_label)
                     .cursor_pointer()
                     .hover(move |style| style.bg(lit(palette.control_fill, 0.09)))
                     .child(glyph(character)),
@@ -2121,11 +2123,13 @@ impl Gallery {
             .h(px(140.0))
             .rounded(px(8.0))
             .overflow_hidden()
-            .bg(lit(palette.accent, 0.1))
+            // A filled control's colours: a fill with a label made for it,
+            // in either scheme.
+            .bg(lit(palette.control_fill, 0.08))
             .flex()
             .items_center()
             .justify_center()
-            .text_color(palette.text_primary)
+            .text_color(palette.control_label)
             .child(if covered { "" } else { "A live native view" })
             .children(self.cover.backdrop())
             .when(covered, |el| {

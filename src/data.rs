@@ -194,7 +194,6 @@ pub fn tree_row<V: ControlHost>(
     // should land when Tab reaches the tree.
     let focus = state.focus(id, cx);
     let click_focus = focus.clone();
-    let chevron: gpui::Hsla = crate::color::to_hsla(palette.text_secondary);
     let row_id = row.id.clone();
     let toggle_id = row.id.clone();
     let key_id = row.id.clone();
@@ -207,6 +206,11 @@ pub fn tree_row<V: ControlHost>(
     // flips, and rows a branch reveals fade in beneath it — unless the whole
     // tree has just appeared, in which case it arrives as one thing.
     let on = state.blend(key("selected"), selected, SWITCH_SLIDE);
+    // The quiet parts of a row — its chevron and its detail — go over to
+    // the fill's label with the rest of it, or they would sit grey on the
+    // selection.
+    let quiet = crate::color::lerp(palette.text_secondary, palette.control_label, on);
+    let chevron: gpui::Hsla = crate::color::to_hsla(quiet);
     let turned = expanded.map(|open| state.blend(key("open"), open, SWITCH_SLIDE));
     let shown = if state.present(id) {
         state.tween_from(key("shown"), 0.0, 1.0, SWITCH_SLIDE)
@@ -406,7 +410,7 @@ pub fn tree_row<V: ControlHost>(
             div()
                 .flex_none()
                 .text_size(px(11.5))
-                .text_color(palette.text_secondary)
+                .text_color(quiet)
                 .child(detail)
         }))
 }
