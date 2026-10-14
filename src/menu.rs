@@ -14,21 +14,15 @@
 //! .children(vampir::context_menu("row", &items, palette, self, cx,
 //!     |host, item, _window, cx| host.run_menu_item(item, cx)))
 //! ```
-//!
-//! The same [`MenuItem`] tree feeds the floating menu
-//! ([`crate::floating_menu`]) a host with a native view over its window
-//! opens instead, so one menu can be built once and shown either way.
 
 use std::collections::hash_map::DefaultHasher;
-use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::time::Instant;
 
 use gpui::{
-    Anchor, AnyElement, App, ClickEvent, ElementId, FontWeight, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, Rgba, SharedString, Window, anchored, canvas, deferred, div,
-    point, prelude::*, px,
+    Anchor, App, ClickEvent, ElementId, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, SharedString, Window, anchored, canvas, deferred, div, point, prelude::*, px,
 };
 
 use crate::controls::WidgetContext;
@@ -49,54 +43,19 @@ const MENU_PADDING: f32 = 5.0;
 const MENU_RADIUS: f32 = 7.0;
 const MENU_MIN_WIDTH: f32 = 168.0;
 const MENU_MAX_HEIGHT: f32 = 520.0;
-/// The column a row's icon sits in, kept for every row of a level that has
-/// one, so labels line up whether or not each row has an icon.
-const ICON_SLOT: f32 = 16.0;
-const ICON_SIZE: f32 = 14.0;
 /// Kept clear of the window edges, so a menu summoned in a corner still
 /// reads as floating above the content rather than welded to the frame.
 pub(crate) const VIEWPORT_MARGIN: f32 = 8.0;
 
-/// An icon drawn ahead of a row's label: whatever the host draws at a size
-/// in a colour. The menu never looks inside it.
-///
-/// A host with an icon enum of its own converts it once —
-/// `impl From<Icon> for MenuIcon` — and [`MenuItem::icon`] takes it from
-/// there.
-#[derive(Clone)]
-pub struct MenuIcon(Rc<dyn Fn(f32, Rgba) -> AnyElement>);
-
-impl MenuIcon {
-    pub fn new(draw: impl Fn(f32, Rgba) -> AnyElement + 'static) -> Self {
-        Self(Rc::new(draw))
-    }
-
-    /// The icon, `size` points square, in `color`.
-    pub fn draw(&self, size: f32, color: Rgba) -> AnyElement {
-        (self.0)(size, color)
-    }
-}
-
-impl fmt::Debug for MenuIcon {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("MenuIcon")
-    }
-}
-
-/// One row of a menu.
-///
-/// `I` is what an action answers with when it is chosen: a `&'static str`
-/// by default, or the host's own command type, so no table has to map a
-/// row back to what it does.
+/// One row of a context menu.
 #[derive(Clone, Debug)]
-pub enum MenuItem<I = ComboId> {
-    Action(MenuAction<I>),
+pub enum MenuItem {
+    Action(MenuAction),
     /// A branch whose rows replace this level in the same floating panel.
     Submenu {
         label: SharedString,
-        items: Vec<MenuItem<I>>,
+        items: Vec<MenuItem>,
         enabled: bool,
-        icon: Option<MenuIcon>,
     },
     /// A hairline between groups.
     Separator,
@@ -106,9 +65,10 @@ pub enum MenuItem<I = ComboId> {
 
 /// A menu row that does something when clicked.
 #[derive(Clone, Debug)]
-pub struct MenuAction<I = ComboId> {
-    /// Comes back to the activation callback.
-    pub id: I,
+pub struct MenuAction {
+    /// Comes back to the activation callback. Also the element id, so no two
+    /// actions in one menu may share it.
+    pub id: ComboId,
     pub label: SharedString,
     /// Right-aligned accelerator text, if the action has one.
     pub shortcut: Option<SharedString>,
@@ -117,13 +77,11 @@ pub struct MenuAction<I = ComboId> {
     pub checked: bool,
     /// Destructive: tinted, and always last in its group.
     pub danger: bool,
-    /// Drawn ahead of the label, so a row can be found by its shape.
-    pub icon: Option<MenuIcon>,
 }
 
-impl<I> MenuItem<I> {
+impl MenuItem {
     /// An enabled, unchecked, ordinary action.
-    pub fn action(id: I, label: impl Into<SharedString>) -> Self {
+    pub fn action(id: ComboId, label: impl Into<SharedString>) -> Self {
         MenuItem::Action(MenuAction {
             id,
             label: label.into(),
@@ -131,7 +89,6 @@ impl<I> MenuItem<I> {
             enabled: true,
             checked: false,
             danger: false,
-            icon: None,
         })
     }
 
@@ -141,12 +98,11 @@ impl<I> MenuItem<I> {
 
     /// A nested level. Its leaf actions use the same activation callback as
     /// actions in the root menu.
-    pub fn submenu(label: impl Into<SharedString>, items: Vec<MenuItem<I>>) -> Self {
+    pub fn submenu(label: impl Into<SharedString>, items: Vec<MenuItem>) -> Self {
         MenuItem::Submenu {
             label: label.into(),
             items,
             enabled: true,
-            icon: None,
         }
     }
 
@@ -166,22 +122,12 @@ impl<I> MenuItem<I> {
     /// Greys the row out and stops it taking clicks. Prefer this to dropping
     /// the item: a menu whose rows move between openings is hard to use.
     pub fn disabled(mut self) -> Self {
-        self.set_enabled(false);
-        self
-    }
-
-    /// Enabled or greyed out, from a value.
-    pub fn enabled(mut self, enabled: bool) -> Self {
-        self.set_enabled(enabled);
-        self
-    }
-
-    fn set_enabled(&mut self, value: bool) {
-        match self {
-            MenuItem::Action(action) => action.enabled = value,
-            MenuItem::Submenu { enabled, .. } => *enabled = value,
+        match &mut self {
+            MenuItem::Action(action) => action.enabled = false,
+            MenuItem::Submenu { enabled, .. } => *enabled = false,
             _ => {}
         }
+        self
     }
 
     pub fn checked(mut self, checked: bool) -> Self {
@@ -197,78 +143,16 @@ impl<I> MenuItem<I> {
         }
         self
     }
-
-    /// The same row with `icon` ahead of its label.
-    pub fn icon(mut self, icon: impl Into<MenuIcon>) -> Self {
-        match &mut self {
-            MenuItem::Action(action) => action.icon = Some(icon.into()),
-            MenuItem::Submenu { icon: slot, .. } => *slot = Some(icon.into()),
-            _ => {}
-        }
-        self
-    }
-
-    /// The row's icon, if it has one.
-    pub fn icon_of(&self) -> Option<&MenuIcon> {
-        match self {
-            MenuItem::Action(action) => action.icon.as_ref(),
-            MenuItem::Submenu { icon, .. } => icon.as_ref(),
-            _ => None,
-        }
-    }
-
-    /// The row's text, for an action, a submenu or a header.
-    pub fn label(&self) -> Option<&str> {
-        match self {
-            MenuItem::Action(action) => Some(&action.label),
-            MenuItem::Submenu { label, .. } | MenuItem::Header(label) => Some(label),
-            MenuItem::Separator => None,
-        }
-    }
-
-    /// Whether the keyboard can land on it.
-    pub fn reachable(&self) -> bool {
-        match self {
-            MenuItem::Action(action) => action.enabled,
-            MenuItem::Submenu { enabled, .. } => *enabled,
-            _ => false,
-        }
-    }
-
-    /// Whether any row of `items` has an icon, so every label of the level
-    /// lines up after the icon column.
-    pub fn any_icon(items: &[MenuItem<I>]) -> bool {
-        items.iter().any(|item| item.icon_of().is_some())
-    }
-
-    /// The first action in the tree that `matches`, at any depth, to edit
-    /// in place.
-    pub fn action_mut(
-        items: &mut [MenuItem<I>],
-        matches: impl Fn(&MenuAction<I>) -> bool + Copy,
-    ) -> Option<&mut MenuAction<I>> {
-        for item in items {
-            match item {
-                MenuItem::Action(action) if matches(action) => return Some(action),
-                MenuItem::Submenu { items, .. } => {
-                    if let Some(found) = MenuItem::action_mut(items, matches) {
-                        return Some(found);
-                    }
-                }
-                _ => {}
-            }
-        }
-        None
-    }
 }
 
-/// Identity is the branch's label and the shape of its own rows: the labels
-/// of its actions, branches and headers. Checked state and disabled rows
-/// can change while the menu is open without turning it into a different
-/// branch. Nothing deeper is hashed: each level below is checked by its own
-/// entry in the path, and folding it in here would throw the reader out of
-/// a level that has not changed because of an edit in a sibling's subtree.
-fn submenu_identity<I>(label: &SharedString, children: &[MenuItem<I>]) -> u64 {
+/// Identity is the branch's label and the shape of its own rows: the ids of
+/// its actions and the labels of its branches. Checked state, disabled rows
+/// and displayed action text can change while the menu is open without
+/// turning it into a different branch. Nothing deeper is hashed: each level
+/// below is checked by its own entry in the path, and folding it in here
+/// would throw the reader out of a level that has not changed because of
+/// an edit in a sibling's subtree.
+fn submenu_identity(label: &SharedString, children: &[MenuItem]) -> u64 {
     let mut hasher = DefaultHasher::new();
     label.hash(&mut hasher);
     children.len().hash(&mut hasher);
@@ -276,17 +160,14 @@ fn submenu_identity<I>(label: &SharedString, children: &[MenuItem<I>]) -> u64 {
         match item {
             MenuItem::Action(action) => {
                 0_u8.hash(&mut hasher);
-                action.label.hash(&mut hasher);
+                action.id.hash(&mut hasher);
             }
             MenuItem::Submenu { label, .. } => {
                 1_u8.hash(&mut hasher);
                 label.hash(&mut hasher);
             }
             MenuItem::Separator => 2_u8.hash(&mut hasher),
-            MenuItem::Header(label) => {
-                3_u8.hash(&mut hasher);
-                label.hash(&mut hasher);
-            }
+            MenuItem::Header(_) => 3_u8.hash(&mut hasher),
         }
     }
     hasher.finish()
@@ -295,17 +176,16 @@ fn submenu_identity<I>(label: &SharedString, children: &[MenuItem<I>]) -> u64 {
 /// The host supplies the whole tree each frame. A branch that vanished,
 /// moved, changed identity or became disabled is no longer a valid place to
 /// leave the keyboard.
-fn visible_level<'a, I>(
-    mut items: &'a [MenuItem<I>],
+fn visible_level<'a>(
+    mut items: &'a [MenuItem],
     levels: &[MenuBranch],
-) -> Option<(&'a [MenuItem<I>], Option<&'a SharedString>)> {
+) -> Option<(&'a [MenuItem], Option<&'a SharedString>)> {
     let mut title = None;
     for branch in levels {
         let MenuItem::Submenu {
             label,
             items: children,
             enabled: true,
-            ..
         } = items.get(branch.index)?
         else {
             return None;
@@ -326,8 +206,8 @@ fn visible_level<'a, I>(
 /// the keyboard is put back on it only if a branch still stands at the same
 /// place. Anywhere else the restored row could be an action the reader
 /// never chose, one Enter away from running.
-fn settle_levels<I>(
-    items: &[MenuItem<I>],
+fn settle_levels(
+    items: &[MenuItem],
     levels: &mut Vec<MenuBranch>,
     highlight: &mut Option<usize>,
 ) -> Option<MenuBranch> {
@@ -349,22 +229,23 @@ fn settle_levels<I>(
 enum MenuCommand {
     /// Up a level. At the root, Escape closes the menu and Left does
     /// nothing: Left means "back", and there is no back from the top.
-    Back { close_at_root: bool },
+    Back {
+        close_at_root: bool,
+    },
     Enter {
         row: usize,
         at: usize,
         identity: u64,
     },
-    /// Run the action at this row of the level.
-    Run(usize),
+    Run(ComboId),
     /// Light this reachable row.
     Highlight(usize),
 }
 
-fn menu_command<I>(
+fn menu_command(
     key: Key,
     at: Option<usize>,
-    items: &[MenuItem<I>],
+    items: &[MenuItem],
     reachable: &[usize],
 ) -> Option<MenuCommand> {
     let at = at.filter(|at| *at < reachable.len());
@@ -379,12 +260,13 @@ fn menu_command<I>(
             let at = at?;
             let row = *reachable.get(at)?;
             match items.get(row)? {
-                MenuItem::Action(_) if key == Key::Activate => Some(MenuCommand::Run(row)),
+                MenuItem::Action(action) if key == Key::Activate => {
+                    Some(MenuCommand::Run(action.id))
+                }
                 MenuItem::Submenu {
                     label,
                     items,
                     enabled: true,
-                    ..
                 } => Some(MenuCommand::Enter {
                     row,
                     at,
@@ -413,15 +295,19 @@ fn step_highlight(key: Key, at: Option<usize>, len: usize) -> Option<usize> {
     }
 }
 
-fn reachable_indices<I>(items: &[MenuItem<I>]) -> Vec<usize> {
+fn reachable_indices(items: &[MenuItem]) -> Vec<usize> {
     items
         .iter()
         .enumerate()
-        .filter_map(|(index, item)| item.reachable().then_some(index))
+        .filter_map(|(index, item)| match item {
+            MenuItem::Action(action) if action.enabled => Some(index),
+            MenuItem::Submenu { enabled: true, .. } => Some(index),
+            _ => None,
+        })
         .collect()
 }
 
-fn menu_height<I>(items: &[MenuItem<I>], nested: bool) -> f32 {
+fn menu_height(items: &[MenuItem], nested: bool) -> f32 {
     let rows: f32 = items
         .iter()
         .map(|item| match item {
@@ -462,13 +348,13 @@ fn fit_to_window(height: f32, window: Option<f32>) -> f32 {
 /// moment that answer is any use. A callback that opens a menu of its own
 /// keeps it; only the opening that was clicked is closed.
 #[allow(clippy::too_many_arguments)]
-pub fn context_menu<V: ControlHost, I: Clone + 'static>(
+pub fn context_menu<V: ControlHost>(
     id: ComboId,
-    items: &[MenuItem<I>],
+    items: &[MenuItem],
     palette: Palette,
     view: &mut V,
     cx: &mut Context<V>,
-    on_activate: impl Fn(&mut V, I, &mut Window, &mut Context<V>) + 'static,
+    on_activate: impl Fn(&mut V, ComboId, &mut Window, &mut Context<V>) + 'static,
 ) -> Option<impl IntoElement> {
     // A host may replace the item tree while a menu is open. Walk back to
     // the last live branch rather than leaving the keyboard in a vanished
@@ -501,10 +387,9 @@ pub fn context_menu<V: ControlHost, I: Clone + 'static>(
     let key_reachable = reachable.clone();
     let selected = highlight.filter(|index| *index < reachable.len());
     let nested = !levels.is_empty();
-    let icons = MenuItem::any_icon(&items);
     let row_offset = if nested { 2 } else { 0 };
     let dark = palette.is_dark;
-    let on_activate: Activate<V, I> = Rc::new(on_activate);
+    let on_activate: Activate<V> = Rc::new(on_activate);
     let on_key_activate = on_activate.clone();
     let focus = view.control_state_mut().menu_focus(cx);
     let focus_on_open = focus.clone();
@@ -565,13 +450,10 @@ pub fn context_menu<V: ControlHost, I: Clone + 'static>(
     if let Some(title) = title {
         rows.push(render_back(title, id, opened_at, palette, cx));
         rows.push(render_item(
-            Row {
-                index: 0,
-                reachable_at: None,
-                item: MenuItem::Separator,
-                lit: 0.0,
-                icons,
-            },
+            0,
+            None,
+            MenuItem::Separator,
+            0.0,
             id,
             opened_at,
             palette,
@@ -589,13 +471,10 @@ pub fn context_menu<V: ControlHost, I: Clone + 'static>(
             crate::state::SWITCH_SLIDE,
         );
         rows.push(render_item(
-            Row {
-                index,
-                reachable_at,
-                item,
-                lit,
-                icons,
-            },
+            index,
+            reachable_at,
+            item,
+            lit,
             id,
             opened_at,
             palette,
@@ -696,17 +575,8 @@ pub fn context_menu<V: ControlHost, I: Clone + 'static>(
                 Some(MenuCommand::Enter { row, at, identity }) => {
                     this.control_state_mut().enter_menu(row, at, identity, true);
                 }
-                Some(MenuCommand::Run(row)) => {
-                    if let Some(MenuItem::Action(action)) = key_items.get(row) {
-                        activate(
-                            this,
-                            action.id.clone(),
-                            opened_at,
-                            window,
-                            cx,
-                            &on_key_activate,
-                        );
-                    }
+                Some(MenuCommand::Run(action)) => {
+                    activate(this, action, opened_at, window, cx, &on_key_activate);
                 }
                 Some(MenuCommand::Highlight(moved)) => {
                     this.control_state_mut().highlight_menu(Some(moved));
@@ -790,15 +660,7 @@ pub fn context_menu<V: ControlHost, I: Clone + 'static>(
                 .flex()
                 .flex_col()
                 .overflow_hidden()
-                .children(
-                    every_level(tree)
-                        .into_iter()
-                        .flat_map(|level| {
-                            let icons = MenuItem::any_icon(level);
-                            level.iter().map(move |item| sizing_row(item, icons))
-                        })
-                        .flatten(),
-                ),
+                .children(every_row(tree).into_iter().filter_map(sizing_row)),
         );
     // An occluding panel must keep an in-flight drag underneath it moving
     // and release it even if the pointer ends over the menu.
@@ -815,7 +677,7 @@ pub fn context_menu<V: ControlHost, I: Clone + 'static>(
     )
 }
 
-type Activate<V, I> = Rc<dyn Fn(&mut V, I, &mut Window, &mut Context<V>)>;
+type Activate<V> = Rc<dyn Fn(&mut V, ComboId, &mut Window, &mut Context<V>)>;
 
 /// Hands the keyboard back to whatever had it before the menu opened.
 ///
@@ -826,13 +688,13 @@ fn restore_focus<V: ControlHost>(view: &mut V, window: &mut Window, cx: &mut App
     view.control_state_mut().restore_menu_focus(window, cx);
 }
 
-fn activate<V: ControlHost, I>(
+fn activate<V: ControlHost>(
     view: &mut V,
-    id: I,
+    id: ComboId,
     opened_at: Instant,
     window: &mut Window,
     cx: &mut Context<V>,
-    on_activate: &Activate<V, I>,
+    on_activate: &Activate<V>,
 ) {
     // Restore first so a callback that opens another overlay remembers a
     // live control, while retaining the menu's target until it has run.
@@ -843,41 +705,32 @@ fn activate<V: ControlHost, I>(
     }
 }
 
-/// Every level of the tree, depth first: what the panel's width is taken
+/// Every row of every level, depth first: what the panel's width is taken
 /// from.
-fn every_level<I>(items: &[MenuItem<I>]) -> Vec<&[MenuItem<I>]> {
-    let mut levels = Vec::new();
+fn every_row(items: &[MenuItem]) -> Vec<&MenuItem> {
+    let mut rows = Vec::new();
     let mut stack = vec![items];
     while let Some(level) = stack.pop() {
-        levels.push(level);
         for item in level {
+            rows.push(item);
             if let MenuItem::Submenu { items, .. } = item {
                 stack.push(items);
             }
         }
     }
-    levels
-}
-
-/// Every row of every level, depth first.
-#[cfg(test)]
-fn every_row<I>(items: &[MenuItem<I>]) -> Vec<&MenuItem<I>> {
-    every_level(items).into_iter().flatten().collect()
+    rows
 }
 
 /// A row's content at the metrics `render_item` draws it with, and nothing
 /// else. A branch is set in the back row's heavier weight, so it holds the
 /// room for its title when the level it opens is showing.
-fn sizing_row<I>(item: &MenuItem<I>, icons: bool) -> Option<gpui::AnyElement> {
+fn sizing_row(item: &MenuItem) -> Option<gpui::AnyElement> {
     let row = div()
         .flex()
         .items_center()
         .gap(px(8.0))
         .pr(px(8.0))
-        .whitespace_nowrap()
-        .when(icons && !matches!(item, MenuItem::Header(_)), |row| {
-            row.child(div().w(px(ICON_SLOT)).flex_none())
-        });
+        .whitespace_nowrap();
     Some(match item {
         MenuItem::Separator => return None,
         MenuItem::Header(label) => row
@@ -894,9 +747,9 @@ fn sizing_row<I>(item: &MenuItem<I>, icons: bool) -> Option<gpui::AnyElement> {
             .child(div().w(px(10.0)).flex_none())
             .into_any_element(),
         MenuItem::Action(action) => row
-            .pl(px(if action.checked && !icons { 6.0 } else { 8.0 }))
+            .pl(px(if action.checked { 6.0 } else { 8.0 }))
             .text_size(px(12.5))
-            .when(action.checked && !icons, |row| {
+            .when(action.checked, |row| {
                 row.child(div().w(px(12.0)).flex_none())
             })
             .child(action.label.clone())
@@ -953,44 +806,6 @@ fn chevron(right: bool, palette: Palette) -> impl IntoElement {
     )
 }
 
-/// The icon column of a row, empty when the row has no icon of its own but
-/// another in its level does. A checked row without an icon shows its tick
-/// here, so the level's labels stay in one column.
-fn icon_slot(icon: Option<&MenuIcon>, checked: bool, color: Rgba) -> gpui::Div {
-    let slot = div()
-        .w(px(ICON_SLOT))
-        .h(px(ICON_SLOT))
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_center();
-    match icon {
-        Some(icon) => slot.child(icon.draw(ICON_SIZE, color)),
-        None if checked => slot.child(tick_mark(crate::color::to_hsla(color))),
-        None => slot,
-    }
-}
-
-/// The tick a checked row carries, 12 points square.
-fn tick_mark(color: gpui::Hsla) -> gpui::Div {
-    div().w(px(12.0)).h(px(12.0)).flex_none().child(
-        canvas(
-            |_bounds, _window, _cx| {},
-            move |bounds, _state, window, _cx| {
-                let origin = bounds.origin;
-                let mut builder = gpui::PathBuilder::stroke(px(1.5));
-                builder.move_to(point(origin.x + px(1.5), origin.y + px(6.0)));
-                builder.line_to(point(origin.x + px(4.5), origin.y + px(9.0)));
-                builder.line_to(point(origin.x + px(10.5), origin.y + px(2.5)));
-                if let Ok(path) = builder.build() {
-                    window.paint_path(path, color);
-                }
-            },
-        )
-        .size_full(),
-    )
-}
-
 fn render_back<V: ControlHost>(
     title: SharedString,
     menu_id: ComboId,
@@ -1030,32 +845,18 @@ fn render_back<V: ControlHost>(
         .into_any_element()
 }
 
-/// One row as the level draws it: where it sits, whether the keyboard can
-/// land on it, and how lit it is.
-struct Row<I> {
+#[allow(clippy::too_many_arguments)]
+fn render_item<V: ControlHost>(
     index: usize,
     reachable_at: Option<usize>,
-    item: MenuItem<I>,
+    item: MenuItem,
     lit: f32,
-    /// Whether the level keeps an icon column.
-    icons: bool,
-}
-
-fn render_item<V: ControlHost, I: Clone + 'static>(
-    row: Row<I>,
     menu_id: ComboId,
     opened_at: Instant,
     palette: Palette,
     cx: &mut Context<V>,
-    on_activate: &Activate<V, I>,
+    on_activate: &Activate<V>,
 ) -> gpui::AnyElement {
-    let Row {
-        index,
-        reachable_at,
-        item,
-        lit,
-        icons,
-    } = row;
     match item {
         MenuItem::Separator => {
             let mut color: gpui::Hsla = crate::color::to_hsla(palette.field_border);
@@ -1084,7 +885,6 @@ fn render_item<V: ControlHost, I: Clone + 'static>(
             label,
             items,
             enabled,
-            icon,
         } => {
             let identity = submenu_identity(&label, &items);
             div()
@@ -1124,32 +924,28 @@ fn render_item<V: ControlHost, I: Clone + 'static>(
                             }
                         }))
                 })
-                .when(icons, |el| {
-                    el.child(icon_slot(icon.as_ref(), false, palette.text_secondary))
-                })
                 .child(div().flex_1().overflow_hidden().child(label))
                 .child(chevron(true, palette))
                 .into_any_element()
         }
         MenuItem::Action(action) => {
             let on_activate = on_activate.clone();
-            let id = action.id.clone();
+            let id = action.id;
             let label_color = if action.danger {
                 palette.danger_label
             } else {
                 palette.text_primary
             };
             let tick: gpui::Hsla = crate::color::to_hsla(label_color);
-            let (enabled, checked, danger) = (action.enabled, action.checked, action.danger);
             div()
                 .id(ElementId::NamedInteger(
-                    format!("{menu_id}-item").into(),
+                    format!("menu-item-{id}").into(),
                     index as u64,
                 ))
                 .h(px(ITEM_HEIGHT))
                 .flex_none()
                 .w_full()
-                .pl(px(if checked && !icons { 6.0 } else { 8.0 }))
+                .pl(px(if action.checked { 6.0 } else { 8.0 }))
                 .pr(px(8.0))
                 .flex()
                 .items_center()
@@ -1159,13 +955,13 @@ fn render_item<V: ControlHost, I: Clone + 'static>(
                 .text_color(label_color)
                 .whitespace_nowrap()
                 .overflow_hidden()
-                .when(!enabled, |el| el.opacity(0.45))
+                .when(!action.enabled, |el| el.opacity(0.45))
                 // The keyboard's row is filled the same way the mouse fills
                 // one under the pointer, so there is one idea of "this one"
                 // rather than two competing marks.
                 .when(lit > 0.01, move |el| {
                     el.bg(lighting::lit_at(
-                        if danger {
+                        if action.danger {
                             palette.danger_fill
                         } else {
                             palette.control_fill
@@ -1177,12 +973,12 @@ fn render_item<V: ControlHost, I: Clone + 'static>(
                 .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _window, cx| {
                     hover_row(this, reachable_at, cx);
                 }))
-                .when(enabled, move |el| {
+                .when(action.enabled, move |el| {
                     let on_activate = on_activate.clone();
                     el.cursor_pointer()
                         .hover(move |style| {
                             style.bg(lighting::lit(
-                                if danger {
+                                if action.danger {
                                     palette.danger_fill
                                 } else {
                                     palette.control_fill
@@ -1192,22 +988,32 @@ fn render_item<V: ControlHost, I: Clone + 'static>(
                         })
                         .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                             if takes_click(this.control_state(), opened_at, event.click_count()) {
-                                activate(this, id.clone(), opened_at, window, cx, &on_activate);
+                                activate(this, id, opened_at, window, cx, &on_activate);
                                 cx.notify();
                             }
                         }))
                 })
                 // Checked rows get a tick in a fixed gutter, so labels stay
-                // aligned whether or not any row in the menu is checked. A
-                // level with an icon column keeps the tick in that column.
-                .when(checked && !icons, move |el| el.child(tick_mark(tick)))
-                .when(icons, |el| {
-                    el.child(icon_slot(action.icon.as_ref(), checked, label_color))
-                })
-                // A checked row that also has an icon shows its tick after
-                // the label, where the floating menu puts every tick.
-                .when(checked && icons && action.icon.is_some(), move |el| {
-                    el.child(tick_mark(tick))
+                // aligned whether or not any row in the menu is checked.
+                .when(action.checked, move |el| {
+                    el.child(
+                        div().w(px(12.0)).h(px(12.0)).flex_none().child(
+                            canvas(
+                                |_bounds, _window, _cx| {},
+                                move |bounds, _state, window, _cx| {
+                                    let origin = bounds.origin;
+                                    let mut builder = gpui::PathBuilder::stroke(px(1.5));
+                                    builder.move_to(point(origin.x + px(1.5), origin.y + px(6.0)));
+                                    builder.line_to(point(origin.x + px(4.5), origin.y + px(9.0)));
+                                    builder.line_to(point(origin.x + px(10.5), origin.y + px(2.5)));
+                                    if let Ok(path) = builder.build() {
+                                        window.paint_path(path, tick);
+                                    }
+                                },
+                            )
+                            .size_full(),
+                        ),
+                    )
                 })
                 .child(div().flex_1().overflow_hidden().child(action.label))
                 .children(action.shortcut.map(|shortcut| {
@@ -1382,9 +1188,9 @@ pub use crate::state::OpenMenu as ContextMenu;
 #[cfg(test)]
 mod tests {
     use super::{
-        MenuBranch, MenuCommand, MenuIcon, MenuItem, every_row, fit_to_window, menu_command,
-        menu_height, reachable_indices, settle_levels, step_highlight, submenu_identity,
-        takes_click, visible_level,
+        MenuBranch, MenuCommand, MenuItem, every_row, fit_to_window, menu_command, menu_height,
+        reachable_indices, settle_levels, step_highlight, submenu_identity, takes_click,
+        visible_level,
     };
     use crate::ControlState;
     use crate::keyboard::Key;
@@ -1412,7 +1218,7 @@ mod tests {
     fn tree(move_to: &[&'static str], tag: &[&'static str]) -> Vec<MenuItem> {
         let actions = |ids: &[&'static str]| {
             ids.iter()
-                .map(|id| MenuItem::action(*id, *id))
+                .map(|id| MenuItem::action(id, *id))
                 .collect::<Vec<_>>()
         };
         vec![
@@ -1455,14 +1261,10 @@ mod tests {
         assert_eq!(title.map(|title| title.as_ref()), Some("Move to"));
         assert!(matches!(level, [MenuItem::Action(action)] if action.id == "inbox"));
 
-        let disabled: Vec<MenuItem> = vec![MenuItem::submenu("Organize", vec![]).disabled()];
+        let disabled = vec![MenuItem::submenu("Organize", vec![]).disabled()];
         assert!(visible_level(&disabled, &path[..1]).is_none());
     }
 
-    /// Identity is what the reader sees — the labels — so it needs nothing
-    /// of the id type, and a host whose ids are commands can still open a
-    /// menu of them. Toggling a row keeps the level; replacing its rows
-    /// does not.
     #[test]
     fn a_reordered_or_replaced_branch_cannot_show_another_submenu() {
         let original = vec![
@@ -1480,29 +1282,11 @@ mod tests {
         )];
         assert!(visible_level(&replaced, &path).is_none());
 
-        let toggled = vec![MenuItem::submenu(
+        let relabelled = vec![MenuItem::submenu(
             "Organize",
-            vec![MenuItem::action("inbox", "Inbox").checked(true).disabled()],
+            vec![MenuItem::action("inbox", "Move to Inbox")],
         )];
-        assert!(visible_level(&toggled, &path).is_some());
-
-        let commands: Vec<MenuItem<Option<u32>>> = vec![MenuItem::submenu(
-            "Organize",
-            vec![
-                MenuItem::action(Some(7), "Inbox"),
-                MenuItem::action(None, "Gone"),
-            ],
-        )];
-        let MenuItem::Submenu { label, items, .. } = &commands[0] else {
-            unreachable!();
-        };
-        let path = [MenuBranch {
-            index: 0,
-            highlight: 0,
-            identity: submenu_identity(label, items),
-            scroll: Default::default(),
-        }];
-        assert!(visible_level(&commands, &path).is_some());
+        assert!(visible_level(&relabelled, &path).is_some());
     }
 
     /// Editing one branch's subtree must not throw the reader out of
@@ -1606,7 +1390,7 @@ mod tests {
         );
         assert_eq!(
             menu_command(Key::Activate, Some(0), &items, &reachable),
-            Some(MenuCommand::Run(0))
+            Some(MenuCommand::Run("open"))
         );
         assert_eq!(menu_command(Key::Right, Some(0), &items, &reachable), None);
     }
@@ -1628,7 +1412,7 @@ mod tests {
     fn long_levels_scroll_and_nested_levels_make_room_for_back() {
         let short = vec![MenuItem::action("open", "Open")];
         assert_eq!(menu_height(&short, true) - menu_height(&short, false), 33.0);
-        let long: Vec<MenuItem> = (0..40).map(|_| MenuItem::header("Section")).collect();
+        let long: Vec<_> = (0..40).map(|_| MenuItem::header("Section")).collect();
         assert_eq!(menu_height(&long, false), super::MENU_MAX_HEIGHT);
     }
 
@@ -1689,36 +1473,5 @@ mod tests {
         );
         // A window too small for anything still leaves one row's worth.
         assert_eq!(fit_to_window(520.0, Some(10.0)), 38.0);
-    }
-
-    /// An icon on any row gives the whole level an icon column; a level
-    /// without one keeps its labels flush.
-    #[test]
-    fn an_icon_anywhere_in_a_level_opens_the_icon_column() {
-        let icon = MenuIcon::new(|_, _| gpui::IntoElement::into_any_element(gpui::Empty));
-        let plain: Vec<MenuItem> = vec![
-            MenuItem::action("open", "Open"),
-            MenuItem::submenu(
-                "Move to",
-                vec![MenuItem::action("inbox", "Inbox").icon(icon)],
-            ),
-        ];
-        assert!(!MenuItem::any_icon(&plain));
-        assert!(MenuItem::any_icon(children(&plain[1])));
-        assert!(plain[1].icon_of().is_none());
-        assert_eq!(plain[1].label(), Some("Move to"));
-        assert_eq!(MenuItem::<&str>::separator().label(), None);
-    }
-
-    #[test]
-    fn an_action_is_found_at_any_depth_to_relabel() {
-        let mut items = tree(&["inbox"], &["red"]);
-        assert!(MenuItem::action_mut(&mut items, |action| action.id == "none").is_none());
-        let inbox =
-            MenuItem::action_mut(&mut items, |action| action.id == "inbox").expect("nested");
-        inbox.label = "Move to Inbox".into();
-        let organize = children(&items[1]);
-        let moved = children(&organize[1]);
-        assert_eq!(moved[0].label(), Some("Move to Inbox"));
     }
 }

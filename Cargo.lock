@@ -5780,16 +5780,14 @@ dependencies = [
 
 [[package]]
 name = "vampir"
-version = "0.3.0"
+version = "0.2.0"
 dependencies = [
- "block2 0.6.2",
  "gpui-ce",
  "gpui_ce_platform",
  "image",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
- "raw-window-handle",
  "unicode-segmentation",
 ]
 

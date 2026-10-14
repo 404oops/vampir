@@ -21,21 +21,3 @@ pub fn ui_font() -> &'static str {
         "sans-serif"
     }
 }
-
-/// How wide `text` sets in the UI font at `size` and `weight`, from its
-/// glyphs' advances: for a window that has to be sized before it can be
-/// laid out.
-pub fn text_width(cx: &gpui::App, text: &str, size: f32, weight: gpui::FontWeight) -> f32 {
-    let system = cx.text_system();
-    let mut font = gpui::font(ui_font());
-    font.weight = weight;
-    let font = system.resolve_font(&font);
-    let pixels = gpui::px(size);
-    text.chars()
-        .map(|ch| {
-            system
-                .advance(font, pixels, ch)
-                .map_or(size * 0.6, |advance| f32::from(advance.width))
-        })
-        .sum()
-}

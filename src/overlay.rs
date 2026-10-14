@@ -9,7 +9,7 @@ use std::time::Instant;
 use gpui::{
     AnyElement, AnyView, App, Context, Div, ElementId, Entity, FontWeight, InteractiveElement,
     KeyDownEvent, MouseButton, MouseDownEvent, Point, Render, Rgba, ScrollHandle, SharedString,
-    Stateful, StyledText, Window, deferred, div, point, prelude::*, px,
+    StyledText, Window, deferred, div, point, prelude::*, px,
 };
 
 use crate::controls::{WidgetContext, search_field};
@@ -91,37 +91,6 @@ impl From<SharedString> for Hint {
     fn from(text: SharedString) -> Self {
         Hint::new(text)
     }
-}
-
-/// Where a hint sits relative to what it names: never under the pointer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HintSide {
-    Below,
-    Right,
-}
-
-/// Gives `element` a hint: GPUI's tooltip, or when the host has asked for
-/// floating hints ([`ControlState::set_floating_hints`]) a window of its
-/// own beside the element, which a native view over the window cannot
-/// hide. `side` only matters to the window; a tooltip goes where GPUI
-/// puts it.
-///
-/// ```ignore
-/// hinted(div().id("star").child(glyph("★")), Hint::new("Favourite"), HintSide::Below,
-///     WidgetContext { palette, view: self, cx })
-/// ```
-pub fn hinted<V: ControlHost>(
-    element: Stateful<Div>,
-    hint: impl Into<Hint>,
-    side: HintSide,
-    ctx: WidgetContext<'_, '_, '_, V>,
-) -> Stateful<Div> {
-    let WidgetContext { palette, view, cx } = ctx;
-    let hint = hint.into();
-    if view.control_state().floating_hints() {
-        return crate::hint::attach(element, hint, side, cx);
-    }
-    element.tooltip(hint.tooltip(palette))
 }
 
 impl Tooltip {
