@@ -561,6 +561,20 @@ pub struct ControlState {
     drag: Option<Drag>,
     /// A rendered tab bar changed axis while its drag was in flight.
     tab_drag_invalidated: Cell<bool>,
+
+    /// Whether hints are to be drawn in a panel of their own, outside the
+    /// window, because a native view over the window would hide a tooltip
+    /// drawn inside it. See [`crate::hinted`].
+    native_hints: bool,
+    /// The hinted element the pointer is resting on, if any, and the wait
+    /// before its hint shows.
+    #[cfg(all(target_os = "macos", feature = "native"))]
+    pub(crate) hint_key: Option<String>,
+    #[cfg(all(target_os = "macos", feature = "native"))]
+    pub(crate) hint_timer: Option<gpui::Task<()>>,
+    /// The wait before a passing message goes away.
+    #[cfg(all(target_os = "macos", feature = "native"))]
+    pub(crate) toast_timer: Option<gpui::Task<()>>,
 }
 
 impl Default for ControlState {
@@ -596,7 +610,26 @@ impl ControlState {
             ring_hidden: false,
             drag: None,
             tab_drag_invalidated: Cell::new(false),
+            native_hints: false,
+            #[cfg(all(target_os = "macos", feature = "native"))]
+            hint_key: None,
+            #[cfg(all(target_os = "macos", feature = "native"))]
+            hint_timer: None,
+            #[cfg(all(target_os = "macos", feature = "native"))]
+            toast_timer: None,
         }
+    }
+
+    /// Asks for hints in a panel of their own, outside the window, for a
+    /// host with a native view composited over it. Only on macOS with the
+    /// `native` feature does it change anything; elsewhere hints stay
+    /// tooltips.
+    pub fn set_native_hints(&mut self, native: bool) {
+        self.native_hints = native;
+    }
+
+    pub fn native_hints(&self) -> bool {
+        self.native_hints
     }
 
     /// Microseconds since the state was made: the clock every record keeps

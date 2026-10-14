@@ -30,6 +30,7 @@ app-icon = ["dep:image", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation
 native = [
     "dep:async-channel",
     "dep:block2",
+    "dep:lyon_tessellation",
     "dep:objc2",
     "dep:objc2-app-kit",
     "dep:objc2-foundation",
@@ -45,7 +46,7 @@ raw-window-handle = { version = "0.6", optional = true }
 # Round caps and joins on stroked paths. GPUI re-exports lyon's stroke
 # options but not the cap and join enums they are set with; this is the
 # same lyon GPUI tessellates with, so it adds nothing to the build.
-lyon_tessellation = "1"
+lyon_tessellation = { version = "1", optional = true }
 # gpui-ce is the community edition of Zed's GPUI (Apache-2.0): the same API,
 # synced from Zed and published to crates.io, which is what lets this crate be
 # published too. Imported as `gpui` so the code reads as GPUI code.

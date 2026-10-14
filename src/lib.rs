@@ -86,13 +86,13 @@ pub use menu::{
 };
 #[cfg(all(target_os = "macos", feature = "native"))]
 pub use native::{
-    floating_menu,
+    floating_menu, hint as native_hint,
     ns_menu::{NativeAction, NativeMenu},
     ns_window_of,
 };
 pub use overlay::{
-    Command, Hint, SearchResult, Tooltip, command_list, command_palette, fuzzy_filter, fuzzy_score,
-    rank_results, ranked_command_palette, ranked_search_list, search_list,
+    Command, Hint, HintSide, SearchResult, Tooltip, command_list, command_palette, fuzzy_filter,
+    fuzzy_score, hinted, rank_results, ranked_command_palette, ranked_search_list, search_list,
 };
 pub use palette::{DEFAULT_SATURATION, MAX_SATURATION, Palette};
 pub use scroll::{SCROLL_FADE, ScrollAxis, ScrollDrag, apply_scroll_drag, scroll_fades};

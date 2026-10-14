@@ -21,17 +21,18 @@ use gpui_ce_platform::application;
 use vampir::AppIcon;
 use vampir::{
     BadgeTone, ButtonVariant, CARD_LIFT, CONTROL_HEIGHT, ChipSelection, Choice, Chord, Column,
-    ComboId, Command, ControlHost, ControlState, DialogButton, Hint, InputStyle, ListSelection,
-    MAX_CHROMA, MenuItem, Oklch, Palette, Scheme, ScrollAxis, SearchResult, SelectionIntent,
-    SliderTrack, SortDirection, Span, TEXT_SIZE, TITLE_TEXT_SIZE, Tab, TabBarLayout, TextInput,
-    Theme, TreeRow, WidgetContext, arriving, badge, bind_keys, button, caption, card, card_at,
-    checkbox, chip_group, collapsible, color_pad, column, combo, command_palette, context_menu,
-    dialog, edit_menu, fading_text, flatten_tree, glyph, ground, hue_picker, hue_slider, hue_wheel,
-    icon_button, labelled, lit, lit_stops, menu_button, menu_target, progress_bar, radio_group,
-    rank_results, ranked_command_palette, ranked_search_list, reorder, row, saturation_picker,
-    scheme_picker, scroll_area, search_list, segmented, selectable_list, separator,
-    shortcut_recorder, slider, spinbox, spinner, split_area, split_handle, swatch_grid, switch,
-    tab_bar, tab_bar_layout, table_header, table_row, text_area, text_field, tree_row, ui_font,
+    ComboId, Command, ControlHost, ControlState, DialogButton, Hint, HintSide, InputStyle,
+    ListSelection, MAX_CHROMA, MenuItem, Oklch, Palette, Scheme, ScrollAxis, SearchResult,
+    SelectionIntent, SliderTrack, SortDirection, Span, TEXT_SIZE, TITLE_TEXT_SIZE, Tab,
+    TabBarLayout, TextInput, Theme, TreeRow, WidgetContext, arriving, badge, bind_keys, button,
+    caption, card, card_at, checkbox, chip_group, collapsible, color_pad, column, combo,
+    command_palette, context_menu, dialog, edit_menu, fading_text, flatten_tree, glyph, ground,
+    hinted, hue_picker, hue_slider, hue_wheel, icon_button, labelled, lit, lit_stops, menu_button,
+    menu_target, progress_bar, radio_group, rank_results, ranked_command_palette,
+    ranked_search_list, reorder, row, saturation_picker, scheme_picker, scroll_area, search_list,
+    segmented, selectable_list, separator, shortcut_recorder, slider, spinbox, spinner, split_area,
+    split_handle, swatch_grid, switch, tab_bar, tab_bar_layout, table_header, table_row, text_area,
+    text_field, tree_row, ui_font,
 };
 
 // The gallery is also the smallest complete *macOS* host, so it carries the
@@ -224,6 +225,8 @@ struct Gallery {
     selection: ListSelection,
     last_action: SharedString,
     /// What the floating menu's checked row toggles.
+    /// Toggled from the floating menu, which only the native build opens.
+    #[cfg_attr(not(all(target_os = "macos", feature = "native")), allow(dead_code))]
     pinned: bool,
 
     // Colour page.
@@ -1472,6 +1475,7 @@ impl Gallery {
 
         column()
             .children(self.floating_menu_card(palette, cx))
+            .child(self.hint_card(palette, cx))
             .child(card(
                 palette,
                 "Tabs — scroll sideways, close repeatedly, drag to reorder",
@@ -2008,6 +2012,129 @@ impl Gallery {
 
     #[cfg(not(all(target_os = "macos", feature = "native")))]
     fn floating_menu_card(&mut self, _palette: Palette, _cx: &mut Context<Self>) -> Option<Div> {
+        None
+    }
+
+    /// Hints that survive a native view over the window: the same `hinted`
+    /// call draws a tooltip, or with native hints on, a panel beside the
+    /// element. The toast is a passing message in a panel of its own.
+    fn hint_card(&mut self, palette: Palette, cx: &mut Context<Self>) -> Div {
+        let tile = |id: &'static str,
+                    character: &'static str,
+                    hint: Hint,
+                    side: HintSide,
+                    this: &mut Self,
+                    cx: &mut Context<Self>| {
+            hinted(
+                div()
+                    .id(id)
+                    .size(px(CONTROL_HEIGHT))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(vampir::CONTROL_RADIUS))
+                    .bg(lit(palette.control_fill, 0.05))
+                    .border_1()
+                    .border_color(palette.field_border)
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(lit(palette.control_fill, 0.09)))
+                    .child(glyph(character)),
+                hint,
+                side,
+                WidgetContext::new(palette, this, cx),
+            )
+        };
+        let native = self.controls.native_hints();
+        card(
+            palette,
+            "Hints — a tooltip, or a panel of its own beside a native view",
+            row()
+                .gap(px(16.0))
+                .child(switch(
+                    "native-hints",
+                    native,
+                    Some("Native hints"),
+                    true,
+                    WidgetContext::new(palette, self, cx),
+                    |this, on, _window, cx| {
+                        this.controls.set_native_hints(on);
+                        cx.notify();
+                    },
+                ))
+                .child(tile(
+                    "hint-open",
+                    "▣",
+                    Hint::new("Open"),
+                    HintSide::Below,
+                    self,
+                    cx,
+                ))
+                .child(tile(
+                    "hint-star",
+                    "★",
+                    Hint::new("Favourite").shortcut(vampir::display("secondary-d")),
+                    HintSide::Below,
+                    self,
+                    cx,
+                ))
+                .child(tile(
+                    "hint-folder",
+                    "▤",
+                    Hint::new("Show in folder"),
+                    HintSide::Right,
+                    self,
+                    cx,
+                ))
+                .children(self.toast_button(palette, cx)),
+        )
+    }
+
+    #[cfg(all(target_os = "macos", feature = "native"))]
+    fn toast_button(&mut self, palette: Palette, cx: &mut Context<Self>) -> Option<Div> {
+        let weak = cx.entity().downgrade();
+        Some(
+            div()
+                .relative()
+                .w(px(160.0))
+                .child(
+                    // Where the toast hangs from.
+                    gpui::canvas(
+                        move |bounds, _, cx| {
+                            if let Some(host) = weak.upgrade() {
+                                host.update(cx, |host, _| {
+                                    host.controls.measure("toast-anchor", bounds);
+                                });
+                            }
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+                .child(button(
+                    "toast",
+                    "Show a toast",
+                    ButtonVariant::Soft,
+                    true,
+                    palette,
+                    cx,
+                    |this, window, cx| {
+                        if let Some(anchor) = this.controls.measured("toast-anchor") {
+                            vampir::native_hint::toast(
+                                this,
+                                "Copied to the clipboard",
+                                anchor,
+                                window,
+                                cx,
+                            );
+                        }
+                    },
+                )),
+        )
+    }
+
+    #[cfg(not(all(target_os = "macos", feature = "native")))]
+    fn toast_button(&mut self, _palette: Palette, _cx: &mut Context<Self>) -> Option<Div> {
         None
     }
 
