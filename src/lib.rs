@@ -37,6 +37,7 @@
 pub mod color;
 pub mod containers;
 pub mod controls;
+pub mod cover;
 pub mod data;
 pub mod dialog_window;
 pub mod easing;
@@ -71,6 +72,7 @@ pub use controls::{
     fading_text, glyph, icon_button, progress_bar, radio_group, scrollbar, search_field, segmented,
     separator, slider, spinbox, spinner, switch, text_area, text_field,
 };
+pub use cover::{Cover, Request as StillRequest, snapshot_width};
 pub use data::{
     Column, SortDirection, TABLE_ROW_HEIGHT, TreeMove, TreeRow, flatten_tree, table_cell,
     table_header, table_row, tree_row, tree_step,

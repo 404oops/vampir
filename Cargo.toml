@@ -20,13 +20,12 @@ default = ["app-icon", "native"]
 #
 #   vampir = { version = "0.3", default-features = false }
 app-icon = ["dep:image", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
-# What a host that embeds a live native view needs: menus, hints and
-# dialogs in windows of their own, because a native view covers anything
-# drawn inside the GPUI window; a cover that stands a still of the view in
-# for it while an overlay is up; file pickers, alerts and the other things
-# only AppKit can do. macOS only; on the other platforms the feature is
-# empty. Everything it pulls in is already in the tree by way of GPUI's own
-# backend, so it costs nothing to compile on a machine that builds GPUI.
+# What only AppKit can give a host that embeds a live native view: an
+# `NSMenu` the view proposes adopted as the toolkit's rows, and an event
+# monitor that lets the floating menu leave the keyboard with the host's
+# window. The menus, hints, dialogs and the cover themselves are GPUI
+# windows and need none of this. macOS only; on the other platforms the
+# feature is empty and pulls in nothing.
 native = [
     "dep:block2",
     "dep:objc2",
@@ -36,66 +35,41 @@ native = [
 ]
 
 [dependencies]
-raw-window-handle = { version = "0.6", optional = true }
 # gpui-ce is the community edition of Zed's GPUI (Apache-2.0): the same API,
 # synced from Zed and published to crates.io, which is what lets this crate be
 # published too. Imported as `gpui` so the code reads as GPUI code.
 gpui = { package = "gpui-ce", version = "0.2.2" }
 unicode-segmentation = "1"
 
-# Only for `app-icon`, and only on the platform that wants them. Both are
-# already in the tree by way of GPUI's own backends, so on a machine that
-# builds GPUI at all they cost nothing to compile.
+# Only for `app-icon` and `native`, and only on the platform that wants
+# them. All of these are already in the tree by way of GPUI's own backend,
+# so on a machine that builds GPUI at all they cost nothing to compile.
 [target.'cfg(target_os = "macos")'.dependencies]
+raw-window-handle = { version = "0.6", optional = true }
 block2 = { version = "0.6", optional = true }
 objc2 = { version = "0.6", optional = true }
 objc2-app-kit = { version = "0.3", optional = true, features = [
-    "NSAlert",
     "NSApplication",
-    "NSBitmapImageRep",
-    "NSBox",
-    "NSCell",
-    "NSColor",
-    "NSControl",
     "NSEvent",
-    "NSFont",
     "NSGraphics",
-    "NSGraphicsContext",
     "NSImage",
-    "NSImageRep",
     "NSMenu",
     "NSMenuItem",
-    "NSOpenPanel",
-    "NSPanel",
     "NSResponder",
-    "NSSavePanel",
-    "NSScreen",
-    "NSTextField",
     "NSUserInterfaceItemIdentification",
     "NSView",
     "NSWindow",
-    "NSWorkspace",
     "block2",
     "objc2-core-foundation",
-    "objc2-core-graphics",
 ] }
 objc2-foundation = { version = "0.3", optional = true, features = [
     "NSArray",
-    "NSBundle",
-    "NSCalendar",
     "NSData",
-    "NSDate",
-    "NSDateFormatter",
-    "NSDictionary",
     "NSEnumerator",
-    "NSError",
-    "NSFormatter",
     "NSGeometry",
     "NSNotification",
     "NSObject",
     "NSString",
-    "NSURL",
-    "NSValue",
 ] }
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]

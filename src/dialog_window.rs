@@ -1,4 +1,4 @@
-//! A prompt, a confirmation or an alert in a small window of its own.
+//! A prompt, a confirmation, a choice or an alert in a small window of its own.
 //!
 //! The in-window [`dialog`](crate::dialog) is the one to reach for: it sits
 //! over the view it belongs to and fades with it. A host whose window has a
@@ -12,6 +12,8 @@
 //!     move |answer, cx| if let Some(name) = answer { rename(name, cx) });
 //! dialog_window::confirm(cx, palette, "Clear history?", "This cannot be undone.",
 //!     "Clear", move |accepted, cx| if accepted { clear(cx) });
+//! dialog_window::choose(cx, palette, "Save changes?", "", vec!["Don't Save".into(), "Save".into()],
+//!     move |chosen, cx| if chosen == Some(1) { save(cx) });
 //! dialog_window::alert(cx, palette, "Couldn't save", &error);
 //! ```
 //!
@@ -28,7 +30,6 @@ use gpui::{
 use crate::containers::DialogButton;
 use crate::controls::{ButtonVariant, text_field};
 use crate::keyboard::{self, Dismiss};
-use crate::lighting;
 use crate::palette::Palette;
 use crate::state::{ControlHost, ControlState};
 use crate::text_input::InputStyle;
@@ -106,7 +107,7 @@ impl ControlHost for Dialog {
 }
 
 impl Dialog {
-    /// Closes with `outcome`: a chosen button's index, or none.
+    /// Closes, answering with `chosen`: a button's index, or none.
     fn finish(&mut self, chosen: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(answer) = self.answer.take() else {
             return;
@@ -122,9 +123,10 @@ impl Dialog {
         answer(outcome, cx);
     }
 
-    /// The primary button: the last.
+    /// The primary button: the last. Offered no buttons at all, Enter can
+    /// choose nothing, so it cancels.
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.finish(Some(self.buttons.len().saturating_sub(1)), window, cx);
+        self.finish(self.buttons.len().checked_sub(1), window, cx);
     }
 }
 
@@ -239,7 +241,6 @@ impl Render for Dialog {
                     )
                     .child(footer),
             )
-            .shadow(lighting::panel(palette.is_dark))
     }
 }
 

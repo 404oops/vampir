@@ -186,7 +186,7 @@ ink() {
 	"$bin/ink" "$@"
 }
 
-# The six screenshots the docs use, in the state each one shows. From a fresh
+# The screenshots the docs use, in the state each one shows. From a fresh
 # launch, so nothing carries over from whatever was clicked before.
 screenshots() {
 	launch
@@ -206,6 +206,13 @@ screenshots() {
 	key escape; sleep 0.5
 	key cmd-3; sleep 0.8
 	shot "$root/docs/data.png"
+	# The cover's still arrives 400ms after it is asked for.
+	pointer click 316 541; sleep 1.2
+	shot "$root/docs/cover.png" 20 430 940 220
+	pointer click 316 541; sleep 0.4
+	pointer click 116 386; sleep 0.9
+	shot "$root/docs/dialog-window.png"
+	key escape; sleep 0.5
 	key cmd-4; sleep 0.8
 	shot "$root/docs/colour.png"
 	key cmd-1; sleep 0.8

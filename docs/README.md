@@ -1,6 +1,6 @@
 # Vampir documentation
 
-Vampir is a widget toolkit for [GPUI](https://www.gpui.rs): buttons, fields, pop-ups, menus, tables and a full text input, over a small OKLCH palette. It is a plain library crate with no application inside it, and it depends on nothing but `gpui` and `unicode-segmentation`.
+Vampir is a widget toolkit for [GPUI](https://www.gpui.rs): buttons, fields, pop-ups, menus, tables and a full text input, over a small OKLCH palette. It is a plain library crate with no application inside it, and it depends on nothing but `gpui` and `unicode-segmentation` on every platform; the `app-icon` and `native` features add AppKit bindings on macOS only, and they are already in the tree by way of GPUI's own backend.
 
 Use the guide that matches what you are doing:
 

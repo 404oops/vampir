@@ -20,7 +20,7 @@ use gpui::{
 use crate::lighting;
 use crate::overlay::{Hint, HintSide};
 use crate::palette::Palette;
-use crate::state::ControlHost;
+use crate::state::{ControlHost, Tag};
 use crate::typography::{text_width, ui_font};
 
 /// How long the pointer rests on something before its hint shows.
@@ -61,18 +61,15 @@ pub fn attach<V: ControlHost>(
         Some(shortcut) => format!("{}   {shortcut}", hint.text),
         None => hint.text.to_string(),
     };
-    // By window too: each window draws its own.
-    let id = element
-        .interactivity()
-        .element_id
-        .clone()
-        .map_or_else(|| text.clone(), |id| format!("{id:?}"));
-    let key = format!("{}:{side:?}:{id}", cx.entity_id());
+    // By host too: each window draws its own.
+    let key = match element.interactivity().element_id.clone() {
+        Some(id) => Tag::new((cx.entity_id(), side, id)),
+        None => Tag::new((cx.entity_id(), side, text.as_str())),
+    };
     let weak = cx.entity().downgrade();
-    let anchor_key = key.clone();
     element
         .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
-            hover(this, key.clone(), text.clone(), side, *hovered, window, cx);
+            hover(this, key, text.clone(), side, *hovered, window, cx);
         }))
         .on_mouse_down(
             MouseButton::Left,
@@ -85,7 +82,7 @@ pub fn attach<V: ControlHost>(
                 move |bounds, _, cx| {
                     if let Some(host) = weak.upgrade() {
                         host.update(cx, |host, _| {
-                            host.control_state_mut().measure(anchor_key.clone(), bounds);
+                            host.control_state_mut().measure(key, bounds);
                         });
                     }
                 },
@@ -102,7 +99,7 @@ pub fn attach<V: ControlHost>(
 /// a moment's rest, or takes it away.
 fn hover<V: ControlHost>(
     view: &mut V,
-    key: String,
+    key: Tag,
     text: String,
     side: HintSide,
     hovered: bool,
@@ -111,23 +108,23 @@ fn hover<V: ControlHost>(
 ) {
     let state = view.control_state_mut();
     if !hovered {
-        if state.hint_key.as_deref() == Some(key.as_str()) {
+        if state.hint_key == Some(key) {
             state.hint_key = None;
             state.hint_timer = None;
             hide(cx);
         }
         return;
     }
-    state.hint_key = Some(key.clone());
+    state.hint_key = Some(key);
     state.hint_timer = Some(cx.spawn_in(window, async move |this, cx| {
         cx.background_executor().timer(DELAY).await;
         let _ = this.update_in(cx, |host, window, cx| {
             let state = host.control_state();
-            if state.hint_key.as_deref() != Some(key.as_str()) {
+            if state.hint_key != Some(key) {
                 return;
             }
             let palette = state.palette();
-            if let Some(bounds) = state.measured(key.clone()) {
+            if let Some(bounds) = state.measured(key) {
                 show_in(&HINT, text.into(), bounds, side, palette, window, cx);
             }
         });

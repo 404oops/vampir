@@ -568,7 +568,7 @@ pub struct ControlState {
     floating_hints: bool,
     /// The hinted element the pointer is resting on, if any, and the wait
     /// before its hint shows.
-    pub(crate) hint_key: Option<String>,
+    pub(crate) hint_key: Option<Tag>,
     pub(crate) hint_timer: Option<gpui::Task<()>>,
     /// The wait before a passing message goes away.
     pub(crate) toast_timer: Option<gpui::Task<()>>,

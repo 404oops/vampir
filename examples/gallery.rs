@@ -42,6 +42,10 @@ use vampir::{
 #[cfg(feature = "app-icon")]
 const ICON: AppIcon = AppIcon::default_icon();
 
+/// What the Data page's cover shows in place of its "native view": the
+/// toolkit's own icon, as a web view's capture of itself would arrive.
+const STILL: &[u8] = include_bytes!("../assets/icon-256.png");
+
 actions!(
     gallery,
     [
@@ -226,6 +230,9 @@ struct Gallery {
     last_action: SharedString,
     /// What the floating menu's checked row toggles.
     pinned: bool,
+    /// A still standing in for the "embedded view" on the Data page.
+    cover: vampir::Cover,
+    covered: bool,
 
     // Colour page.
     colour: Oklch,
@@ -482,6 +489,8 @@ impl Gallery {
             selection: ListSelection::new(),
             last_action: "—".into(),
             pinned: true,
+            cover: vampir::Cover::new(),
+            covered: false,
             colour: Oklch::new(268.0, 0.11, 0.62),
             palette_query,
             commands: vec![
@@ -669,6 +678,9 @@ fn owned(items: &[&str]) -> Vec<String> {
 
 impl Render for Gallery {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Stills the cover has let go of are freed here, where there is a
+        // window to free them from.
+        self.cover.release(window, cx);
         // The palette as shown this frame: the theme's, crossing over if the
         // scheme or the hue has just changed.
         let palette = self.controls.palette();
@@ -1472,9 +1484,10 @@ impl Gallery {
         .h(px(196.0));
 
         column()
-            .children(self.floating_menu_card(palette, cx))
+            .child(self.floating_menu_card(palette, cx))
             .child(self.hint_card(palette, cx))
             .child(self.dialog_window_card(palette, cx))
+            .child(self.cover_card(palette, cx))
             .child(card(
                 palette,
                 "Tabs — scroll sideways, close repeatedly, drag to reorder",
@@ -1802,7 +1815,7 @@ impl Gallery {
     /// A menu in a pop-up window of its own, for a host whose window has a
     /// native view over it. The rows are the same `MenuItem`s the in-window
     /// menu takes, here with the host's own command type as their ids.
-    fn floating_menu_card(&mut self, palette: Palette, cx: &mut Context<Self>) -> Option<Div> {
+    fn floating_menu_card(&mut self, palette: Palette, cx: &mut Context<Self>) -> Div {
         use vampir::floating_menu;
 
         #[derive(Clone, Copy, Debug)]
@@ -1878,7 +1891,7 @@ impl Gallery {
                 }
             }
         };
-        Some(card(
+        card(
             palette,
             "Floating menu — a window of its own, above a native view",
             row()
@@ -1906,7 +1919,7 @@ impl Gallery {
                         "Arrows walk it, Enter runs a row, letters find one, Escape closes.",
                     ),
                 ),
-        ))
+        )
     }
 
     /// The button that adopts an AppKit menu: only where there is AppKit.
@@ -2088,13 +2101,100 @@ impl Gallery {
                     self,
                     cx,
                 ))
-                .children(self.toast_button(palette, cx)),
+                .child(self.toast_button(palette, cx)),
         )
     }
 
-    /// Prompt, confirm and alert in a window of their own, for a host whose
-    /// window has a native view over it. The answer comes back through a
-    /// callback with the `App`, from which the host reaches itself.
+    /// A still in place of an embedded view. The gallery has no native
+    /// view, so the "view" is a drawn box and the "still" the app icon,
+    /// delivered a moment after it is asked for, the way a web view's
+    /// capture arrives; a request made before a switch is dropped by its
+    /// token.
+    fn cover_card(&mut self, palette: Palette, cx: &mut Context<Self>) -> Div {
+        let covered = self.covered;
+        let pending = self.cover.pending();
+        // Square, like the still standing in for it: a real still is a
+        // picture of the view at its own shape, and fills it.
+        let view = div()
+            .relative()
+            .w(px(140.0))
+            .h(px(140.0))
+            .rounded(px(8.0))
+            .overflow_hidden()
+            .bg(lit(palette.accent, 0.1))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_color(palette.text_primary)
+            .child(if covered { "" } else { "A live native view" })
+            .children(self.cover.backdrop())
+            .when(covered, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        // Over a picture, not a surface: a dark wash and
+                        // light text read on it in either scheme.
+                        .bg(gpui::hsla(0.0, 0.0, 0.0, 0.45))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(gpui::white())
+                        .child("Drawn over the still"),
+                )
+            });
+        card(
+            palette,
+            "Cover — a still of an embedded view, for drawing over",
+            row().child(view).child(div().w(px(160.0)).child(button(
+                "cover-take",
+                if covered {
+                    "Uncover"
+                } else if pending {
+                    "Taking a still…"
+                } else {
+                    "Cover with a still"
+                },
+                ButtonVariant::Soft,
+                !pending,
+                palette,
+                cx,
+                |this, window, cx| {
+                    if this.covered {
+                        this.covered = false;
+                        this.cover.clear();
+                        this.note("Live view shown again", cx);
+                        return;
+                    }
+                    let request = this.cover.request();
+                    this.note("Asked the view for a still", cx);
+                    cx.spawn_in(window, async move |this, cx| {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(400))
+                            .await;
+                        let _ = this.update(cx, |this, cx| {
+                            let bytes = Some(STILL.to_vec());
+                            if this
+                                .cover
+                                .deliver_bytes(request, bytes, gpui::ImageFormat::Png)
+                            {
+                                this.covered = true;
+                                this.note("Still arrived; view hidden", cx);
+                            }
+                        });
+                    })
+                    .detach();
+                },
+            ))),
+        )
+    }
+
+    /// Prompt, confirm, choose and alert in a window of their own, for a
+    /// host whose window has a native view over it. The answer comes back
+    /// through a callback with the `App`, from which the host reaches
+    /// itself.
     fn dialog_window_card(&mut self, palette: Palette, cx: &mut Context<Self>) -> Div {
         let host = cx.entity().downgrade();
         let note = move |text: String, cx: &mut App| {
@@ -2105,7 +2205,7 @@ impl Gallery {
         let (prompt_note, confirm_note, choose_note) = (note.clone(), note.clone(), note);
         card(
             palette,
-            "Dialog windows — a prompt, a confirmation or an alert above a native view",
+            "Dialog windows — a prompt, a confirmation, a choice or an alert above a native view",
             row()
                 .child(div().w(px(160.0)).child(button(
                     "dialog-window-prompt",
@@ -2209,47 +2309,39 @@ impl Gallery {
         )
     }
 
-    fn toast_button(&mut self, palette: Palette, cx: &mut Context<Self>) -> Option<Div> {
+    fn toast_button(&mut self, palette: Palette, cx: &mut Context<Self>) -> Div {
         let weak = cx.entity().downgrade();
-        Some(
-            div()
-                .relative()
-                .w(px(160.0))
-                .child(
-                    // Where the toast hangs from.
-                    gpui::canvas(
-                        move |bounds, _, cx| {
-                            if let Some(host) = weak.upgrade() {
-                                host.update(cx, |host, _| {
-                                    host.controls.measure("toast-anchor", bounds);
-                                });
-                            }
-                        },
-                        |_, _, _, _| {},
-                    )
-                    .absolute()
-                    .size_full(),
-                )
-                .child(button(
-                    "toast",
-                    "Show a toast",
-                    ButtonVariant::Soft,
-                    true,
-                    palette,
-                    cx,
-                    |this, window, cx| {
-                        if let Some(anchor) = this.controls.measured("toast-anchor") {
-                            vampir::hint::toast(
-                                this,
-                                "Copied to the clipboard",
-                                anchor,
-                                window,
-                                cx,
-                            );
+        div()
+            .relative()
+            .w(px(160.0))
+            .child(
+                // Where the toast hangs from.
+                gpui::canvas(
+                    move |bounds, _, cx| {
+                        if let Some(host) = weak.upgrade() {
+                            host.update(cx, |host, _| {
+                                host.controls.measure("toast-anchor", bounds);
+                            });
                         }
                     },
-                )),
-        )
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .child(button(
+                "toast",
+                "Show a toast",
+                ButtonVariant::Soft,
+                true,
+                palette,
+                cx,
+                |this, window, cx| {
+                    if let Some(anchor) = this.controls.measured("toast-anchor") {
+                        vampir::hint::toast(this, "Copied to the clipboard", anchor, window, cx);
+                    }
+                },
+            ))
     }
 
     fn render_dialog(

@@ -32,7 +32,7 @@ Every control animates its changes of state — the switch slides, the tick draw
 
 ## Containers — `vampir::containers`
 
-`tab_bar` (natural-width horizontal tabs, drag to reorder, optional close buttons, and a raised pill that slides to the active tab), `tab_bar_layout` with `TabBarLayout::{Horizontal, HorizontalUniform { width }, Vertical}`, `split_handle` + `split_area`, `collapsible` (unfolds to its measured height), `dialog` + `DialogButton`, and `dialog_window` for a prompt, a confirmation or an alert in a window of its own.
+`tab_bar` (natural-width horizontal tabs, drag to reorder, optional close buttons, and a raised pill that slides to the active tab), `tab_bar_layout` with `TabBarLayout::{Horizontal, HorizontalUniform { width }, Vertical}`, `split_handle` + `split_area`, `collapsible` (unfolds to its measured height), `dialog` + `DialogButton`, and `dialog_window` for a prompt, a confirmation, a choice or an alert in a window of its own.
 
 `HorizontalUniform` keeps each tab at the same width (clamped to 96–320), elides long labels, and scrolls sideways when the strip is full. Its close buttons stay at the same position within each tab as siblings close. `Vertical` fills the width its host gives it and scrolls down when its height is constrained. In every layout, tabs fade out into the well at an edge with more past it rather than being cut off there. Both layouts keep the same select, close and drag callbacks as `tab_bar`; arrow keys follow the layout's direction and bring the newly selected tab into view. A `Tab` is identified by its label unless `Tab::id` says otherwise, and everything the bar remembers about a tab follows that identity through a reorder. The gallery's Data page renders both dense horizontal and vertical bars over the same host-owned tabs.
 
@@ -43,6 +43,8 @@ Closing the final tab leaves the bar empty and returns keyboard focus to the roo
 `split_area` is the invisible probe that turns a pointer position into a fraction. Put it inside the element the two panes share; the divider will not work without it. `reorder` is what a host does with a finished tab drag: it moves the item and keeps the selection on the item it was on.
 
 `dialog` is opened with `ControlState::open_dialog` and renders nothing otherwise. It fades in, takes the keyboard, keeps Tab among its buttons, and closes itself — fading out, handing the keyboard back — from a button, Enter, Escape or the scrim, before the host's callback runs.
+
+![A prompt in a dialog window of its own, over the Data page](dialog-window.png)
 
 `dialog_window::prompt`, `confirm`, `choose` and `alert` are the same asks in a GPUI dialog window of their own — `choose` offering several buttons, the last of them primary, and answering with the chosen one's index — for a host whose window has a native view over it that would hide an in-window dialog. Each takes a title, a wrapping message and the name of the way to say yes, fits its height to what it holds, puts the keyboard in a prompt's field from the start, submits on Enter and cancels on Escape, and answers through a callback with the `App`, from which the host reaches its own entity. The gallery's Data page opens all four.
 
@@ -87,6 +89,10 @@ These are in-window menus drawn by the toolkit. The macOS menu bar is a differen
 ![A floating hint beside a tile on the Data page, with floating hints switched on](native-hint.png)
 
 `hinted(element, hint, side, ctx)` is the one call for either kind: it gives any `Stateful<Div>` a tooltip, or when the host has asked for floating hints with `ControlState::set_floating_hints(true)` — because a native view composited over the window would hide a tooltip drawn inside it, or cut one off at the edge — a hint in a pop-up window of its own that never takes the keyboard. The window shows after the pointer has rested for a moment, sits `HintSide::Below` or `HintSide::Right` of the element rather than under the pointer, is kept on the screen, and goes when the pointer leaves or the element is pressed; `hint::dismiss` takes it away when the host removes a hinted element from under the pointer. `hint::toast(view, text, anchor, window, cx)` is a passing message in the same kind of window, under an anchor the host measured, gone after a few seconds. The gallery's Data page has a switch between the two kinds and a toast.
+
+![The Data page's drawn view covered with a still, drawn over](cover.png)
+
+`Cover` is the bookkeeping for drawing over a native view, which nothing drawn inside the window can appear above: the host asks it for a request token, takes a still of the view however the view allows and delivers it with the token, shows `backdrop()` in the view's place, hides the view, and draws over the still; when the last thing drawn over it closes, `clear()` and the view comes back. A still that answers an older token — asked for before a switch, or before the overlay was opened again — is dropped, so what shows is never a still of a page that is no longer in front. `snapshot_width` is the width to ask a view for a still at, so a Retina or very large window still yields about one 1080p frame. The gallery's Data page covers a drawn box with the toolkit's own icon, delivered a moment after it is asked for, the way a web view's capture arrives.
 
 `command_palette` is opened with `ControlState::open_palette`, or `toggle_palette` from whatever shortcut the host gives it, and renders nothing otherwise. The host owns the query `TextInput` and the `Command`s; the palette filters them with `fuzzy_filter` as the query is typed, moves the highlight with Up and Down, runs the highlighted command on Enter or a clicked one, and closes on Escape or the scrim — handing the keyboard back where it was before the command runs.
 

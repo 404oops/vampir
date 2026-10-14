@@ -86,7 +86,8 @@ pub fn slowed(duration: Duration) -> Duration {
             .filter(|scale| scale.is_finite() && *scale > 0.0)
             .unwrap_or(1.0)
     });
-    duration.mul_f64(scale)
+    // A scale large enough to overflow slows nothing: better than a panic.
+    Duration::try_from_secs_f64(duration.as_secs_f64() * scale).unwrap_or(duration)
 }
 
 #[cfg(test)]

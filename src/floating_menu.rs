@@ -1144,12 +1144,12 @@ fn open_level<I: Clone + 'static>(
         });
         // Going inactive after having been active is the reader clicking
         // elsewhere, or switching away: the menu closes, as a native one
-        // would. A window that never takes the keyboard never activates,
-        // and its platform watch closes it instead.
+        // would. A window with a platform watch leaves that to the watch,
+        // which sees the click the window never gets.
         menu.update(cx, |menu, cx| {
             menu._activation = Some(cx.observe_window_activation(window, |this, window, cx| {
                 let active = window.is_window_active();
-                if this.was_active && !active {
+                if this.watch.is_none() && this.was_active && !active {
                     this.finish(None, window, cx);
                 }
                 this.was_active |= active;

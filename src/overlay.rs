@@ -94,7 +94,7 @@ impl From<SharedString> for Hint {
 }
 
 /// Where a hint sits relative to what it names: never under the pointer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum HintSide {
     Below,
     Right,
