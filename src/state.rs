@@ -561,6 +561,17 @@ pub struct ControlState {
     drag: Option<Drag>,
     /// A rendered tab bar changed axis while its drag was in flight.
     tab_drag_invalidated: Cell<bool>,
+
+    /// Whether hints are to be drawn in a window of their own, because a
+    /// native view over this one would hide a tooltip drawn inside it. See
+    /// [`crate::hinted`].
+    floating_hints: bool,
+    /// The hinted element the pointer is resting on, if any, and the wait
+    /// before its hint shows.
+    pub(crate) hint_key: Option<String>,
+    pub(crate) hint_timer: Option<gpui::Task<()>>,
+    /// The wait before a passing message goes away.
+    pub(crate) toast_timer: Option<gpui::Task<()>>,
 }
 
 impl Default for ControlState {
@@ -596,7 +607,21 @@ impl ControlState {
             ring_hidden: false,
             drag: None,
             tab_drag_invalidated: Cell::new(false),
+            floating_hints: false,
+            hint_key: None,
+            hint_timer: None,
+            toast_timer: None,
         }
+    }
+
+    /// Asks for hints in a window of their own, for a host with a native
+    /// view composited over its window. See [`crate::hinted`].
+    pub fn set_floating_hints(&mut self, floating: bool) {
+        self.floating_hints = floating;
+    }
+
+    pub fn floating_hints(&self) -> bool {
+        self.floating_hints
     }
 
     /// Microseconds since the state was made: the clock every record keeps

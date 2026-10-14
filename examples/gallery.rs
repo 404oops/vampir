@@ -11,9 +11,9 @@
 //! the menu bar and shortcuts a real application owns.
 
 use gpui::{
-    App, Bounds, Context, Entity, KeyBinding, Menu, MenuItem as OsMenuItem, Point, ScrollHandle,
-    SharedString, SystemMenuType, TitlebarOptions, Window, WindowBounds, WindowOptions, actions,
-    div, prelude::*, px, size,
+    App, Bounds, Context, Div, Entity, KeyBinding, Menu, MenuItem as OsMenuItem, Point,
+    ScrollHandle, SharedString, SystemMenuType, TitlebarOptions, Window, WindowBounds,
+    WindowOptions, actions, div, prelude::*, px, size,
 };
 use gpui_ce_platform::application;
 
@@ -21,17 +21,18 @@ use gpui_ce_platform::application;
 use vampir::AppIcon;
 use vampir::{
     BadgeTone, ButtonVariant, CARD_LIFT, CONTROL_HEIGHT, ChipSelection, Choice, Chord, Column,
-    ComboId, Command, ControlHost, ControlState, DialogButton, Hint, InputStyle, ListSelection,
-    MAX_CHROMA, MenuItem, Oklch, Palette, Scheme, ScrollAxis, SearchResult, SelectionIntent,
-    SliderTrack, SortDirection, Span, TEXT_SIZE, TITLE_TEXT_SIZE, Tab, TabBarLayout, TextInput,
-    Theme, TreeRow, WidgetContext, arriving, badge, bind_keys, button, caption, card, card_at,
-    checkbox, chip_group, collapsible, color_pad, column, combo, command_palette, context_menu,
-    dialog, edit_menu, fading_text, flatten_tree, glyph, ground, hue_picker, hue_slider, hue_wheel,
-    icon_button, labelled, lit, lit_stops, menu_button, menu_target, progress_bar, radio_group,
-    rank_results, ranked_command_palette, ranked_search_list, reorder, row, saturation_picker,
-    scheme_picker, scroll_area, search_list, segmented, selectable_list, separator,
-    shortcut_recorder, slider, spinbox, spinner, split_area, split_handle, swatch_grid, switch,
-    tab_bar, tab_bar_layout, table_header, table_row, text_area, text_field, tree_row, ui_font,
+    ComboId, Command, ControlHost, ControlState, DialogButton, Hint, HintSide, InputStyle,
+    ListSelection, MAX_CHROMA, MenuItem, Oklch, Palette, Scheme, ScrollAxis, SearchResult,
+    SelectionIntent, SliderTrack, SortDirection, Span, TEXT_SIZE, TITLE_TEXT_SIZE, Tab,
+    TabBarLayout, TextInput, Theme, TreeRow, WidgetContext, arriving, badge, bind_keys, button,
+    caption, card, card_at, checkbox, chip_group, collapsible, color_pad, column, combo,
+    command_palette, context_menu, dialog, edit_menu, fading_text, flatten_tree, glyph, ground,
+    hinted, hue_picker, hue_slider, hue_wheel, icon_button, labelled, lit, lit_stops, menu_button,
+    menu_target, progress_bar, radio_group, rank_results, ranked_command_palette,
+    ranked_search_list, reorder, row, saturation_picker, scheme_picker, scroll_area, search_list,
+    segmented, selectable_list, separator, shortcut_recorder, slider, spinbox, spinner, split_area,
+    split_handle, swatch_grid, switch, tab_bar, tab_bar_layout, table_header, table_row, text_area,
+    text_field, tree_row, ui_font,
 };
 
 // The gallery is also the smallest complete *macOS* host, so it carries the
@@ -223,6 +224,8 @@ struct Gallery {
     details_open: bool,
     selection: ListSelection,
     last_action: SharedString,
+    /// What the floating menu's checked row toggles.
+    pinned: bool,
 
     // Colour page.
     colour: Oklch,
@@ -478,6 +481,7 @@ impl Gallery {
             details_open: true,
             selection: ListSelection::new(),
             last_action: "—".into(),
+            pinned: true,
             colour: Oklch::new(268.0, 0.11, 0.62),
             palette_query,
             commands: vec![
@@ -1468,6 +1472,9 @@ impl Gallery {
         .h(px(196.0));
 
         column()
+            .children(self.floating_menu_card(palette, cx))
+            .child(self.hint_card(palette, cx))
+            .child(self.dialog_window_card(palette, cx))
             .child(card(
                 palette,
                 "Tabs — scroll sideways, close repeatedly, drag to reorder",
@@ -1719,17 +1726,33 @@ impl Gallery {
     }
 }
 
+/// A menu icon drawn from a glyph, for rows that carry one.
+fn glyph_icon(character: &'static str) -> vampir::MenuIcon {
+    vampir::MenuIcon::new(move |size, color| {
+        glyph(character)
+            .text_size(px(size * 0.85))
+            .text_color(color)
+            .into_any_element()
+    })
+}
+
 // ---- Overlays ---------------------------------------------------------------
 
 impl Gallery {
     fn row_menu(&self) -> Vec<MenuItem> {
         vec![
             MenuItem::header(self.controls.menu_target().unwrap_or("Item").to_string()),
-            MenuItem::action("open", "Open").shortcut("⏎"),
-            MenuItem::action("rename", "Rename").shortcut("F2"),
+            MenuItem::action("open", "Open")
+                .shortcut("⏎")
+                .icon(glyph_icon("▣")),
+            MenuItem::action("rename", "Rename")
+                .shortcut("F2")
+                .icon(glyph_icon("✎")),
             MenuItem::separator(),
             MenuItem::action("pin", "Pin to top").checked(true),
-            MenuItem::action("reveal", "Show in folder").disabled(),
+            MenuItem::action("reveal", "Show in folder")
+                .disabled()
+                .icon(glyph_icon("▤")),
             MenuItem::submenu(
                 "Organize",
                 vec![
@@ -1744,7 +1767,10 @@ impl Gallery {
                 ],
             ),
             MenuItem::separator(),
-            MenuItem::action("delete", "Delete").shortcut("⌫").danger(),
+            MenuItem::action("delete", "Delete")
+                .shortcut("⌫")
+                .danger()
+                .icon(glyph_icon("✕")),
         ]
     }
 
@@ -1771,6 +1797,459 @@ impl Gallery {
             MenuItem::action("palette", "Command palette…")
                 .shortcut(vampir::display("secondary-k")),
         ]
+    }
+
+    /// A menu in a pop-up window of its own, for a host whose window has a
+    /// native view over it. The rows are the same `MenuItem`s the in-window
+    /// menu takes, here with the host's own command type as their ids.
+    fn floating_menu_card(&mut self, palette: Palette, cx: &mut Context<Self>) -> Option<Div> {
+        use vampir::floating_menu;
+
+        #[derive(Clone, Copy, Debug)]
+        enum Pick {
+            Open,
+            OpenInWindow,
+            Pin,
+            Reveal,
+            MoveTo(&'static str),
+            Delete,
+        }
+
+        fn items(pinned: bool) -> Vec<MenuItem<Pick>> {
+            vec![
+                MenuItem::action(Pick::Open, "Open")
+                    .shortcut("⏎")
+                    .icon(glyph_icon("▣")),
+                MenuItem::action(Pick::OpenInWindow, "Open in New Window").icon(glyph_icon("⧉")),
+                MenuItem::separator(),
+                MenuItem::action(Pick::Pin, "Pinned")
+                    .checked(pinned)
+                    .icon(glyph_icon("★")),
+                MenuItem::action(Pick::Reveal, "Show in Folder")
+                    .disabled()
+                    .icon(glyph_icon("▤")),
+                MenuItem::submenu(
+                    "Move to",
+                    vec![
+                        MenuItem::header("Folders"),
+                        MenuItem::action(Pick::MoveTo("Documents"), "Documents"),
+                        MenuItem::action(Pick::MoveTo("Images"), "Images"),
+                        MenuItem::separator(),
+                        MenuItem::action(
+                            Pick::MoveTo("Archive"),
+                            "A folder with a much longer name than the rest",
+                        ),
+                    ],
+                )
+                .icon(glyph_icon("▥")),
+                MenuItem::separator(),
+                MenuItem::action(Pick::Delete, "Delete")
+                    .shortcut("⌫")
+                    .danger()
+                    .icon(glyph_icon("✕")),
+            ]
+        }
+
+        let open = move |above: bool| {
+            move |this: &mut Gallery, window: &mut Window, cx: &mut Context<Gallery>| {
+                let items = items(this.pinned);
+                let host = cx.entity().downgrade();
+                let on_choice = move |choice: Option<Pick>, _window: &mut Window, cx: &mut App| {
+                    let Some(host) = host.upgrade() else {
+                        return;
+                    };
+                    host.update(cx, |this, cx| match choice {
+                        Some(Pick::Pin) => {
+                            this.pinned = !this.pinned;
+                            this.note(if this.pinned { "Pinned" } else { "Unpinned" }, cx);
+                        }
+                        Some(Pick::MoveTo(folder)) => {
+                            this.note(format!("Floating menu: move to {folder}"), cx)
+                        }
+                        Some(pick) => this.note(format!("Floating menu: {pick:?}"), cx),
+                        None => this.note("Floating menu dismissed", cx),
+                    });
+                };
+                let at = window.mouse_position();
+                if above {
+                    floating_menu::open_above_with(cx, window, at, items, palette, on_choice);
+                } else {
+                    floating_menu::open_with(cx, window, at, items, palette, on_choice);
+                }
+            }
+        };
+        Some(card(
+            palette,
+            "Floating menu — a window of its own, above a native view",
+            row()
+                .child(div().w(px(180.0)).child(button(
+                    "floating-menu",
+                    "Open at the pointer",
+                    ButtonVariant::Soft,
+                    true,
+                    palette,
+                    cx,
+                    open(false),
+                )))
+                .child(div().w(px(180.0)).child(button(
+                    "floating-menu-above",
+                    "Open upward",
+                    ButtonVariant::Soft,
+                    true,
+                    palette,
+                    cx,
+                    open(true),
+                )))
+                .children(self.native_menu_button(palette, cx))
+                .child(
+                    div().text_color(palette.text_secondary).child(
+                        "Arrows walk it, Enter runs a row, letters find one, Escape closes.",
+                    ),
+                ),
+        ))
+    }
+
+    /// The button that adopts an AppKit menu: only where there is AppKit.
+    #[cfg(all(target_os = "macos", feature = "native"))]
+    fn native_menu_button(&mut self, palette: Palette, cx: &mut Context<Self>) -> Option<Div> {
+        Some(div().w(px(180.0)).child(button(
+            "native-menu",
+            "Adopt an AppKit menu",
+            ButtonVariant::Soft,
+            true,
+            palette,
+            cx,
+            Self::open_native_menu,
+        )))
+    }
+
+    #[cfg(not(all(target_os = "macos", feature = "native")))]
+    fn native_menu_button(&mut self, _palette: Palette, _cx: &mut Context<Self>) -> Option<Div> {
+        None
+    }
+
+    /// An `NSMenu` a native view might propose, adopted as the toolkit's
+    /// rows and shown in the floating menu; choosing a row runs the
+    /// AppKit action behind it, which here reports back through a note.
+    #[cfg(all(target_os = "macos", feature = "native"))]
+    fn open_native_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use objc2::rc::Retained;
+        use objc2::runtime::AnyObject;
+        use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
+        use objc2_app_kit::{NSMenu, NSMenuItem};
+        use objc2_foundation::{NSObject, NSObjectProtocol, NSString};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use vampir::{NativeMenu, floating_menu};
+
+        define_class!(
+            #[unsafe(super(NSObject))]
+            #[thread_kind = MainThreadOnly]
+            #[ivars = Rc<RefCell<Option<String>>>]
+            struct Ran;
+            unsafe impl NSObjectProtocol for Ran {}
+            impl Ran {
+                #[unsafe(method(selected:))]
+                fn selected(&self, sender: &AnyObject) {
+                    let item: &NSMenuItem = unsafe { &*(sender as *const AnyObject).cast() };
+                    *self.ivars().borrow_mut() = Some(item.title().to_string());
+                }
+            }
+        );
+
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let ran = Rc::new(RefCell::new(None));
+        let target = Ran::alloc(mtm).set_ivars(ran.clone());
+        let target: Retained<Ran> = unsafe { msg_send![super(target), init] };
+        let menu = NSMenu::new(mtm);
+        menu.setAutoenablesItems(false);
+        let row = |title: &str, enabled: bool| {
+            let item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &NSString::from_str(title),
+                    Some(sel!(selected:)),
+                    &NSString::from_str(""),
+                )
+            };
+            unsafe { item.setTarget(Some(&target)) };
+            item.setEnabled(enabled);
+            item
+        };
+        menu.addItem(&row("Back", false));
+        menu.addItem(&row("Reload", true));
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        let speech = NSMenu::new(mtm);
+        speech.setAutoenablesItems(false);
+        speech.addItem(&row("Start Speaking", true));
+        speech.addItem(&row("Stop Speaking", false));
+        let parent = row("Speech", true);
+        parent.setSubmenu(Some(&speech));
+        menu.addItem(&parent);
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        menu.addItem(&row("Inspect Element", true));
+        let adopted = NativeMenu::adopt(&menu, |item| {
+            (item.title().to_string() == "Reload").then(|| glyph_icon("↻"))
+        });
+        let host = cx.entity().downgrade();
+        let palette = self.controls.palette();
+        floating_menu::open_with(
+            cx,
+            window,
+            window.mouse_position(),
+            adopted.items().to_vec(),
+            palette,
+            move |choice, _window, cx| {
+                let Some(host) = host.upgrade() else {
+                    return;
+                };
+                let ran = match choice {
+                    Some(id) if adopted.run(id) => ran.borrow_mut().take(),
+                    _ => None,
+                };
+                drop(target);
+                host.update(cx, |this, cx| match ran {
+                    Some(title) => this.note(format!("AppKit ran {title}"), cx),
+                    None => this.note("AppKit menu dismissed", cx),
+                });
+            },
+        );
+    }
+
+    /// Hints that survive a native view over the window: the same `hinted`
+    /// call draws a tooltip, or with floating hints on, a window beside the
+    /// element. The toast is a passing message in a window of its own.
+    fn hint_card(&mut self, palette: Palette, cx: &mut Context<Self>) -> Div {
+        let tile = |id: &'static str,
+                    character: &'static str,
+                    hint: Hint,
+                    side: HintSide,
+                    this: &mut Self,
+                    cx: &mut Context<Self>| {
+            hinted(
+                div()
+                    .id(id)
+                    .size(px(CONTROL_HEIGHT))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(vampir::CONTROL_RADIUS))
+                    .bg(lit(palette.control_fill, 0.05))
+                    .border_1()
+                    .border_color(palette.field_border)
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(lit(palette.control_fill, 0.09)))
+                    .child(glyph(character)),
+                hint,
+                side,
+                WidgetContext::new(palette, this, cx),
+            )
+        };
+        let native = self.controls.floating_hints();
+        card(
+            palette,
+            "Hints — a tooltip, or a window of its own beside a native view",
+            row()
+                .gap(px(16.0))
+                .child(switch(
+                    "floating-hints",
+                    native,
+                    Some("Floating hints"),
+                    true,
+                    WidgetContext::new(palette, self, cx),
+                    |this, on, _window, cx| {
+                        this.controls.set_floating_hints(on);
+                        cx.notify();
+                    },
+                ))
+                .child(tile(
+                    "hint-open",
+                    "▣",
+                    Hint::new("Open"),
+                    HintSide::Below,
+                    self,
+                    cx,
+                ))
+                .child(tile(
+                    "hint-star",
+                    "★",
+                    Hint::new("Favourite").shortcut(vampir::display("secondary-d")),
+                    HintSide::Below,
+                    self,
+                    cx,
+                ))
+                .child(tile(
+                    "hint-folder",
+                    "▤",
+                    Hint::new("Show in folder"),
+                    HintSide::Right,
+                    self,
+                    cx,
+                ))
+                .children(self.toast_button(palette, cx)),
+        )
+    }
+
+    /// Prompt, confirm and alert in a window of their own, for a host whose
+    /// window has a native view over it. The answer comes back through a
+    /// callback with the `App`, from which the host reaches itself.
+    fn dialog_window_card(&mut self, palette: Palette, cx: &mut Context<Self>) -> Div {
+        let host = cx.entity().downgrade();
+        let note = move |text: String, cx: &mut App| {
+            if let Some(host) = host.upgrade() {
+                host.update(cx, |this, cx| this.note(text, cx));
+            }
+        };
+        let (prompt_note, confirm_note, choose_note) = (note.clone(), note.clone(), note);
+        card(
+            palette,
+            "Dialog windows — a prompt, a confirmation or an alert above a native view",
+            row()
+                .child(div().w(px(160.0)).child(button(
+                    "dialog-window-prompt",
+                    "Ask for a name",
+                    ButtonVariant::Soft,
+                    true,
+                    palette,
+                    cx,
+                    move |_this, _window, cx| {
+                        let note = prompt_note.clone();
+                        vampir::dialog_window::prompt(
+                            cx,
+                            palette,
+                            "New Folder",
+                            "A folder on the desktop, which you can rename later.",
+                            "Untitled Folder",
+                            "Create",
+                            move |answer, cx| {
+                                note(
+                                    match answer {
+                                        Some(name) => format!("Folder named {name:?}"),
+                                        None => "Prompt cancelled".to_string(),
+                                    },
+                                    cx,
+                                )
+                            },
+                        );
+                    },
+                )))
+                .child(div().w(px(160.0)).child(button(
+                    "dialog-window-confirm",
+                    "Confirm something",
+                    ButtonVariant::Soft,
+                    true,
+                    palette,
+                    cx,
+                    move |_this, _window, cx| {
+                        let note = confirm_note.clone();
+                        vampir::dialog_window::confirm(
+                            cx,
+                            palette,
+                            "Clear browsing history?",
+                            "Every page you have visited is forgotten. Bookmarks and downloads stay.",
+                            "Clear History",
+                            move |accepted, cx| {
+                                note(
+                                    if accepted { "History cleared" } else { "Kept the history" }
+                                        .to_string(),
+                                    cx,
+                                )
+                            },
+                        );
+                    },
+                )))
+                .child(div().w(px(160.0)).child(button(
+                    "dialog-window-choose",
+                    "Offer three ways",
+                    ButtonVariant::Soft,
+                    true,
+                    palette,
+                    cx,
+                    move |_this, _window, cx| {
+                        let note = choose_note.clone();
+                        vampir::dialog_window::choose(
+                            cx,
+                            palette,
+                            "Allow this site to use your camera?",
+                            "A saved choice can be changed from the site's icon in the address bar.",
+                            vec!["Block".into(), "Allow Once".into(), "Allow Always".into()],
+                            move |answer, cx| {
+                                note(
+                                    match answer {
+                                        Some(0) => "Camera blocked".to_string(),
+                                        Some(1) => "Camera allowed once".to_string(),
+                                        Some(_) => "Camera allowed always".to_string(),
+                                        None => "Camera prompt cancelled".to_string(),
+                                    },
+                                    cx,
+                                )
+                            },
+                        );
+                    },
+                )))
+                .child(div().w(px(160.0)).child(button(
+                    "dialog-window-alert",
+                    "Show an alert",
+                    ButtonVariant::Soft,
+                    true,
+                    palette,
+                    cx,
+                    move |this, _window, cx| {
+                        this.note("Alert shown", cx);
+                        vampir::dialog_window::alert(
+                            cx,
+                            palette,
+                            "Couldn't create the download folder",
+                            "The disk is full, or the folder is somewhere you cannot write.",
+                        );
+                    },
+                ))),
+        )
+    }
+
+    fn toast_button(&mut self, palette: Palette, cx: &mut Context<Self>) -> Option<Div> {
+        let weak = cx.entity().downgrade();
+        Some(
+            div()
+                .relative()
+                .w(px(160.0))
+                .child(
+                    // Where the toast hangs from.
+                    gpui::canvas(
+                        move |bounds, _, cx| {
+                            if let Some(host) = weak.upgrade() {
+                                host.update(cx, |host, _| {
+                                    host.controls.measure("toast-anchor", bounds);
+                                });
+                            }
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+                .child(button(
+                    "toast",
+                    "Show a toast",
+                    ButtonVariant::Soft,
+                    true,
+                    palette,
+                    cx,
+                    |this, window, cx| {
+                        if let Some(anchor) = this.controls.measured("toast-anchor") {
+                            vampir::hint::toast(
+                                this,
+                                "Copied to the clipboard",
+                                anchor,
+                                window,
+                                cx,
+                            );
+                        }
+                    },
+                )),
+        )
     }
 
     fn render_dialog(

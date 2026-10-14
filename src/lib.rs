@@ -38,14 +38,20 @@ pub mod color;
 pub mod containers;
 pub mod controls;
 pub mod data;
+pub mod dialog_window;
 pub mod easing;
+pub mod floating_menu;
+pub mod hint;
 #[cfg(feature = "app-icon")]
 pub mod icon;
 pub mod keyboard;
 pub mod lighting;
 pub mod menu;
+#[cfg(all(target_os = "macos", feature = "native"))]
+pub mod native;
 pub mod overlay;
 pub mod palette;
+pub mod popup;
 pub mod scroll;
 pub mod selection;
 pub mod shortcut;
@@ -69,7 +75,7 @@ pub use data::{
     Column, SortDirection, TABLE_ROW_HEIGHT, TreeMove, TreeRow, flatten_tree, table_cell,
     table_header, table_row, tree_row, tree_step,
 };
-pub use easing::{ease_in_cubic, ease_out_cubic, modal_opacity};
+pub use easing::{ease_in_cubic, ease_out_cubic, modal_opacity, slowed};
 #[cfg(feature = "app-icon")]
 pub use icon::AppIcon;
 pub use keyboard::{
@@ -79,10 +85,17 @@ pub use keyboard::{
 pub use lighting::{
     glow, ground, ground_at, lit, lit_at, lit_mix, lit_stops, panel, raised, recessed, rim, shade,
 };
-pub use menu::{ContextMenu, MenuAction, MenuItem, context_menu, menu_button, menu_target};
+pub use menu::{
+    ContextMenu, MenuAction, MenuIcon, MenuItem, context_menu, menu_button, menu_target,
+};
+#[cfg(all(target_os = "macos", feature = "native"))]
+pub use native::{
+    ns_menu::{NativeAction, NativeMenu},
+    ns_window_of,
+};
 pub use overlay::{
-    Command, Hint, SearchResult, Tooltip, command_list, command_palette, fuzzy_filter, fuzzy_score,
-    rank_results, ranked_command_palette, ranked_search_list, search_list,
+    Command, Hint, HintSide, SearchResult, Tooltip, command_list, command_palette, fuzzy_filter,
+    fuzzy_score, hinted, rank_results, ranked_command_palette, ranked_search_list, search_list,
 };
 pub use palette::{DEFAULT_SATURATION, MAX_SATURATION, Palette};
 pub use scroll::{SCROLL_FADE, ScrollAxis, ScrollDrag, apply_scroll_drag, scroll_fades};
