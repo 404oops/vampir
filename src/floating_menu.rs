@@ -1031,6 +1031,20 @@ impl<I: Clone + 'static> Render for Menu<I> {
             .on_action(cx.listener(|this, _: &keyboard::Dismiss, window, cx| {
                 this.key(Key::Dismiss, window, cx);
             }))
+            // Tab and Shift-Tab are bound by the root to moving focus, and
+            // a binding is matched before the key reaches the listener
+            // above: caught here, they close the menu as any other key it
+            // has no use for does.
+            .capture_action(cx.listener(|this, _: &keyboard::FocusNext, window, cx| {
+                cx.stop_propagation();
+                this.signal(Signal::Close, window, cx);
+            }))
+            .capture_action(
+                cx.listener(|this, _: &keyboard::FocusPrevious, window, cx| {
+                    cx.stop_propagation();
+                    this.signal(Signal::Close, window, cx);
+                }),
+            )
             .child(panel);
         if self.controls.animating() {
             window.request_animation_frame();

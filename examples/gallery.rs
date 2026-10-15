@@ -1762,7 +1762,9 @@ impl Gallery {
                 .shortcut("F2")
                 .icon(glyph_icon("✎")),
             MenuItem::separator(),
-            MenuItem::action("pin", "Pin to top").checked(true),
+            MenuItem::action("pin", "Pin to top")
+                .checked(true)
+                .icon(glyph_icon("★")),
             MenuItem::action("reveal", "Show in folder")
                 .disabled()
                 .icon(glyph_icon("▤")),

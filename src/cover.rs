@@ -26,7 +26,10 @@
 
 use std::sync::Arc;
 
-use gpui::{AnyElement, App, Image, ImageFormat, ImageSource, ObjectFit, Window, img, prelude::*};
+use gpui::{
+    AnyElement, App, Image, ImageFormat, ImageSource, ImgResourceLoader, ObjectFit, Window, img,
+    prelude::*,
+};
 
 /// One request for a still: handed to whoever takes it, and handed back
 /// with the still, so an answer to an earlier request can be told from the
@@ -133,9 +136,23 @@ impl Cover {
     /// Call it while drawing, where there is a window to free them from;
     /// a still still showing is never touched.
     pub fn release(&mut self, window: &mut Window, cx: &mut App) {
-        for still in self.let_go.drain(..) {
-            match still {
-                ImageSource::Render(image) => cx.drop_image(image, Some(window)),
+        let mut freed: Vec<ImageSource> = Vec::new();
+        for still in std::mem::take(&mut self.let_go) {
+            // GPUI names an encoded image by its bytes and a path by the
+            // path, so a still let go of can be the very image showing (an
+            // unchanged page captured again), or one already freed this
+            // call. Freeing it would blank what shows, or decode it again
+            // only to free it.
+            if self
+                .still
+                .iter()
+                .chain(&freed)
+                .any(|kept| same_image(kept, &still))
+            {
+                continue;
+            }
+            match &still {
+                ImageSource::Render(image) => cx.drop_image(image.clone(), Some(window)),
                 // An encoded still is decoded into GPUI's asset cache, and
                 // what the GPU holds is the decoded image's: forgetting the
                 // cache entry alone would leave the texture behind.
@@ -143,10 +160,18 @@ impl Cover {
                     if let Some(decoded) = image.clone().get_render_image(window, cx) {
                         cx.drop_image(decoded, Some(window));
                     }
-                    image.remove_asset(cx);
+                    still.remove_asset(cx);
                 }
-                other => other.remove_asset(cx),
+                // A path or a URI is decoded into the cache the same way.
+                ImageSource::Resource(resource) => {
+                    if let Some(Ok(decoded)) = window.get_asset::<ImgResourceLoader>(resource, cx) {
+                        cx.drop_image(decoded, Some(window));
+                    }
+                    still.remove_asset(cx);
+                }
+                ImageSource::Custom(_) => {}
             }
+            freed.push(still);
         }
     }
 
@@ -154,6 +179,19 @@ impl Cover {
     #[cfg(test)]
     fn let_go(&self) -> usize {
         self.let_go.len()
+    }
+}
+
+/// Whether two stills come to the same image on the GPU: GPUI caches an
+/// encoded image under its bytes' hash and a resource under its location,
+/// so two sources that are not the same value can still share a texture.
+fn same_image(a: &ImageSource, b: &ImageSource) -> bool {
+    match (a, b) {
+        (ImageSource::Render(a), ImageSource::Render(b)) => a.id == b.id,
+        (ImageSource::Image(a), ImageSource::Image(b)) => a.id() == b.id(),
+        (ImageSource::Resource(a), ImageSource::Resource(b)) => a == b,
+        (ImageSource::Custom(a), ImageSource::Custom(b)) => Arc::ptr_eq(a, b),
+        _ => false,
     }
 }
 
@@ -222,6 +260,21 @@ mod tests {
         cover.clear();
         assert_eq!(cover.let_go(), 2);
         assert!(cover.still().is_none());
+    }
+
+    #[test]
+    fn an_identical_capture_is_the_same_image() {
+        let still = |bytes: Vec<u8>| {
+            ImageSource::from(Arc::new(Image::from_bytes(ImageFormat::Png, bytes)))
+        };
+        // The page did not change between captures: separate values, one
+        // cache entry, and freeing the old would free what shows.
+        assert!(same_image(&still(vec![1, 2]), &still(vec![1, 2])));
+        assert!(!same_image(&still(vec![1, 2]), &still(vec![3])));
+        let path = |name: &str| ImageSource::from(std::path::PathBuf::from(name));
+        assert!(same_image(&path("/tmp/a.png"), &path("/tmp/a.png")));
+        assert!(!same_image(&path("/tmp/a.png"), &path("/tmp/b.png")));
+        assert!(!same_image(&path("/tmp/a.png"), &still(vec![1])));
     }
 
     #[test]

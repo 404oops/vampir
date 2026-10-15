@@ -900,6 +900,10 @@ fn sizing_row<I>(item: &MenuItem<I>, icons: bool) -> Option<gpui::AnyElement> {
                 row.child(div().w(px(12.0)).flex_none())
             })
             .child(action.label.clone())
+            // The tick after the label of a checked row with an icon.
+            .when(action.checked && icons && action.icon.is_some(), |row| {
+                row.child(div().w(px(12.0)).flex_none())
+            })
             .children(
                 action
                     .shortcut
@@ -1204,12 +1208,12 @@ fn render_item<V: ControlHost, I: Clone + 'static>(
                 .when(icons, |el| {
                     el.child(icon_slot(action.icon.as_ref(), checked, label_color))
                 })
+                .child(div().flex_1().overflow_hidden().child(action.label))
                 // A checked row that also has an icon shows its tick after
                 // the label, where the floating menu puts every tick.
                 .when(checked && icons && action.icon.is_some(), move |el| {
                     el.child(tick_mark(tick))
                 })
-                .child(div().flex_1().overflow_hidden().child(action.label))
                 .children(action.shortcut.map(|shortcut| {
                     div()
                         .flex_none()

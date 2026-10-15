@@ -264,12 +264,26 @@ fn place(
         ),
     };
     if let Some(screen) = screen {
+        let right = screen.origin.x + screen.size.width - SCREEN_MARGIN;
+        let bottom = screen.origin.y + screen.size.height - SCREEN_MARGIN;
+        // Slid back onto the screen, a hint that runs off it on the side it
+        // was put would land on what it names, under the pointer: off macOS
+        // its window takes the pointer, the host sees it leave, and the
+        // hint goes and comes back for as long as it rests there. It goes
+        // on the other side instead.
+        match side {
+            HintSide::Below if y + height > bottom => {
+                y = frame.y + anchor.origin.y - GAP - height;
+            }
+            HintSide::Right if x + width > right => {
+                x = frame.x + anchor.origin.x - SIDE_GAP - width;
+            }
+            _ => {}
+        }
         // Not `clamp`, which panics on a hint wider than the screen: that
         // one keeps its start on the screen and runs off the far side.
-        x = x
-            .min(screen.origin.x + screen.size.width - width - SCREEN_MARGIN)
-            .max(screen.origin.x + SCREEN_MARGIN);
-        y = y.min(screen.origin.y + screen.size.height - height - SCREEN_MARGIN);
+        x = x.min(right - width).max(screen.origin.x + SCREEN_MARGIN);
+        y = y.min(bottom - height).max(screen.origin.y + SCREEN_MARGIN);
     }
     point(x, y)
 }
@@ -367,6 +381,7 @@ fn show_in(
         is_movable: false,
         ..Default::default()
     };
+    let was_active = window.is_window_active();
     if let Ok(handle) = cx.open_window(options, |_, cx| cx.new(|_| Panel { text, palette })) {
         let host = window.window_handle().window_id();
         slot.with(|slot| {
@@ -378,7 +393,11 @@ fn show_in(
         // The new window must not take the keyboard from the host's: a
         // platform that gives it to the newest window gets it back, so the
         // host's next click is a click and not the one that focuses it.
-        window.activate_window();
+        // Only a host that had the keyboard: the pointer resting on a
+        // window behind another must not bring it to the front.
+        if was_active {
+            window.activate_window();
+        }
     }
 }
 
@@ -414,10 +433,27 @@ mod tests {
         let edge = bounds(360.0, 10.0, 40.0, 20.0);
         let at = place(frame, edge, (120.0, 24.0), HintSide::Below, screen);
         assert_eq!(at.x, 400.0 - 120.0 - SCREEN_MARGIN);
-        // Below a control at the bottom: kept above the screen's bottom.
+        // Below a control at the bottom: put above it, not pushed up
+        // over it.
         let low = bounds(10.0, 290.0, 40.0, 10.0);
         let at = place(frame, low, (120.0, 24.0), HintSide::Below, screen);
-        assert_eq!(at.y, 300.0 - 24.0 - SCREEN_MARGIN);
+        assert_eq!(at.y, 290.0 - GAP - 24.0);
+    }
+
+    #[test]
+    fn a_hint_with_no_room_on_its_side_goes_on_the_other() {
+        let frame = point(0.0, 0.0);
+        let screen = Some(bounds(0.0, 0.0, 400.0, 300.0));
+        // Beside a control at the right edge: put to its left, not slid
+        // over it.
+        let edge = bounds(340.0, 100.0, 40.0, 20.0);
+        let at = place(frame, edge, (120.0, 24.0), HintSide::Right, screen);
+        assert_eq!(at.x, 340.0 - SIDE_GAP - 120.0);
+        assert!(at.x + 120.0 <= edge.origin.x);
+        // Room enough: where it was asked for.
+        let middle = bounds(100.0, 100.0, 40.0, 20.0);
+        let at = place(frame, middle, (120.0, 24.0), HintSide::Right, screen);
+        assert_eq!(at.x, 140.0 + SIDE_GAP);
     }
 
     #[test]
