@@ -561,6 +561,15 @@ pub struct ControlState {
     drag: Option<Drag>,
     /// A rendered tab bar changed axis while its drag was in flight.
     tab_drag_invalidated: Cell<bool>,
+
+    /// Whether hints are to be drawn in a window of their own, because a
+    /// native view over this one would hide a tooltip drawn inside it. See
+    /// [`crate::hinted`].
+    floating_hints: bool,
+    /// The hinted element the pointer is resting on, if any, and the wait
+    /// before its hint shows.
+    pub(crate) hint_key: Option<Tag>,
+    pub(crate) hint_timer: Option<gpui::Task<()>>,
 }
 
 impl Default for ControlState {
@@ -596,7 +605,20 @@ impl ControlState {
             ring_hidden: false,
             drag: None,
             tab_drag_invalidated: Cell::new(false),
+            floating_hints: false,
+            hint_key: None,
+            hint_timer: None,
         }
+    }
+
+    /// Asks for hints in a window of their own, for a host with a native
+    /// view composited over its window. See [`crate::hinted`].
+    pub fn set_floating_hints(&mut self, floating: bool) {
+        self.floating_hints = floating;
+    }
+
+    pub fn floating_hints(&self) -> bool {
+        self.floating_hints
     }
 
     /// Microseconds since the state was made: the clock every record keeps
@@ -2085,8 +2107,16 @@ pub fn mouse_moved<V: ControlHost>(
 /// from the root. Put it on every `.occlude()`d surface too, because an
 /// occluding panel swallows the move stream a drag underneath it depends
 /// on. [`crate::root`] is this and [`crate::handle_keys`] together.
+///
+/// It also closes a floating menu on a press anywhere else in the app.
+/// The menu otherwise learns of such a press by losing the keyboard, and
+/// an X11 window manager that still counts the host window as focused
+/// hands nothing back when it is clicked.
 pub fn handle_mouse<E: InteractiveElement, V: ControlHost>(root: E, cx: &mut Context<V>) -> E {
-    root.on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+    root.capture_any_mouse_down(|_, window, cx| {
+        crate::floating_menu::dismiss_open_elsewhere(window, cx)
+    })
+    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
         if mouse_moved(this, event, cx) {
             cx.notify();
         }

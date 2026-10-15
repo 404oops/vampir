@@ -72,6 +72,24 @@ pub(crate) fn modal_opacity_at(
     }
 }
 
+/// `duration` at the slow-motion scale `VAMPIR_SLOW_MOTION` names, for a
+/// GPUI [`Animation`](gpui::Animation) rather than a control's tween:
+/// [`ControlState::scaled`](crate::ControlState::scaled) is the same
+/// scale for those, and a window with no control state of its own — a
+/// floating menu, a dialog — reads it here so it slows down with the rest.
+pub fn slowed(duration: Duration) -> Duration {
+    static SCALE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    let scale = *SCALE.get_or_init(|| {
+        std::env::var("VAMPIR_SLOW_MOTION")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|scale| scale.is_finite() && *scale > 0.0)
+            .unwrap_or(1.0)
+    });
+    // A scale large enough to overflow slows nothing: better than a panic.
+    Duration::try_from_secs_f64(duration.as_secs_f64() * scale).unwrap_or(duration)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

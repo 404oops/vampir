@@ -1,6 +1,6 @@
 # Vampir repository guide
 
-Vampir is a widget toolkit for [GPUI](https://www.gpui.rs). It is a plain library crate with no application inside it: `gpui` and `unicode-segmentation` are the only dependencies, and it builds anywhere GPUI does. `gpui` is the crates.io [gpui-ce](https://github.com/gpui-ce/gpui-ce) release (the community edition of GPUI, Apache-2.0, notice in `THIRD_PARTY.md`) renamed in `Cargo.toml`; do not change it back to a git dependency, that is what makes the crate publishable.
+Vampir is a widget toolkit for [GPUI](https://www.gpui.rs). It is a plain library crate with no application inside it: `gpui` and `unicode-segmentation` are the only dependencies it needs on every platform (`default-features = false` gets back to exactly those two; the `app-icon` and `native` features add AppKit bindings on macOS only, already in the tree by way of GPUI's own backend), and it builds anywhere GPUI does. `gpui` is the crates.io [gpui-ce](https://github.com/gpui-ce/gpui-ce) release (the community edition of GPUI, Apache-2.0, notice in `THIRD_PARTY.md`) renamed in `Cargo.toml`; do not change it back to a git dependency, that is what makes the crate publishable.
 
 This is a short working guide for contributors and coding tools. The detailed documentation is in [`docs/`](docs/); use the relevant page when you need more context.
 
@@ -69,7 +69,7 @@ CI runs exactly those three checks and then builds the gallery. The first build 
 
 `examples/gallery.rs` is the closest thing to a manual test suite. A change that is visible should be visible there, in both schemes. It is also the smallest complete host, so it is where host-side patterns get demonstrated rather than only described.
 
-Avoid adding dependencies. The crate currently has two, which keeps it easy to integrate with projects that already use GPUI.
+Avoid adding dependencies. The crate needs two on every platform, which keeps it easy to integrate with projects that already use GPUI; the macOS-only ones behind `app-icon` and `native` come free with GPUI's backend, and anything new has to clear the same bar.
 
 When you add a control, the checklist at the end of [writing-a-control.md](docs/writing-a-control.md#checklist) lists everywhere it has to be registered — `lib.rs`, the docs table, the README list, the gallery and a test.
 

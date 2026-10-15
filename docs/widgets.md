@@ -32,7 +32,7 @@ Every control animates its changes of state — the switch slides, the tick draw
 
 ## Containers — `vampir::containers`
 
-`tab_bar` (natural-width horizontal tabs, drag to reorder, optional close buttons, and a raised pill that slides to the active tab), `tab_bar_layout` with `TabBarLayout::{Horizontal, HorizontalUniform { width }, Vertical}`, `split_handle` + `split_area`, `collapsible` (unfolds to its measured height), `dialog` + `DialogButton`.
+`tab_bar` (natural-width horizontal tabs, drag to reorder, optional close buttons, and a raised pill that slides to the active tab), `tab_bar_layout` with `TabBarLayout::{Horizontal, HorizontalUniform { width }, Vertical}`, `split_handle` + `split_area`, `collapsible` (unfolds to its measured height), `dialog` + `DialogButton`, and `dialog_window` for a prompt, a confirmation, a choice or an alert in a window of its own.
 
 `HorizontalUniform` keeps each tab at the same width (clamped to 96–320), elides long labels, and scrolls sideways when the strip is full. Its close buttons stay at the same position within each tab as siblings close. `Vertical` fills the width its host gives it and scrolls down when its height is constrained. In every layout, tabs fade out into the well at an edge with more past it rather than being cut off there. Both layouts keep the same select, close and drag callbacks as `tab_bar`; arrow keys follow the layout's direction and bring the newly selected tab into view. A `Tab` is identified by its label unless `Tab::id` says otherwise, and everything the bar remembers about a tab follows that identity through a reorder. The gallery's Data page renders both dense horizontal and vertical bars over the same host-owned tabs.
 
@@ -44,11 +44,15 @@ Closing the final tab leaves the bar empty and returns keyboard focus to the roo
 
 `dialog` is opened with `ControlState::open_dialog` and renders nothing otherwise. It fades in, takes the keyboard, keeps Tab among its buttons, and closes itself — fading out, handing the keyboard back — from a button, Enter, Escape or the scrim, before the host's callback runs.
 
+![A prompt in a dialog window of its own, over the Data page](dialog-window.png)
+
+`dialog_window::prompt`, `confirm`, `choose` and `alert` are the same asks in a GPUI dialog window of their own — `choose` offering several buttons, the last of them primary, and answering with the chosen one's index — for a host whose window has a native view over it that would hide an in-window dialog. Each takes a title, a wrapping message and the name of the way to say yes, fits its height to what it holds, puts the keyboard in a prompt's field from the start, submits on Enter and cancels on Escape, and answers through a callback with the `App`, from which the host reaches its own entity. The gallery's Data page opens all four.
+
 The page itself is laid out with the same vocabulary: `card` is the lit panel with a caption that everything sits on, `labelled` puts a caption over a control, `row` and `column` space controls the toolkit's way, `scroll_area` is a scrolling region on the window's ground with the edge fades and the overlay scrollbar it needs, and `arriving` fades content in and settles it into place each time what it shows changes. `card_at` is a card's colour at a given height, for anything inside one that has to blend into it, such as a scroll fade.
 
 ## Menus — `vampir::menu`
 
-`context_menu` renders the open menu; `MenuItem::action(..).shortcut(..).checked(..).danger().disabled()` builds action rows, `MenuItem::submenu(label, items)` nests a menu to any depth, and `MenuItem::header` and `MenuItem::separator` break rows up. A submenu can also be disabled. Open the menu from wherever the press happened:
+`context_menu` renders the open menu; `MenuItem::action(id, label).shortcut(..).checked(..).danger().disabled()` builds action rows, `MenuItem::submenu(label, items)` nests a menu to any depth, and `MenuItem::header` and `MenuItem::separator` break rows up. A submenu can also be disabled, and `enabled(bool)` sets either from a value. An action's `id` is what comes back when it is chosen: a `&'static str` by default, or the host's own command type — `MenuItem<Option<Command>>` is a menu whose rows carry what they do, with `None` for a row that only says something — so there is no table to keep in step with the rows. Any action or submenu can carry an icon with `.icon(..)`: a `MenuIcon` is whatever the host draws at a size in a colour, converted once from the host's icon type with `impl From<Icon> for MenuIcon`, and a level with an icon anywhere in it keeps an icon column so its labels line up. Open the menu from wherever the press happened:
 
 ```rust
 .on_mouse_down(MouseButton::Right, cx.listener(|this, event: &MouseDownEvent, _w, cx| {
@@ -70,11 +74,25 @@ Submenus drill into the same panel. Click a submenu row, or press Right or Enter
 
 These are in-window menus drawn by the toolkit. The macOS menu bar is a different thing entirely and belongs to GPUI — see [Shipping a macOS app](macos-apps.md).
 
+![The floating menu open over the Data page, a row lit from the keyboard](floating-menu.png)
+
+`floating_menu` is the same menu in a pop-up window of its own, for a host whose window has a live native view — a web view, a video player — composited over it, where anything drawn inside the window is hidden. It takes the same `MenuItem` tree, icons, shortcuts, headers, danger rows and all, so a host builds a menu once and shows it whichever way the window allows. `floating_menu::open_with(cx, window, position, items, palette, on_choice)` opens it at a window position and calls `on_choice` with the chosen action's id, or `None` when it was dismissed, in the window the menu was opened for; `open_above_with` opens it upward from a trigger on a shelf, and a menu near the bottom of the screen opens upward of its own accord. The window is a GPUI pop-up, which every platform has: it takes the keyboard while it is open, and a press anywhere else, a key it has no use for, or switching away closes it. On macOS with the `native` feature it instead watches the app's events, so the field or page being typed in keeps its caret and the closing click goes no further, as with a native menu. Submenus open in place with a row at the top that leads back. It is as wide as its longest row, within 184 to 340 points, and scrolls past 520. The gallery's Data page opens one from a button, with an enum of its own as the ids.
+
+`NativeMenu` (macOS, `native` feature) adopts an AppKit `NSMenu` — the context menu a web view or text view proposes — as the same rows, so a host can draw it with either menu instead of letting AppKit pop it up. `NativeMenu::adopt(&menu, icon)` leaves out hidden rows and Option-key alternates, collapses separators, drops an empty submenu and turns a disabled one into a disabled row, and asks `icon` for each row's `MenuIcon`; its `items()` are `MenuItem<usize>`, each action's id finding the `NativeAction` behind it, which `run(id)` performs as a click would. `find` locates an action by what its item says — a framework's stable `identifier`, where titles are localised — and `row_mut` relabels it; the menu must be run while whoever proposed it still holds it. The gallery's third floating-menu button adopts a small AppKit menu whose rows report back when run.
+
 ## Overlays — `vampir::overlay`
 
 ![The command palette open over the fields page](overlays.png)
 
 `Tooltip::text` / `Tooltip::with_shortcut` plug into GPUI's own `.tooltip(..)`, which already owns the hover delay and the placement; `Hint` is what one says, for a control such as `icon_button` that carries its own.
+
+![A floating hint beside a tile on the Data page, with floating hints switched on](native-hint.png)
+
+`hinted(element, hint, side, ctx)` is the one call for either kind: it gives any `Stateful<Div>` a tooltip, or when the host has asked for floating hints with `ControlState::set_floating_hints(true)` — because a native view composited over the window would hide a tooltip drawn inside it, or cut one off at the edge — a hint in a pop-up window of its own that never takes the keyboard. The window shows after the pointer has rested for a moment, sits `HintSide::Below` or `HintSide::Right` of the element rather than under the pointer, is kept on the screen, and goes when the pointer leaves or the element is pressed; `hint::dismiss` takes it away when the host removes a hinted element from under the pointer. `hint::toast(view, text, anchor, window, cx)` is a passing message in the same kind of window, under an anchor the host measured, gone after a few seconds. A hint or a message showing closes with the window it was shown for. The gallery's Data page has a switch between the two kinds and a toast.
+
+![The Data page's drawn view covered with a still, drawn over](cover.png)
+
+`Cover` is the bookkeeping for drawing over a native view, which nothing drawn inside the window can appear above: the host asks it for a request token, takes a still of the view however the view allows and delivers it with the token, shows `backdrop()` in the view's place, hides the view, and draws over the still; when the last thing drawn over it closes, `clear()` and the view comes back. A still that answers an older token — asked for before a switch, or before the overlay was opened again — is dropped, so what shows is never a still of a page that is no longer in front. `snapshot_width` is the width to ask a view for a still at, so a Retina or very large window still yields about one 1080p frame. The gallery's Data page covers a drawn box with the toolkit's own icon, delivered a moment after it is asked for, the way a web view's capture arrives.
 
 `command_palette` is opened with `ControlState::open_palette`, or `toggle_palette` from whatever shortcut the host gives it, and renders nothing otherwise. The host owns the query `TextInput` and the `Command`s; the palette filters them with `fuzzy_filter` as the query is typed, moves the highlight with Up and Down, runs the highlighted command on Enter or a clicked one, and closes on Escape or the scrim — handing the keyboard back where it was before the command runs.
 

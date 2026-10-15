@@ -14,12 +14,25 @@ categories = ["gui"]
 exclude = ["docs/", ".github/", "tools/"]
 
 [features]
-default = ["app-icon"]
+default = ["app-icon", "native"]
 # Setting the application icon at runtime. The widgets need none of it, so
 # `default-features = false` gets back to a crate with two dependencies:
 #
 #   vampir = { version = "0.2", default-features = false }
 app-icon = ["dep:image", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
+# What only AppKit can give a host that embeds a live native view: an
+# `NSMenu` the view proposes adopted as the toolkit's rows, and an event
+# monitor that lets the floating menu leave the keyboard with the host's
+# window. The menus, hints, dialogs and the cover themselves are GPUI
+# windows and need none of this. macOS only; on the other platforms the
+# feature is empty and pulls in nothing.
+native = [
+    "dep:block2",
+    "dep:objc2",
+    "dep:objc2-app-kit",
+    "dep:objc2-foundation",
+    "dep:raw-window-handle",
+]
 
 [dependencies]
 # gpui-ce is the community edition of Zed's GPUI (Apache-2.0): the same API,
@@ -28,18 +41,36 @@ app-icon = ["dep:image", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation
 gpui = { package = "gpui-ce", version = "0.2.2" }
 unicode-segmentation = "1"
 
-# Only for `app-icon`, and only on the platform that wants them. Both are
-# already in the tree by way of GPUI's own backends, so on a machine that
-# builds GPUI at all they cost nothing to compile.
+# Only for `app-icon` and `native`, and only on the platform that wants
+# them. All of these are already in the tree by way of GPUI's own backend,
+# so on a machine that builds GPUI at all they cost nothing to compile.
 [target.'cfg(target_os = "macos")'.dependencies]
+raw-window-handle = { version = "0.6", optional = true }
+block2 = { version = "0.6", optional = true }
 objc2 = { version = "0.6", optional = true }
 objc2-app-kit = { version = "0.3", optional = true, features = [
     "NSApplication",
+    "NSEvent",
     "NSGraphics",
     "NSImage",
+    "NSMenu",
+    "NSMenuItem",
     "NSResponder",
+    "NSUserInterfaceItemIdentification",
+    "NSView",
+    "NSWindow",
+    "block2",
+    "objc2-core-foundation",
 ] }
-objc2-foundation = { version = "0.3", optional = true, features = ["NSData"] }
+objc2-foundation = { version = "0.3", optional = true, features = [
+    "NSArray",
+    "NSData",
+    "NSEnumerator",
+    "NSGeometry",
+    "NSNotification",
+    "NSObject",
+    "NSString",
+] }
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 image = { version = "0.25", optional = true, default-features = false, features = [
@@ -64,3 +95,10 @@ path = "examples/gallery.rs"
 
 [profile.release]
 lto = "thin"
+
+# AppKit objects must be exercised on the main thread, so the native menu
+# regressions run without the Rust test harness.
+[[test]]
+name = "native_menu"
+path = "tests/native-menu.rs"
+harness = false
