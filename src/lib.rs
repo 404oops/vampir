@@ -35,6 +35,7 @@
 //! [`Palette::from_hue_and_saturation`] or field by field.
 
 pub mod color;
+pub mod command_bar;
 pub mod containers;
 pub mod controls;
 pub mod data;
@@ -55,6 +56,10 @@ pub mod text_input;
 pub mod theme;
 pub mod typography;
 
+pub use command_bar::{
+    CommandBarOptions, CommandBarOutcome, CommandBarWindow, Dismissal, close_command_bar,
+    is_command_bar_open, open_command_bar, set_command_bar_commands,
+};
 pub use containers::{
     CARD_LIFT, DialogButton, Tab, TabBarLayout, arriving, card, card_at, collapsible, column,
     dialog, labelled, reorder, row, scroll_area, split_area, split_handle, tab_bar, tab_bar_layout,

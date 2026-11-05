@@ -266,7 +266,7 @@ impl SearchResult {
 }
 
 /// A command as a result row, so commands and results share one drawing.
-fn command_result(command: &Command) -> SearchResult {
+pub(crate) fn command_result(command: &Command) -> SearchResult {
     SearchResult {
         id: command.id.clone(),
         label: command.label.clone(),
@@ -482,7 +482,7 @@ const ROW_SPACING: f32 = 8.0;
 /// The tallest an inline result list grows before it scrolls.
 const INLINE_RESULT_MAX_HEIGHT: f32 = 300.0;
 /// The same for the list in a palette, which has the window to itself.
-const PALETTE_RESULT_MAX_HEIGHT: f32 = 340.0;
+pub(crate) const PALETTE_RESULT_MAX_HEIGHT: f32 = 340.0;
 
 struct RowPlacement {
     /// Whether a section heading goes above this row.
@@ -862,7 +862,10 @@ pub fn command_list<V: ControlHost>(
         .children(rows)
 }
 
-type Activate<V> = Rc<dyn Fn(&mut V, SharedString, &mut Window, &mut Context<V>)>;
+/// What a palette panel does on Escape.
+pub(crate) type Dismissed<V> = Rc<dyn Fn(&mut V, &mut Window, &mut Context<V>)>;
+
+pub(crate) type Activate<V> = Rc<dyn Fn(&mut V, SharedString, &mut Window, &mut Context<V>)>;
 
 /// A search field with the rows that match it underneath, and the keys
 /// between the two: Up and Down move the highlight, Enter picks it.
@@ -979,7 +982,7 @@ pub fn ranked_search_list<V: ControlHost>(
 
 /// A scrolling result list's rows, with what its keys need to move through
 /// them.
-struct ResultList {
+pub(crate) struct ResultList {
     elements: Vec<AnyElement>,
     ids: Rc<[SharedString]>,
     navigation: Rc<ResultNavigation>,
@@ -988,7 +991,7 @@ struct ResultList {
 /// Draws a scrolling result list, keeping the keyboard's row on its result
 /// as the results change and the list's scroll in step with the row.
 #[allow(clippy::too_many_arguments)]
-fn result_list<V: ControlHost>(
+pub(crate) fn result_list<V: ControlHost>(
     id: &'static str,
     query: &str,
     emphasis: &str,
@@ -1259,7 +1262,7 @@ fn list_keys<V: ControlHost, E: InteractiveElement>(
 }
 
 /// When palette `id` opened, if it is the one open.
-fn palette_opened_at(state: &ControlState, id: ComboId) -> Option<Instant> {
+pub(crate) fn palette_opened_at(state: &ControlState, id: ComboId) -> Option<Instant> {
     state
         .palette_overlay
         .as_ref()
@@ -1378,54 +1381,36 @@ fn palette_with_results<V: ControlHost>(
     on_activate: Activate<V>,
 ) -> impl IntoElement {
     let WidgetContext { palette, view, cx } = ctx;
-    let state = view.control_state();
-    let dark = palette.is_dark;
     // The panel arrives the way a menu does: the same reveal, a short drift
     // down into place.
-    let reveal = ease_out_cubic(progress(opened_at, state.scaled(COMBO_REVEAL)));
-    let fill = if dark {
-        palette.soft_fill
-    } else {
-        palette.field_surface
-    };
-    let panel = div()
-        // A little above centre: the list grows downward, and a palette
-        // pinned to the middle ends up low on the screen as soon as it has
-        // results.
-        .mt(gpui::relative(0.16))
-        .relative()
-        .top(px(-6.0 * (1.0 - reveal)))
-        .opacity(reveal)
-        .w(px(520.0))
-        .max_w(gpui::relative(0.9))
-        .flex()
-        .flex_col()
-        .gap(px(6.0))
-        .p(px(8.0))
-        .rounded(px(10.0))
-        .bg(fill)
-        .border_1()
-        .border_color(lighting::rim(fill, dark))
-        .shadow(lighting::panel(dark))
-        .occlude()
-        // Once `bind_keys` has run, Escape arrives as this action and never
-        // as a key. The query field has the keyboard, and this is the first
-        // thing above it.
-        .on_action(cx.listener(move |this, _: &Dismiss, window, cx| {
+    let reveal = ease_out_cubic(progress(
+        opened_at,
+        view.control_state().scaled(COMBO_REVEAL),
+    ));
+    let panel = palette_panel(
+        id,
+        query,
+        list,
+        empty_message,
+        WidgetContext { palette, view, cx },
+        window,
+        on_activate,
+        Rc::new(|this: &mut V, window: &mut Window, cx: &mut Context<V>| {
             this.control_state_mut().close_palette(window, cx);
-            cx.notify();
-        }))
-        .child(search_field(id, query, palette, window, cx))
-        .child(result_viewport(
-            id,
-            list.elements,
-            &list.navigation,
-            empty_message,
-            (fill, fill),
-            palette,
-            state,
-        ));
-    let panel = list_keys(panel, id, list.ids, Some(list.navigation), cx, on_activate);
+        }),
+    )
+    // A little above centre: the list grows downward, and a palette pinned
+    // to the middle ends up low on the screen as soon as it has results.
+    .mt(gpui::relative(0.16))
+    .relative()
+    .top(px(-6.0 * (1.0 - reveal)))
+    .opacity(reveal)
+    .w(px(PALETTE_WIDTH))
+    .max_w(gpui::relative(0.9))
+    .rounded(px(10.0))
+    .border_1()
+    .border_color(lighting::rim(palette_fill(palette), palette.is_dark))
+    .shadow(lighting::panel(palette.is_dark));
     deferred(
         div()
             .id(ElementId::Name(format!("{id}-scrim").into()))
@@ -1449,6 +1434,80 @@ fn palette_with_results<V: ControlHost>(
             .child(panel),
     )
     .with_priority(180)
+}
+
+/// How wide a command palette is, in a window or over one.
+pub(crate) const PALETTE_WIDTH: f32 = 520.0;
+/// The padding and gap around and between the palette's query field and
+/// its list, which a window sized to the palette has to add up.
+pub(crate) const PALETTE_PADDING: f32 = 8.0;
+const PALETTE_GAP: f32 = 6.0;
+
+/// The palette's surface: the field colour in the light scheme, where the
+/// panel lifts off the page by its shadow, and the soft fill in the dark one.
+pub(crate) fn palette_fill(palette: Palette) -> Rgba {
+    if palette.is_dark {
+        palette.soft_fill
+    } else {
+        palette.field_surface
+    }
+}
+
+/// The height of a palette panel holding `list`, padding included: what a
+/// window sized to the panel needs.
+pub(crate) fn palette_panel_height(list: &ResultList) -> f32 {
+    let rows = if list.navigation.rows.is_empty() {
+        COMMAND_ROW_HEIGHT
+    } else {
+        list.navigation.viewport_height()
+    };
+    2.0 * PALETTE_PADDING + crate::controls::CONTROL_HEIGHT + PALETTE_GAP + rows
+}
+
+/// The panel every command palette is made of: the query field over the
+/// result list, with the list's keys, and Escape answered by `on_dismiss`.
+/// The overlay places it over a scrim; the command bar window fills itself
+/// with it. One implementation, so the two cannot drift on keys, focus or
+/// results.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn palette_panel<V: ControlHost>(
+    id: ComboId,
+    query: &Entity<TextInput>,
+    list: ResultList,
+    empty_message: &'static str,
+    ctx: WidgetContext<'_, '_, '_, V>,
+    window: &Window,
+    on_activate: Activate<V>,
+    on_dismiss: Dismissed<V>,
+) -> Div {
+    let WidgetContext { palette, view, cx } = ctx;
+    let state = view.control_state();
+    let fill = palette_fill(palette);
+    let panel = div()
+        .flex()
+        .flex_col()
+        .gap(px(PALETTE_GAP))
+        .p(px(PALETTE_PADDING))
+        .bg(fill)
+        .occlude()
+        // Once `bind_keys` has run, Escape arrives as this action and never
+        // as a key. The query field has the keyboard, and this is the first
+        // thing above it.
+        .on_action(cx.listener(move |this, _: &Dismiss, window, cx| {
+            on_dismiss(this, window, cx);
+            cx.notify();
+        }))
+        .child(search_field(id, query, palette, window, cx))
+        .child(result_viewport(
+            id,
+            list.elements,
+            &list.navigation,
+            empty_message,
+            (fill, fill),
+            palette,
+            state,
+        ));
+    list_keys(panel, id, list.ids, Some(list.navigation), cx, on_activate)
 }
 
 #[cfg(test)]
