@@ -14,10 +14,6 @@
 //! .children(vampir::context_menu("row", &items, palette, self, cx,
 //!     |host, item, _window, cx| host.run_menu_item(item, cx)))
 //! ```
-//!
-//! The same [`MenuItem`] tree feeds the floating menu
-//! ([`crate::floating_menu`]) a host with a native view over its window
-//! opens instead, so one menu can be built once and shown either way.
 
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
@@ -1210,7 +1206,7 @@ fn render_item<V: ControlHost, I: Clone + 'static>(
                 })
                 .child(div().flex_1().overflow_hidden().child(action.label))
                 // A checked row that also has an icon shows its tick after
-                // the label, where the floating menu puts every tick.
+                // the label, so the icon column stays an icon column.
                 .when(checked && icons && action.icon.is_some(), move |el| {
                     el.child(tick_mark(tick))
                 })
