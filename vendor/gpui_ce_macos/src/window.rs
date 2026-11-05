@@ -369,11 +369,11 @@ unsafe fn build_window_class(name: &'static str, superclass: &Class) -> *const C
 
         decl.add_method(
             sel!(canBecomeMainWindow),
-            yes as extern "C" fn(&Object, Sel) -> BOOL,
+            can_become_main as extern "C" fn(&Object, Sel) -> BOOL,
         );
         decl.add_method(
             sel!(canBecomeKeyWindow),
-            yes as extern "C" fn(&Object, Sel) -> BOOL,
+            can_become_key as extern "C" fn(&Object, Sel) -> BOOL,
         );
         decl.add_method(
             sel!(windowDidResize:),
@@ -550,6 +550,12 @@ struct MacWindowState {
     /// cleared when the popup closes, since it may not outlive the popup.
     popup: Option<PopupOptions>,
     popup_parent: Option<id>,
+    /// Whether an anchored popup was opened to take the keyboard. One that was not — a scrim,
+    /// a hint — never becomes key, so a click on it leaves the keyboard where it is.
+    popup_takes_focus: bool,
+    /// The activity last reported to the activate callback, so a window whose popup takes the
+    /// keyboard does not report going inactive and straight back.
+    reported_active: Option<bool>,
 }
 
 impl MacWindowState {
@@ -957,6 +963,8 @@ impl MacWindow {
                     _ => None,
                 },
                 popup_parent,
+                popup_takes_focus: focus,
+                reported_active: None,
             })));
 
             (*native_window).set_ivar(
@@ -1597,7 +1605,8 @@ impl PlatformWindow for MacWindow {
     }
 
     fn is_active(&self) -> bool {
-        unsafe { self.0.lock().native_window.isKeyWindow() == YES }
+        let native_window = self.0.lock().native_window;
+        unsafe { effectively_key(native_window) }
     }
 
     // is_hovered is unused on macOS. See Window::is_window_hovered.
@@ -2190,10 +2199,6 @@ unsafe fn drop_window_state(object: &Object) {
         let raw: *mut c_void = *object.get_ivar(WINDOW_STATE_IVAR);
         Arc::from_raw(raw as *mut Mutex<MacWindowState>);
     }
-}
-
-extern "C" fn yes(_: &Object, _: Sel) -> BOOL {
-    YES
 }
 
 extern "C" fn dealloc_window(this: &Object, _: Sel) {
@@ -2810,20 +2815,73 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
         }
     }
 
+    let this = this as *const Object as id;
     executor
         .spawn(async move {
-            let mut lock = window_state.as_ref().lock();
-            if is_active {
-                lock.move_traffic_light();
+            // Read again once AppKit has finished moving the key window: a window whose own
+            // popup took the keyboard stays active, as it does under a menu, and only goes
+            // inactive when the keyboard leaves it and its popups altogether.
+            if window_state.lock().closed.load(Ordering::Acquire) {
+                return;
             }
-
-            if let Some(mut callback) = lock.activate_callback.take() {
-                drop(lock);
-                callback(is_active);
-                window_state.lock().activate_callback = Some(callback);
-            };
+            report_activation(&window_state, unsafe { effectively_key(this) });
+            // A popup taking or losing the keyboard is its parent's activity changing too.
+            let parent = window_state.lock().popup_parent;
+            if let Some(parent) = parent {
+                let parent_state = unsafe { get_window_state(&*parent) };
+                if !parent_state.lock().closed.load(Ordering::Acquire) {
+                    report_activation(&parent_state, unsafe { effectively_key(parent) });
+                }
+            }
         })
         .detach();
+}
+
+fn report_activation(window_state: &Arc<Mutex<MacWindowState>>, is_active: bool) {
+    let mut lock = window_state.as_ref().lock();
+    if lock.reported_active == Some(is_active) {
+        return;
+    }
+    lock.reported_active = Some(is_active);
+    if is_active {
+        lock.move_traffic_light();
+    }
+    if let Some(mut callback) = lock.activate_callback.take() {
+        drop(lock);
+        callback(is_active);
+        window_state.lock().activate_callback = Some(callback);
+    };
+}
+
+/// Whether `window` has the keyboard, itself or through one of its anchored popups.
+unsafe fn effectively_key(window: id) -> bool {
+    unsafe {
+        window.isKeyWindow() == YES
+            || popup_children(window)
+                .into_iter()
+                .any(|child| child.isKeyWindow() == YES)
+    }
+}
+
+/// A popup is never the main window: its parent keeps that, and with it the look of the
+/// window in front, the way a window under a menu does.
+extern "C" fn can_become_main(this: &Object, _: Sel) -> BOOL {
+    let window_state = unsafe { get_window_state(this) };
+    if window_state.lock().popup.is_some() {
+        NO
+    } else {
+        YES
+    }
+}
+
+extern "C" fn can_become_key(this: &Object, _: Sel) -> BOOL {
+    let window_state = unsafe { get_window_state(this) };
+    let lock = window_state.lock();
+    if lock.popup.is_some() && !lock.popup_takes_focus {
+        NO
+    } else {
+        YES
+    }
 }
 
 extern "C" fn window_should_close(this: &Object, _: Sel, _: id) -> BOOL {
