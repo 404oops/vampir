@@ -113,6 +113,32 @@ pub(crate) struct WindowsWindowInner {
     pub(crate) main_receiver: PriorityQueueReceiver<RunnableVariant>,
     pub(crate) platform_window_handle: HWND,
     pub(crate) parent_hwnd: Option<HWND>,
+    /// Set when this window is a [`WindowKind::AnchoredPopup`].
+    pub(crate) popup: Option<PopupState>,
+    /// The anchored popups this window owns, which follow it when it moves. Weak, because the
+    /// popups belong to GPUI; each one takes itself out of the list when it is destroyed.
+    pub(crate) owned_popups: RefCell<Vec<Weak<WindowsWindowInner>>>,
+    /// The activity last reported to GPUI, so that the keyboard moving between a window and its
+    /// own popups is not reported as the window going inactive and straight back.
+    pub(crate) reported_active: Cell<Option<bool>>,
+}
+
+/// What an anchored popup needs to keep to its anchor as its owner moves.
+///
+/// The popup is an owned `WS_POPUP` window, so it stays above its owner and only its owner, is
+/// hidden while the owner is minimised and is destroyed with it — all done by the OS.
+/// [`popup::PopupOptions::grab`] has no effect on this backend: there is no pointer capture and
+/// no dismissal on clicks outside; the popup takes the keyboard only when opened with `focus`.
+pub(crate) struct PopupState {
+    owner: HWND,
+    options: RefCell<popup::PopupOptions>,
+    /// The size asked for, kept apart from the window's own size because a constraint adjustment
+    /// may have shrunk the window, and it should grow back once there is room.
+    size: Cell<Size<Pixels>>,
+    /// Whether the popup was opened to take the keyboard. One that was not — a scrim, a hint —
+    /// is `WS_EX_NOACTIVATE` and answers `MA_NOACTIVATE`, so a click on it leaves the keyboard
+    /// where it is.
+    pub(crate) takes_focus: bool,
 }
 
 impl WindowsWindowState {
@@ -304,7 +330,108 @@ impl WindowsWindowInner {
             platform_window_handle: context.platform_window_handle,
             system_settings: WindowsSystemSettings::new(),
             parent_hwnd: context.parent_hwnd,
+            popup: context.popup.take(),
+            owned_popups: RefCell::new(Vec::new()),
+            reported_active: Cell::new(None),
         }))
+    }
+
+    /// Puts an anchored popup where its options say, against where its owner is now. Does
+    /// nothing for any other window, or while the owner is minimised: the OS has hidden the
+    /// popup then, and the owner's client origin is meaningless until it is restored, which
+    /// moves it again.
+    pub(crate) fn follow_anchor(&self) {
+        let Some(popup) = &self.popup else {
+            return;
+        };
+        if unsafe { IsIconic(popup.owner) }.as_bool() {
+            return;
+        }
+        let options = popup.options.borrow().clone();
+        let Some(bounds) = anchored_popup_bounds(
+            &options,
+            popup.owner,
+            popup.size.get(),
+            self.state.scale_factor.get(),
+        ) else {
+            return;
+        };
+        let rect = calculate_window_rect(bounds, &self.state.border_offset);
+        unsafe {
+            SetWindowPos(
+                self.hwnd,
+                None,
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+        }
+        .context("unable to place anchored popup")
+        .log_err();
+    }
+
+    /// The owner of this window, if it is an anchored popup.
+    pub(crate) fn popup_owner(&self) -> Option<HWND> {
+        self.popup.as_ref().map(|popup| popup.owner)
+    }
+
+    /// Whether `hwnd` is one of the anchored popups this window owns and that is still open.
+    pub(crate) fn owns_popup(&self, hwnd: HWND) -> bool {
+        self.owned_popups
+            .borrow()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .any(|popup| popup.hwnd == hwnd)
+    }
+
+    /// Whether this window has the keyboard, itself or through one of its own popups. Under its
+    /// popup a window stays the window in front, as it does under a menu.
+    pub(crate) fn is_effectively_active(&self) -> bool {
+        let active = unsafe { GetActiveWindow() };
+        !active.is_invalid() && (active == self.hwnd || self.owns_popup(active))
+    }
+
+    /// Tells GPUI whether this window is active, if that changed since it was last told.
+    pub(crate) fn report_activation(&self) {
+        let active = self.is_effectively_active();
+        if self.reported_active.replace(Some(active)) == Some(active) {
+            return;
+        }
+        if let Some(mut func) = self.state.callbacks.active_status_change.take() {
+            func(active);
+            self.state.callbacks.active_status_change.set(Some(func));
+        }
+    }
+
+    /// Moves every anchored popup this window owns along with it.
+    pub(crate) fn move_owned_popups(&self) {
+        // Collected first: placing a popup re-enters the window procedure.
+        let popups: SmallVec<[Rc<WindowsWindowInner>; 2]> = self
+            .owned_popups
+            .borrow()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for popup in popups {
+            popup.follow_anchor();
+        }
+    }
+
+    /// Takes a destroyed popup out of its owner's list, so the owner never moves a window that
+    /// has gone. Owned windows are destroyed before their owner, so the owner is still there.
+    pub(crate) fn detach_from_owner(&self) {
+        let Some(popup) = &self.popup else {
+            return;
+        };
+        if let Some(owner) = window_from_hwnd(popup.owner) {
+            let this: *const WindowsWindowInner = self;
+            owner
+                .owned_popups
+                .borrow_mut()
+                .retain(|popup| popup.strong_count() > 0 && popup.as_ptr() != this);
+        }
     }
 
     fn toggle_fullscreen(self: &Rc<Self>) {
@@ -439,6 +566,7 @@ struct WindowCreateContext {
     invalidate_devices: Arc<AtomicBool>,
     draw_coordinator: Rc<DrawCoordinator>,
     parent_hwnd: Option<HWND>,
+    popup: Option<PopupState>,
 }
 
 impl WindowsWindow {
@@ -446,12 +574,20 @@ impl WindowsWindow {
         handle: AnyWindowHandle,
         params: WindowParams,
         creation_info: WindowCreationInfo,
+        popup_owner: Option<Rc<WindowsWindowInner>>,
     ) -> Result<Self> {
-        // Native popups are not implemented on Windows yet. Rejecting lets callers fall back to
-        // gpui's in-window popovers.
-        if let WindowKind::AnchoredPopup(_) = params.kind {
-            return Err(popup::PopupNotSupportedError.into());
-        }
+        let popup = match (&params.kind, &popup_owner) {
+            (WindowKind::AnchoredPopup(options), Some(owner)) => Some(PopupState {
+                owner: owner.hwnd,
+                options: RefCell::new(options.clone()),
+                size: Cell::new(params.bounds.size),
+                takes_focus: params.focus,
+            }),
+            (WindowKind::AnchoredPopup(_), None) => {
+                anyhow::bail!("an anchored popup's parent window is not open")
+            }
+            _ => None,
+        };
 
         let WindowCreationInfo {
             icon,
@@ -501,7 +637,16 @@ impl WindowsWindow {
                 .unwrap_or(""),
         );
 
-        let (mut dwexstyle, dwstyle) = if params.kind == WindowKind::PopUp {
+        let (mut dwexstyle, dwstyle) = if popup.is_some() {
+            // Owned rather than topmost, so it is above its owner and nothing else; a tool
+            // window, so it has no taskbar button; and activatable, so it can take the keyboard.
+            let no_activate = if params.focus {
+                WINDOW_EX_STYLE(0)
+            } else {
+                WS_EX_NOACTIVATE
+            };
+            (WS_EX_TOOLWINDOW | no_activate, WS_POPUP)
+        } else if params.kind == WindowKind::PopUp {
             (WS_EX_TOOLWINDOW | WS_EX_TOPMOST, WINDOW_STYLE(0x0))
         } else {
             let mut dwstyle = WS_SYSMENU;
@@ -527,7 +672,21 @@ impl WindowsWindow {
         }
 
         let hinstance = get_module_handle();
-        let display = if let Some(display_id) = params.display_id {
+        // A popup opens on its owner's monitor, at its owner's scale.
+        let initial_popup_bounds = popup
+            .as_ref()
+            .map(|popup| {
+                let options = popup.options.borrow();
+                let owner_scale =
+                    unsafe { GetDpiForWindow(popup.owner) } as f32 / USER_DEFAULT_SCREEN_DPI as f32;
+                anchored_popup_bounds(&options, popup.owner, popup.size.get(), owner_scale)
+                    .context("unable to place an anchored popup on its parent")
+            })
+            .transpose()?;
+        let display = if let Some(popup) = &popup {
+            let monitor = unsafe { MonitorFromWindow(popup.owner, MONITOR_DEFAULTTONEAREST) };
+            WindowsDisplay::new(WindowsDisplay::display_id_for_monitor(monitor))
+        } else if let Some(display_id) = params.display_id {
             WindowsDisplay::new(display_id)
         } else {
             None
@@ -535,14 +694,17 @@ impl WindowsWindow {
         .or_else(WindowsDisplay::primary_monitor)
         .context("failed to find any monitor")?;
         let appearance = system_appearance().unwrap_or_default();
+        let is_popup = popup.is_some();
+        let owner_hwnd = popup.as_ref().map(|popup| popup.owner);
         let mut context = WindowCreateContext {
             inner: None,
             handle,
             hide_title_bar,
             display,
-            is_movable: params.is_movable,
-            is_resizable: params.is_resizable,
-            is_minimizable: params.is_minimizable,
+            // A popup goes where its anchor is, not where it is dragged.
+            is_movable: params.is_movable && !is_popup,
+            is_resizable: params.is_resizable && !is_popup,
+            is_minimizable: params.is_minimizable && !is_popup,
             min_size: params.window_min_size,
             executor,
             current_cursor,
@@ -560,6 +722,17 @@ impl WindowsWindow {
             invalidate_devices,
             draw_coordinator,
             parent_hwnd,
+            popup,
+        };
+        // Created where it belongs, so that it takes the DPI of its owner's monitor from the start.
+        let (x, y, cx, cy) = match initial_popup_bounds {
+            Some(bounds) => (
+                bounds.origin.x.0,
+                bounds.origin.y.0,
+                bounds.size.width.0,
+                bounds.size.height.0,
+            ),
+            None => (CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT),
         };
         let creation_result = unsafe {
             CreateWindowExW(
@@ -567,11 +740,13 @@ impl WindowsWindow {
                 WINDOW_CLASS_NAME,
                 &window_name,
                 dwstyle,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                parent_hwnd,
+                x,
+                y,
+                cx,
+                cy,
+                // The owner of a dialog or a popup: not `WS_CHILD`, so this is ownership, not
+                // containment. Only a dialog disables its owner (above).
+                parent_hwnd.or(owner_hwnd),
                 None,
                 Some(hinstance.into()),
                 Some(&context as *const _ as *const _),
@@ -588,6 +763,19 @@ impl WindowsWindow {
         set_non_rude_hwnd(hwnd, true);
         configure_dwm_dark_mode(hwnd, appearance);
         this.state.border_offset.update(hwnd)?;
+        if let Some(owner) = popup_owner {
+            {
+                let mut owned_popups = owner.owned_popups.borrow_mut();
+                owned_popups.retain(|popup| popup.strong_count() > 0);
+                owned_popups.push(Rc::downgrade(&this));
+            }
+            // Again, now that the popup's own scale is known, in case its monitor's differs.
+            this.follow_anchor();
+            if params.show {
+                show_popup(hwnd, params.focus);
+            }
+            return Ok(Self(this));
+        }
         let placement = retrieve_window_placement(
             hwnd,
             display,
@@ -696,6 +884,17 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn resize(&mut self, size: Size<Pixels>) {
+        if let Some(popup) = &self.0.popup {
+            // Placed again rather than resized in place, so a popup that grows keeps its anchor
+            // and still flips or slides to stay on screen.
+            popup.size.set(size);
+            let this = self.0.clone();
+            self.0
+                .executor
+                .spawn(async move { this.follow_anchor() })
+                .detach();
+            return;
+        }
         let hwnd = self.0.hwnd;
         let bounds = gpui::bounds(self.bounds().origin, size).to_device_pixels(self.scale_factor());
         let rect = calculate_window_rect(bounds, &self.state.border_offset);
@@ -717,6 +916,20 @@ impl PlatformWindow for WindowsWindow {
                     .log_err();
                 }
             })
+            .detach();
+    }
+
+    fn set_popup_anchor(&self, anchor_rect: Bounds<Pixels>) {
+        let Some(popup) = &self.0.popup else {
+            return;
+        };
+        popup.options.borrow_mut().anchor_rect = anchor_rect;
+        // Deferred like `resize`: moving the window synchronously would call back into GPUI
+        // while the caller still has it borrowed.
+        let this = self.0.clone();
+        self.0
+            .executor
+            .spawn(async move { this.follow_anchor() })
             .detach();
     }
 
@@ -848,6 +1061,18 @@ impl PlatformWindow for WindowsWindow {
     fn activate(&self) {
         let hwnd = self.0.hwnd;
         let this = self.0.clone();
+        if self.0.popup.is_some() {
+            // The app is already in front, since the popup's owner is ours, so a popup needs
+            // none of the foreground workarounds below.
+            self.0
+                .executor
+                .spawn(async move {
+                    this.follow_anchor();
+                    show_popup(hwnd, true);
+                })
+                .detach();
+            return;
+        }
         self.0
             .executor
             .spawn(async move {
@@ -921,7 +1146,7 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn is_active(&self) -> bool {
-        self.0.hwnd == unsafe { GetActiveWindow() }
+        self.0.is_effectively_active()
     }
 
     fn is_hovered(&self) -> bool {
@@ -1647,6 +1872,79 @@ fn calculate_client_rect(
     Bounds {
         origin: logical_point(left as f32, top as f32, scale_factor),
         size: physical_size.to_pixels(scale_factor),
+    }
+}
+
+/// Where an anchored popup goes, in physical screen pixels: its options resolved against its
+/// owner's client area and the work area of its owner's monitor, all in the owner's logical
+/// space. `size` is the popup's logical size at its own scale, `popup_scale`, which differs from
+/// the owner's only when the two are on monitors with different DPIs.
+fn anchored_popup_bounds(
+    options: &popup::PopupOptions,
+    owner: HWND,
+    size: Size<Pixels>,
+    popup_scale: f32,
+) -> Option<Bounds<DevicePixels>> {
+    let owner_dpi = unsafe { GetDpiForWindow(owner) };
+    if owner_dpi == 0 {
+        return None;
+    }
+    let owner_scale = owner_dpi as f32 / USER_DEFAULT_SCREEN_DPI as f32;
+    let mut client_origin = POINT::default();
+    if !unsafe { ClientToScreen(owner, &mut client_origin) }.as_bool() {
+        return None;
+    }
+    let monitor = unsafe { MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST) };
+    let mut monitor_info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    let work_area = unsafe { GetMonitorInfoW(monitor, &mut monitor_info) }
+        .as_bool()
+        .then(|| {
+            let work = monitor_info.rcWork;
+            Bounds {
+                origin: logical_point(work.left as f32, work.top as f32, owner_scale),
+                size: gpui::size(
+                    DevicePixels(work.right - work.left),
+                    DevicePixels(work.bottom - work.top),
+                )
+                .to_pixels(owner_scale),
+            }
+        });
+    let placed = popup::place_popup(
+        options,
+        logical_point(client_origin.x as f32, client_origin.y as f32, owner_scale),
+        size.map(|length| length * (popup_scale / owner_scale)),
+        work_area,
+    );
+    Some(placed.to_device_pixels(owner_scale))
+}
+
+/// Shows an anchored popup, giving it the keyboard when `focus` is set. Plain activation is
+/// enough: the popup's owner belongs to this app, which is in front when a popup opens.
+fn show_popup(hwnd: HWND, focus: bool) {
+    unsafe {
+        // Above the owner's other popups: a popup opened later — a bar over its scrim — is the
+        // one in front. Never topmost: the band is the owner's.
+        SetWindowPos(
+            hwnd,
+            Some(HWND_TOP),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+        .ok();
+        if focus {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            // Both return the previous window, which reads as an error when there was none.
+            SetActiveWindow(hwnd).ok();
+            SetFocus(Some(hwnd)).ok();
+        } else {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
     }
 }
 
