@@ -2442,6 +2442,14 @@ impl Window {
         self.platform_window.resize(size);
     }
 
+    /// Re-anchors a [`WindowKind::AnchoredPopup`](crate::WindowKind::AnchoredPopup) window to a
+    /// new rectangle on its parent, in the parent's content coordinates, keeping its anchor,
+    /// gravity and constraints. The popup already follows its parent when the parent moves;
+    /// this is for when the anchor itself moves, as it does when the parent is resized.
+    pub fn set_popup_anchor(&mut self, anchor_rect: Bounds<Pixels>) {
+        self.platform_window.set_popup_anchor(anchor_rect);
+    }
+
     /// Returns whether or not the window is currently fullscreen
     pub fn is_fullscreen(&self) -> bool {
         self.platform_window.is_fullscreen()
