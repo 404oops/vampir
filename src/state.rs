@@ -550,6 +550,7 @@ pub struct ControlState {
     pub palette_overlay: Option<OpenPalette>,
     /// The command bars this host has open in windows of their own. See
     /// [`crate::command_bar`].
+    #[cfg(feature = "command-bar-window")]
     pub(crate) command_bars: Vec<crate::command_bar::Session>,
     /// The shortcut recorder waiting for a key chord, if any.
     pub recording: Option<ComboId>,
@@ -593,6 +594,7 @@ impl ControlState {
             dialog_return_focus: None,
             dialog_trap: RefCell::new(None),
             palette_overlay: None,
+            #[cfg(feature = "command-bar-window")]
             command_bars: Vec::new(),
             recording: None,
             recording_keys: None,

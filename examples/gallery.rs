@@ -1607,6 +1607,7 @@ impl Gallery {
 
     /// Opens the command bar in a window of its own above this one, which a
     /// native view cannot hide, or brings the open one back.
+    #[cfg(feature = "command-bar-window")]
     fn open_command_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let palette = self.controls.palette();
         let commands = self.commands.clone();
@@ -1630,6 +1631,14 @@ impl Gallery {
         if let Err(error) = opened {
             self.note(format!("No command bar here: {error}"), cx);
         }
+    }
+
+    #[cfg(not(feature = "command-bar-window"))]
+    fn open_command_bar(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.note(
+            "The command bar window needs --features command-bar-window",
+            cx,
+        );
     }
 
     fn page_native(

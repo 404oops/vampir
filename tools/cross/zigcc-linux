@@ -1,0 +1,7 @@
+#!/bin/sh
+for arg; do
+  shift
+  case "$arg" in --target=*|-target) continue ;; esac
+  set -- "$@" "$arg"
+done
+exec zig cc -target aarch64-linux-gnu "$@"

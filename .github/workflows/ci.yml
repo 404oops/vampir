@@ -47,6 +47,13 @@ jobs:
       - name: Build the gallery
         run: cargo build --example gallery
 
+      # The command bar window, against the GPUI-CE vendored here.
+      - name: Clippy with the command bar window
+        run: cargo clippy --all-targets --features command-bar-window -- -D warnings
+
+      - name: Test with the command bar window
+        run: cargo test --features command-bar-window
+
       # The library's own promise: two dependencies, on every platform.
       - name: Test without the app icon
         run: cargo test --no-default-features

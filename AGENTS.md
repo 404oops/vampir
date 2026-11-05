@@ -59,7 +59,7 @@ Keep these conventions in mind when changing the library. Each is explained in m
 ## Working in the repository
 
 ```bash
-cargo run --example gallery      # every widget, one window
+cargo run --example gallery      # every widget, one window (add --features command-bar-window for the Native view page's bar)
 cargo fmt
 cargo clippy --all-targets -- -D warnings
 cargo test

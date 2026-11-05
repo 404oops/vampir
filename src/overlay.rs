@@ -1455,6 +1455,7 @@ pub(crate) fn palette_fill(palette: Palette) -> Rgba {
 
 /// The height of a palette panel holding `list`, padding included: what a
 /// window sized to the panel needs.
+#[cfg(feature = "command-bar-window")]
 pub(crate) fn palette_panel_height(list: &ResultList) -> f32 {
     let rows = if list.navigation.rows.is_empty() {
         COMMAND_ROW_HEIGHT

@@ -21,6 +21,13 @@ default = ["app-icon"]
 #   vampir = { version = "0.2", default-features = false }
 app-icon = ["dep:image", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
 
+# The command palette in a window of its own, above a host window whose
+# content a live native view covers (`open_command_bar`). It needs the
+# anchored popup windows that only the GPUI-CE vendored in this repository
+# implements (vendor/LOCAL_PATCHES.md), so it is off by default and a host
+# turning it on patches GPUI-CE the way this repository's own manifest does.
+command-bar-window = []
+
 [dependencies]
 # gpui-ce is the community edition of Zed's GPUI (Apache-2.0): the same API,
 # synced from Zed and published to crates.io, which is what lets this crate be

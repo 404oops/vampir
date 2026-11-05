@@ -1,7 +1,10 @@
 //! The placement every backend that positions native popups itself shares
 //! (`gpui::popup::place_popup`, in the vendored GPUI-CE). Here rather than
-//! in GPUI-CE's own tests, which the published package cannot build.
+//! in GPUI-CE's own tests, which the published package cannot build. Only
+//! with `command-bar-window`, the feature that depends on the vendored
+//! GPUI-CE.
 
+#![cfg(feature = "command-bar-window")]
 use gpui::popup::{
     PopupAnchor, PopupConstraintAdjustment, PopupGravity, PopupOptions, place_popup,
 };

@@ -76,6 +76,10 @@ These are in-window menus drawn by the toolkit. The macOS menu bar is a differen
 
 `Tooltip::text` / `Tooltip::with_shortcut` plug into GPUI's own `.tooltip(..)`, which already owns the hover delay and the placement; `Hint` is what one says, for a control such as `icon_button` that carries its own.
 
+![The command bar above the Native view page's live NSTextView, filtering for "to"](command-bar.png)
+
+`open_command_bar` is the palette in a window of its own above the host window, for a host with a live native view over its content that would hide the in-window palette; `CommandBarOptions::dim` darkens the host window behind it. The gallery's Native view page shows it over a real native view. See [hosting](hosting.md#over-a-native-view).
+
 `command_palette` is opened with `ControlState::open_palette`, or `toggle_palette` from whatever shortcut the host gives it, and renders nothing otherwise. The host owns the query `TextInput` and the `Command`s; the palette filters them with `fuzzy_filter` as the query is typed, moves the highlight with Up and Down, runs the highlighted command on Enter or a clicked one, and closes on Escape or the scrim — handing the keyboard back where it was before the command runs.
 
 `search_list` is the same field-and-rows without the overlay: a search field with the matching rows underneath and the same keys between them, for a filter over a list in the page. The gallery's Fields page shows one filtering as you type. `command_list` is the rows on their own, for a host that filters and moves the highlight itself; `fuzzy_score` is the ranking.

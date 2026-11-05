@@ -35,6 +35,7 @@
 //! [`Palette::from_hue_and_saturation`] or field by field.
 
 pub mod color;
+#[cfg(feature = "command-bar-window")]
 pub mod command_bar;
 pub mod containers;
 pub mod controls;
@@ -56,6 +57,7 @@ pub mod text_input;
 pub mod theme;
 pub mod typography;
 
+#[cfg(feature = "command-bar-window")]
 pub use command_bar::{
     CommandBarOptions, CommandBarOutcome, CommandBarWindow, Dismissal, close_command_bar,
     is_command_bar_open, open_command_bar, set_command_bar_commands,
