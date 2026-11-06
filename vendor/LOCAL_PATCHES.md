@@ -28,4 +28,4 @@ Each commit touching `vendor/` after the one that adds it is one of these, and s
 ## What has been run where
 
 - **macOS:** on screen, in the gallery's Native view page, over an `NSTextView` and a spinning `NSProgressIndicator`: opening, typing, choosing, Escape, a click on the parent, a click on the scrim, and the parent keeping its active title bar.
-- **Windows, X11:** type-checked from macOS only (`tools/check-windows.sh`, `tools/check-linux.sh`: zig stands in for the C and resource compilers, nothing is linked). Not yet run on either.
+- **Windows, X11:** type-checked and linted from macOS (`tools/check-windows.sh`, `tools/check-linux.sh`, each with `clippy` as its first argument for the lints: zig stands in for the C and resource compilers, nothing is linked), and built and tested by CI on both. Not yet run on screen on either.

@@ -274,7 +274,7 @@ mod imp {
                             &ChangeWindowAttributesAux::new().background_pixel(*colour),
                         )
                         .and_then(|_| connection.clear_area(true, child, 0, 0, 0, 0))
-                        .and_then(|_| connection.flush().map_err(Into::into));
+                        .and_then(|_| connection.flush());
                     if changed.is_err() {
                         return;
                     }
