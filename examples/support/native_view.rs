@@ -144,19 +144,84 @@ mod imp {
 
 #[cfg(target_os = "windows")]
 mod imp {
+    use std::cell::Cell;
+
     use gpui::{Bounds, Pixels, Window};
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, WPARAM};
+    use windows::Win32::Graphics::Gdi::{
+        CLEARTYPE_QUALITY, CreateFontW, DEFAULT_CHARSET, DeleteObject, FW_NORMAL, HFONT,
+    };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, ES_AUTOVSCROLL, ES_MULTILINE, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE,
-        SWP_NOZORDER, SetWindowPos, ShowWindow, WINDOW_STYLE, WS_CHILD, WS_EX_CLIENTEDGE,
+        CreateWindowExW, ES_AUTOVSCROLL, ES_MULTILINE, LWA_ALPHA, SW_HIDE, SW_SHOWNA,
+        SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetLayeredWindowAttributes, SetWindowPos,
+        ShowWindow, WINDOW_STYLE, WM_SETFONT, WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_LAYERED,
         WS_VSCROLL,
     };
     use windows::core::w;
 
     pub struct View {
         hwnd: HWND,
+        /// The control's font and the scale it was made for. Without one an
+        /// `EDIT` draws in the stock system font, which does not follow the
+        /// monitor's scale: tiny at 200%.
+        font: Cell<Option<(HFONT, f32)>>,
+    }
+
+    impl View {
+        /// Gives the control a font sized for `scale`, if it does not have one.
+        fn match_font(&self, scale: f32) {
+            if self
+                .font
+                .get()
+                .is_some_and(|(_, made_for)| made_for == scale)
+            {
+                return;
+            }
+            // 9 points, the size of the desktop's own text, at this scale.
+            let height = -(12.0 * scale).round() as i32;
+            let font = unsafe {
+                CreateFontW(
+                    height,
+                    0,
+                    0,
+                    0,
+                    FW_NORMAL.0 as i32,
+                    0,
+                    0,
+                    0,
+                    DEFAULT_CHARSET,
+                    Default::default(),
+                    Default::default(),
+                    CLEARTYPE_QUALITY,
+                    0,
+                    w!("Segoe UI"),
+                )
+            };
+            if font.is_invalid() {
+                return;
+            }
+            unsafe {
+                SendMessageW(
+                    self.hwnd,
+                    WM_SETFONT,
+                    Some(WPARAM(font.0 as usize)),
+                    Some(LPARAM(1)),
+                );
+            }
+            if let Some((old, _)) = self.font.replace(Some((font, scale))) {
+                let _ = unsafe { DeleteObject(old.into()) };
+            }
+        }
+    }
+
+    impl Drop for View {
+        fn drop(&mut self) {
+            if let Some((font, _)) = self.font.take() {
+                let _ = unsafe { DeleteObject(font.into()) };
+            }
+        }
     }
 
     impl View {
@@ -168,11 +233,15 @@ mod imp {
             };
             let parent = HWND(handle.hwnd.get() as *mut _);
             let instance = unsafe { GetModuleHandleW(None) }.ok()?;
+            // Layered, because GPUI's window is `WS_EX_NOREDIRECTIONBITMAP`: it
+            // draws only through DirectComposition, so a plain child has no
+            // surface for the desktop compositor to show. A layered child
+            // (Windows 8 and later) gets one of its own.
             let hwnd = unsafe {
                 CreateWindowExW(
-                    WS_EX_CLIENTEDGE,
+                    WS_EX_CLIENTEDGE | WS_EX_LAYERED,
                     w!("EDIT"),
-                    w!("A native EDIT control, a child HWND of the GPUI window.\r\n\r\nType here, then press Ctrl+J: the command bar opens above this control in a window of its own, and the control stays visible and live underneath."),
+                    w!("A native EDIT control, a child HWND of the GPUI window.\r\n\r\nType here: the keys are this control's own while it has the keyboard. Then open the command bar with the button above, or click outside this control and press Ctrl+J: it opens above this control in a window of its own, and the control stays visible and live underneath."),
                     WS_CHILD
                         | WS_VSCROLL
                         | WINDOW_STYLE(ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32),
@@ -187,7 +256,14 @@ mod imp {
                 )
             }
             .ok()?;
-            Some(View { hwnd })
+            // A layered window shows nothing until it is given its opacity.
+            unsafe { SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA) }.ok()?;
+            let view = View {
+                hwnd,
+                font: Cell::new(None),
+            };
+            view.match_font(window.scale_factor());
+            Some(view)
         }
 
         pub fn place(&self, bounds: Option<Bounds<Pixels>>, window: &Window) {
@@ -198,6 +274,8 @@ mod imp {
                 return;
             };
             let scale = window.scale_factor();
+            // The window may have moved to a monitor of another scale.
+            self.match_font(scale);
             let device = |pixels: Pixels| (f32::from(pixels) * scale).round() as i32;
             unsafe {
                 let _ = SetWindowPos(

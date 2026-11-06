@@ -392,6 +392,12 @@ fn translate_accelerator(msg: &MSG) -> Option<()> {
     if msg.message != WM_KEYDOWN && msg.message != WM_SYSKEYDOWN {
         return None;
     }
+    // A native child window a host embeds has the keyboard: its keys are its own. It would
+    // answer GPUI's private message with `DefWindowProc`'s 0, which reads as handled, and
+    // never see a key.
+    if !is_gpui_window(msg.hwnd) {
+        return None;
+    }
 
     let result = unsafe {
         SendMessageW(

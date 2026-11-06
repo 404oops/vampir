@@ -637,7 +637,7 @@ impl WindowsWindow {
                 .unwrap_or(""),
         );
 
-        let (mut dwexstyle, dwstyle) = if popup.is_some() {
+        let (mut dwexstyle, mut dwstyle) = if popup.is_some() {
             // Owned rather than topmost, so it is above its owner and nothing else; a tool
             // window, so it has no taskbar button; and activatable, so it can take the keyboard.
             let no_activate = if params.focus {
@@ -670,6 +670,10 @@ impl WindowsWindow {
         if !disable_direct_composition {
             dwexstyle |= WS_EX_NOREDIRECTIONBITMAP;
         }
+        // A native child window a host embeds paints itself: without this, the `ValidateRect`
+        // that ends each frame of ours validates the child's area too, and the child never
+        // hears that it has to paint.
+        dwstyle |= WS_CLIPCHILDREN;
 
         let hinstance = get_module_handle();
         // A popup opens on its owner's monitor, at its owner's scale.
@@ -1786,6 +1790,19 @@ unsafe extern "system" fn window_procedure(
     }
 
     result
+}
+
+/// Whether `hwnd` is one of GPUI's own windows, rather than a native child window a host
+/// embedded in one: an `EDIT` control, a web view. Only GPUI's windows understand GPUI's private
+/// messages, and only theirs can be read through `window_from_hwnd`.
+pub(crate) fn is_gpui_window(hwnd: HWND) -> bool {
+    if hwnd.is_invalid() {
+        return false;
+    }
+    let mut class = [0u16; 32];
+    let length = unsafe { GetClassNameW(hwnd, &mut class) } as usize;
+    // SAFETY: a `w!` literal is NUL-terminated.
+    length > 0 && class[..length] == *unsafe { WINDOW_CLASS_NAME.as_wide() }
 }
 
 pub(crate) fn window_from_hwnd(hwnd: HWND) -> Option<Rc<WindowsWindowInner>> {
