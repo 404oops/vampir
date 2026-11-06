@@ -32,7 +32,7 @@ Every control animates its changes of state — the switch slides, the tick draw
 
 ## Containers — `vampir::containers`
 
-`tab_bar` (natural-width horizontal tabs, drag to reorder, optional close buttons, and a raised pill that slides to the active tab), `tab_bar_layout` with `TabBarLayout::{Horizontal, HorizontalUniform { width }, Vertical}`, `split_handle` + `split_area`, `collapsible` (unfolds to its measured height), `dialog` + `DialogButton`.
+`tab_bar` (natural-width horizontal tabs, drag to reorder, optional close buttons, and a raised pill that slides to the active tab), `tab_bar_layout` with `TabBarLayout::{Horizontal, HorizontalUniform { width }, Vertical}`, `split_handle` + `split_area`, `collapsible` (unfolds to its measured height), and `dialog` + `DialogButton`.
 
 `HorizontalUniform` keeps each tab at the same width (clamped to 96–320), elides long labels, and scrolls sideways when the strip is full. Its close buttons stay at the same position within each tab as siblings close. `Vertical` fills the width its host gives it and scrolls down when its height is constrained. In every layout, tabs fade out into the well at an edge with more past it rather than being cut off there. Both layouts keep the same select, close and drag callbacks as `tab_bar`; arrow keys follow the layout's direction and bring the newly selected tab into view. A `Tab` is identified by its label unless `Tab::id` says otherwise, and everything the bar remembers about a tab follows that identity through a reorder. The gallery's Data page renders both dense horizontal and vertical bars over the same host-owned tabs.
 
@@ -48,7 +48,7 @@ The page itself is laid out with the same vocabulary: `card` is the lit panel wi
 
 ## Menus — `vampir::menu`
 
-`context_menu` renders the open menu; `MenuItem::action(..).shortcut(..).checked(..).danger().disabled()` builds action rows, `MenuItem::submenu(label, items)` nests a menu to any depth, and `MenuItem::header` and `MenuItem::separator` break rows up. A submenu can also be disabled. Open the menu from wherever the press happened:
+`context_menu` renders the open menu; `MenuItem::action(id, label).shortcut(..).checked(..).danger().disabled()` builds action rows, `MenuItem::submenu(label, items)` nests a menu to any depth, and `MenuItem::header` and `MenuItem::separator` break rows up. A submenu can also be disabled, and `enabled(bool)` sets either from a value. An action's `id` is what comes back when it is chosen: a `&'static str` by default, or the host's own command type — `MenuItem<Option<Command>>` is a menu whose rows carry what they do, with `None` for a row that only says something — so there is no table to keep in step with the rows. Any action or submenu can carry an icon with `.icon(..)`: a `MenuIcon` is whatever the host draws at a size in a colour, converted once from the host's icon type with `impl From<Icon> for MenuIcon`, and a level with an icon anywhere in it keeps an icon column so its labels line up. Open the menu from wherever the press happened:
 
 ```rust
 .on_mouse_down(MouseButton::Right, cx.listener(|this, event: &MouseDownEvent, _w, cx| {
@@ -75,6 +75,10 @@ These are in-window menus drawn by the toolkit. The macOS menu bar is a differen
 ![The command palette open over the fields page](overlays.png)
 
 `Tooltip::text` / `Tooltip::with_shortcut` plug into GPUI's own `.tooltip(..)`, which already owns the hover delay and the placement; `Hint` is what one says, for a control such as `icon_button` that carries its own.
+
+![The command bar above the Native view page's live NSTextView, filtering for "to"](command-bar.png)
+
+`open_command_bar` is the palette in a window of its own above the host window, for a host with a live native view over its content that would hide the in-window palette; `CommandBarOptions::dim` darkens the host window behind it. The gallery's Native view page shows it over a real native view. See [hosting](hosting.md#over-a-native-view).
 
 `command_palette` is opened with `ControlState::open_palette`, or `toggle_palette` from whatever shortcut the host gives it, and renders nothing otherwise. The host owns the query `TextInput` and the `Command`s; the palette filters them with `fuzzy_filter` as the query is typed, moves the highlight with Up and Down, runs the highlighted command on Enter or a clicked one, and closes on Escape or the scrim — handing the keyboard back where it was before the command runs.
 

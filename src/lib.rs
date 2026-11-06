@@ -35,6 +35,8 @@
 //! [`Palette::from_hue_and_saturation`] or field by field.
 
 pub mod color;
+#[cfg(feature = "command-bar-window")]
+pub mod command_bar;
 pub mod containers;
 pub mod controls;
 pub mod data;
@@ -55,6 +57,11 @@ pub mod text_input;
 pub mod theme;
 pub mod typography;
 
+#[cfg(feature = "command-bar-window")]
+pub use command_bar::{
+    CommandBarOptions, CommandBarOutcome, CommandBarWindow, Dismissal, close_command_bar,
+    is_command_bar_open, open_command_bar, set_command_bar_commands,
+};
 pub use containers::{
     CARD_LIFT, DialogButton, Tab, TabBarLayout, arriving, card, card_at, collapsible, column,
     dialog, labelled, reorder, row, scroll_area, split_area, split_handle, tab_bar, tab_bar_layout,
@@ -79,7 +86,9 @@ pub use keyboard::{
 pub use lighting::{
     glow, ground, ground_at, lit, lit_at, lit_mix, lit_stops, panel, raised, recessed, rim, shade,
 };
-pub use menu::{ContextMenu, MenuAction, MenuItem, context_menu, menu_button, menu_target};
+pub use menu::{
+    ContextMenu, MenuAction, MenuIcon, MenuItem, context_menu, menu_button, menu_target,
+};
 pub use overlay::{
     Command, Hint, SearchResult, Tooltip, command_list, command_palette, fuzzy_filter, fuzzy_score,
     rank_results, ranked_command_palette, ranked_search_list, search_list,

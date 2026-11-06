@@ -41,7 +41,7 @@ done
 app="dist/Vampir gallery.app"
 contents="$app/Contents"
 
-cargo build --profile "$profile" --example gallery
+cargo build --profile "$profile" --example gallery --features command-bar-window
 
 rm -rf "$app"
 mkdir -p "$contents/MacOS" "$contents/Resources"

@@ -1990,8 +1990,6 @@ dependencies = [
 [[package]]
 name = "gpui-ce"
 version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0af79c6659e0fea67773cfbd751fc5c8e51be00139827f365d7d1237a468a4d"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -2096,8 +2094,6 @@ dependencies = [
 [[package]]
 name = "gpui_ce_linux"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab947c84c6460f6431c99bd6a8b0954591bfa511c0006515ecc3897e7a903c84"
 dependencies = [
  "accesskit",
  "accesskit_unix",
@@ -2148,8 +2144,6 @@ dependencies = [
 [[package]]
 name = "gpui_ce_macos"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af0fe6b615e579ce0180198417815547c1c9ae654dc1e2382299f0c3f3564f79"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -2354,8 +2348,6 @@ dependencies = [
 [[package]]
 name = "gpui_ce_windows"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "063326fe043ef3f51b0b36877e8d9f9af0e20d6dfe51efcb275a3cd380128e02"
 dependencies = [
  "accesskit",
  "accesskit_windows",
@@ -5788,7 +5780,10 @@ dependencies = [
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
+ "raw-window-handle",
  "unicode-segmentation",
+ "windows 0.62.2",
+ "x11rb",
 ]
 
 [[package]]
