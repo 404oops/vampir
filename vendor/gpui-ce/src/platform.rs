@@ -1480,6 +1480,12 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
     /// Resizes the window's content area to `size`, in logical pixels.
     fn resize(&mut self, size: Size<Pixels>);
+    /// Moves a [`WindowKind::AnchoredPopup`] to a new anchor rectangle on its parent, for a
+    /// popup whose anchor moved without its parent moving: the parent was resized, or what the
+    /// popup is anchored to was laid out again. Following the parent as a whole is the
+    /// backend's job and needs no call. Does nothing for any other kind of window, and on
+    /// platforms without native popups.
+    fn set_popup_anchor(&self, _anchor_rect: Bounds<Pixels>) {}
     /// Returns the number of device pixels per logical pixel.
     fn scale_factor(&self) -> f32;
     /// Returns the window's light or dark appearance.
