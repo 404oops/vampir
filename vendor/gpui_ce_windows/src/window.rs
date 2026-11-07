@@ -18,8 +18,7 @@ use smallvec::SmallVec;
 use windows::{
     Win32::{
         Foundation::*,
-        Graphics::Dwm::*,
-        Graphics::Gdi::*,
+        Graphics::{Dwm::*, Gdi::*},
         System::{
             Com::*, Diagnostics::Debug::MessageBeep, LibraryLoader::*, Ole::*, SystemServices::*,
         },
@@ -31,9 +30,6 @@ use windows::{
 use crate::direct_manipulation::DirectManipulationHandler;
 use crate::*;
 use gpui::*;
-
-#[cfg(feature = "wgpu")]
-use gpui_wgpu::{WgpuRenderer, WgpuSurfaceConfig, wgpu};
 
 pub(crate) struct WindowsWindow(pub Rc<WindowsWindowInner>);
 
@@ -57,23 +53,22 @@ pub struct WindowsWindowState {
     pub restore_from_minimized: Cell<Option<Box<dyn FnMut(RequestFrameOptions)>>>,
 
     pub callbacks: Callbacks,
+    pub frame_signal: Arc<PlatformFrameSignal>,
     pub input_handler: Cell<Option<PlatformInputHandler>>,
     pub ime_enabled: Cell<bool>,
     pub pending_surrogate: Cell<Option<u16>>,
     pub last_reported_modifiers: Cell<Option<Modifiers>>,
     pub last_reported_capslock: Cell<Option<Capslock>>,
     pub hovered: Cell<bool>,
+    pub last_visibility: Cell<Option<WindowVisibility>>,
     pub direct_manipulation: DirectManipulationHandler,
 
-    #[cfg(feature = "wgpu")]
-    pub renderer: RefCell<WgpuRenderer>,
-    #[cfg(not(feature = "wgpu"))]
     pub renderer: RefCell<DirectXRenderer>,
     /// Set when the next `draw_window` call must be treated as a forced
     /// render. Used after a GPU device-lost recovery, where the next frame
     /// must both re-enable drawing (via `mark_drawable`) and bypass the GPUI
     /// view cache (which would otherwise replay stale atlas tile references
-    /// from the previous frame and panic in `DirectXAtlasState::texture`),
+    /// from the previous frame and panic in `DirectXAtlasTextures::texture`),
     /// and when a forced render was requested while another draw was in
     /// progress and had to be deferred.
     pub force_render_pending: Cell<bool>,
@@ -88,7 +83,6 @@ pub struct WindowsWindowState {
     pub display: Cell<WindowsDisplay>,
     /// Flag to instruct the `VSyncProvider` thread to invalidate the directx devices
     /// as resizing them has failed, causing us to have lost at least the render target.
-    #[cfg(not(feature = "wgpu"))]
     pub invalidate_devices: Arc<AtomicBool>,
     /// Shared with [`WindowsPlatformState::draw_coordinator`] and every other window.
     pub(crate) draw_coordinator: Rc<DrawCoordinator>,
@@ -100,6 +94,7 @@ pub struct WindowsWindowState {
 
 pub(crate) struct WindowsWindowInner {
     hwnd: HWND,
+    pub(crate) dialog_owner: Rc<crate::dialog::DialogOwner>,
     drop_target_helper: IDropTargetHelper,
     pub(crate) state: WindowsWindowState,
     system_settings: WindowsSystemSettings,
@@ -113,46 +108,20 @@ pub(crate) struct WindowsWindowInner {
     pub(crate) main_receiver: PriorityQueueReceiver<RunnableVariant>,
     pub(crate) platform_window_handle: HWND,
     pub(crate) parent_hwnd: Option<HWND>,
-    /// Set when this window is a [`WindowKind::AnchoredPopup`].
-    pub(crate) popup: Option<PopupState>,
-    /// The anchored popups this window owns, which follow it when it moves. Weak, because the
-    /// popups belong to GPUI; each one takes itself out of the list when it is destroyed.
-    pub(crate) owned_popups: RefCell<Vec<Weak<WindowsWindowInner>>>,
-    /// The activity last reported to GPUI, so that the keyboard moving between a window and its
-    /// own popups is not reported as the window going inactive and straight back.
-    pub(crate) reported_active: Cell<Option<bool>>,
-}
-
-/// What an anchored popup needs to keep to its anchor as its owner moves.
-///
-/// The popup is an owned `WS_POPUP` window, so it stays above its owner and only its owner, is
-/// hidden while the owner is minimised and is destroyed with it — all done by the OS.
-/// [`popup::PopupOptions::grab`] has no effect on this backend: there is no pointer capture and
-/// no dismissal on clicks outside; the popup takes the keyboard only when opened with `focus`.
-pub(crate) struct PopupState {
-    owner: HWND,
-    options: RefCell<popup::PopupOptions>,
-    /// The size asked for, kept apart from the window's own size because a constraint adjustment
-    /// may have shrunk the window, and it should grow back once there is room.
-    size: Cell<Size<Pixels>>,
-    /// Whether the popup was opened to take the keyboard. One that was not — a scrim, a hint —
-    /// is `WS_EX_NOACTIVATE` and answers `MA_NOACTIVATE`, so a click on it leaves the keyboard
-    /// where it is.
-    pub(crate) takes_focus: bool,
 }
 
 impl WindowsWindowState {
     fn new(
         hwnd: HWND,
-        #[cfg(not(feature = "wgpu"))] directx_devices: &DirectXDevices,
+        directx_devices: &DirectXDevices,
         window_params: &CREATESTRUCTW,
         current_cursor: Option<HCURSOR>,
         cursor_visible: Arc<AtomicBool>,
         display: WindowsDisplay,
         min_size: Option<Size<Pixels>>,
         appearance: WindowAppearance,
-        #[cfg(not(feature = "wgpu"))] disable_direct_composition: bool,
-        #[cfg(not(feature = "wgpu"))] invalidate_devices: Arc<AtomicBool>,
+        disable_direct_composition: bool,
+        invalidate_devices: Arc<AtomicBool>,
         draw_coordinator: Rc<DrawCoordinator>,
     ) -> Result<Self> {
         let scale_factor = {
@@ -171,20 +140,6 @@ impl WindowsWindowState {
         };
         let border_offset = WindowBorderOffset::default();
         let restore_from_minimized = None;
-        #[cfg(feature = "wgpu")]
-        let renderer = WgpuRenderer::new(
-            Rc::new(RefCell::new(None)),
-            &RawWindow { hwnd },
-            WgpuSurfaceConfig {
-                size: physical_size,
-                transparent: false,
-                preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
-            },
-            None,
-            None,
-        )
-        .context("Creating Wgpu renderer")?;
-        #[cfg(not(feature = "wgpu"))]
         let renderer = DirectXRenderer::new(hwnd, directx_devices, disable_direct_composition)
             .context("Creating DirectX renderer")?;
         let callbacks = Callbacks::default();
@@ -212,12 +167,14 @@ impl WindowsWindowState {
             restore_from_minimized: Cell::new(restore_from_minimized),
             min_size,
             callbacks,
+            frame_signal: Arc::new(PlatformFrameSignal::new()),
             input_handler: Cell::new(input_handler),
             ime_enabled: Cell::new(true),
             pending_surrogate: Cell::new(pending_surrogate),
             last_reported_modifiers: Cell::new(last_reported_modifiers),
             last_reported_capslock: Cell::new(last_reported_capslock),
             hovered: Cell::new(hovered),
+            last_visibility: Cell::new(None),
             renderer: RefCell::new(renderer),
             force_render_pending: Cell::new(false),
             click_state,
@@ -229,7 +186,6 @@ impl WindowsWindowState {
             fullscreen: Cell::new(fullscreen),
             initial_placement: Cell::new(initial_placement),
             hwnd,
-            #[cfg(not(feature = "wgpu"))]
             invalidate_devices,
             draw_coordinator,
             direct_manipulation,
@@ -297,10 +253,22 @@ impl WindowsWindowState {
 }
 
 impl WindowsWindowInner {
+    /// Whether the window is being presented: shown and not minimized. Windows
+    /// has no notification for a window fully covered by other windows, so
+    /// that case reports `Visible`.
+    pub(crate) fn visibility(&self) -> WindowVisibility {
+        let is_visible =
+            unsafe { IsWindowVisible(self.hwnd).as_bool() && !IsIconic(self.hwnd).as_bool() };
+        if is_visible {
+            WindowVisibility::Visible
+        } else {
+            WindowVisibility::Hidden
+        }
+    }
+
     fn new(context: &mut WindowCreateContext, hwnd: HWND, cs: &CREATESTRUCTW) -> Result<Rc<Self>> {
         let state = WindowsWindowState::new(
             hwnd,
-            #[cfg(not(feature = "wgpu"))]
             &context.directx_devices,
             cs,
             context.current_cursor,
@@ -308,15 +276,14 @@ impl WindowsWindowInner {
             context.display,
             context.min_size,
             context.appearance,
-            #[cfg(not(feature = "wgpu"))]
             context.disable_direct_composition,
-            #[cfg(not(feature = "wgpu"))]
             context.invalidate_devices.clone(),
             context.draw_coordinator.clone(),
         )?;
 
         Ok(Rc::new(Self {
             hwnd,
+            dialog_owner: crate::dialog::DialogOwner::new(hwnd),
             drop_target_helper: context.drop_target_helper.clone(),
             state,
             handle: context.handle,
@@ -330,108 +297,7 @@ impl WindowsWindowInner {
             platform_window_handle: context.platform_window_handle,
             system_settings: WindowsSystemSettings::new(),
             parent_hwnd: context.parent_hwnd,
-            popup: context.popup.take(),
-            owned_popups: RefCell::new(Vec::new()),
-            reported_active: Cell::new(None),
         }))
-    }
-
-    /// Puts an anchored popup where its options say, against where its owner is now. Does
-    /// nothing for any other window, or while the owner is minimised: the OS has hidden the
-    /// popup then, and the owner's client origin is meaningless until it is restored, which
-    /// moves it again.
-    pub(crate) fn follow_anchor(&self) {
-        let Some(popup) = &self.popup else {
-            return;
-        };
-        if unsafe { IsIconic(popup.owner) }.as_bool() {
-            return;
-        }
-        let options = popup.options.borrow().clone();
-        let Some(bounds) = anchored_popup_bounds(
-            &options,
-            popup.owner,
-            popup.size.get(),
-            self.state.scale_factor.get(),
-        ) else {
-            return;
-        };
-        let rect = calculate_window_rect(bounds, &self.state.border_offset);
-        unsafe {
-            SetWindowPos(
-                self.hwnd,
-                None,
-                rect.left,
-                rect.top,
-                rect.right - rect.left,
-                rect.bottom - rect.top,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            )
-        }
-        .context("unable to place anchored popup")
-        .log_err();
-    }
-
-    /// The owner of this window, if it is an anchored popup.
-    pub(crate) fn popup_owner(&self) -> Option<HWND> {
-        self.popup.as_ref().map(|popup| popup.owner)
-    }
-
-    /// Whether `hwnd` is one of the anchored popups this window owns and that is still open.
-    pub(crate) fn owns_popup(&self, hwnd: HWND) -> bool {
-        self.owned_popups
-            .borrow()
-            .iter()
-            .filter_map(Weak::upgrade)
-            .any(|popup| popup.hwnd == hwnd)
-    }
-
-    /// Whether this window has the keyboard, itself or through one of its own popups. Under its
-    /// popup a window stays the window in front, as it does under a menu.
-    pub(crate) fn is_effectively_active(&self) -> bool {
-        let active = unsafe { GetActiveWindow() };
-        !active.is_invalid() && (active == self.hwnd || self.owns_popup(active))
-    }
-
-    /// Tells GPUI whether this window is active, if that changed since it was last told.
-    pub(crate) fn report_activation(&self) {
-        let active = self.is_effectively_active();
-        if self.reported_active.replace(Some(active)) == Some(active) {
-            return;
-        }
-        if let Some(mut func) = self.state.callbacks.active_status_change.take() {
-            func(active);
-            self.state.callbacks.active_status_change.set(Some(func));
-        }
-    }
-
-    /// Moves every anchored popup this window owns along with it.
-    pub(crate) fn move_owned_popups(&self) {
-        // Collected first: placing a popup re-enters the window procedure.
-        let popups: SmallVec<[Rc<WindowsWindowInner>; 2]> = self
-            .owned_popups
-            .borrow()
-            .iter()
-            .filter_map(Weak::upgrade)
-            .collect();
-        for popup in popups {
-            popup.follow_anchor();
-        }
-    }
-
-    /// Takes a destroyed popup out of its owner's list, so the owner never moves a window that
-    /// has gone. Owned windows are destroyed before their owner, so the owner is still there.
-    pub(crate) fn detach_from_owner(&self) {
-        let Some(popup) = &self.popup else {
-            return;
-        };
-        if let Some(owner) = window_from_hwnd(popup.owner) {
-            let this: *const WindowsWindowInner = self;
-            owner
-                .owned_popups
-                .borrow_mut()
-                .retain(|popup| popup.strong_count() > 0 && popup.as_ptr() != this);
-        }
     }
 
     fn toggle_fullscreen(self: &Rc<Self>) {
@@ -532,9 +398,11 @@ pub(crate) struct Callbacks {
     pub(crate) request_frame: Cell<Option<Box<dyn FnMut(RequestFrameOptions)>>>,
     pub(crate) input: Cell<Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>>,
     pub(crate) active_status_change: Cell<Option<Box<dyn FnMut(bool)>>>,
+    pub(crate) visibility_change: Cell<Option<Box<dyn FnMut(WindowVisibility)>>>,
     pub(crate) hovered_status_change: Cell<Option<Box<dyn FnMut(bool)>>>,
     pub(crate) resize: Cell<Option<Box<dyn FnMut(Size<Pixels>, f32)>>>,
     pub(crate) moved: Cell<Option<Box<dyn FnMut()>>>,
+    pub(crate) display_changed: Cell<Option<Box<dyn FnMut()>>>,
     pub(crate) should_close: Cell<Option<Box<dyn FnMut() -> bool>>>,
     pub(crate) close: Cell<Option<Box<dyn FnOnce()>>>,
     pub(crate) hit_test_window_control: Cell<Option<Box<dyn FnMut() -> Option<WindowControlArea>>>>,
@@ -558,15 +426,11 @@ struct WindowCreateContext {
     main_receiver: PriorityQueueReceiver<RunnableVariant>,
     platform_window_handle: HWND,
     appearance: WindowAppearance,
-    #[cfg(not(feature = "wgpu"))]
     disable_direct_composition: bool,
-    #[cfg(not(feature = "wgpu"))]
     directx_devices: DirectXDevices,
-    #[cfg(not(feature = "wgpu"))]
     invalidate_devices: Arc<AtomicBool>,
     draw_coordinator: Rc<DrawCoordinator>,
     parent_hwnd: Option<HWND>,
-    popup: Option<PopupState>,
 }
 
 impl WindowsWindow {
@@ -574,20 +438,12 @@ impl WindowsWindow {
         handle: AnyWindowHandle,
         params: WindowParams,
         creation_info: WindowCreationInfo,
-        popup_owner: Option<Rc<WindowsWindowInner>>,
     ) -> Result<Self> {
-        let popup = match (&params.kind, &popup_owner) {
-            (WindowKind::AnchoredPopup(options), Some(owner)) => Some(PopupState {
-                owner: owner.hwnd,
-                options: RefCell::new(options.clone()),
-                size: Cell::new(params.bounds.size),
-                takes_focus: params.focus,
-            }),
-            (WindowKind::AnchoredPopup(_), None) => {
-                anyhow::bail!("an anchored popup's parent window is not open")
-            }
-            _ => None,
-        };
+        // Native popups are not implemented on Windows yet. Rejecting lets callers fall back to
+        // gpui's in-window popovers.
+        if let WindowKind::AnchoredPopup(_) = params.kind {
+            return Err(popup::PopupNotSupportedError.into());
+        }
 
         let WindowCreationInfo {
             icon,
@@ -599,15 +455,10 @@ impl WindowsWindow {
             main_receiver,
             platform_window_handle,
             disable_direct_composition,
-            #[cfg(not(feature = "wgpu"))]
             directx_devices,
             invalidate_devices,
             draw_coordinator,
         } = creation_info;
-        #[cfg(feature = "wgpu")]
-        {
-            _ = invalidate_devices;
-        }
         register_window_class(icon);
         let parent_hwnd = if params.kind == WindowKind::Dialog {
             let parent_window = unsafe { GetActiveWindow() };
@@ -637,16 +488,7 @@ impl WindowsWindow {
                 .unwrap_or(""),
         );
 
-        let (mut dwexstyle, mut dwstyle) = if popup.is_some() {
-            // Owned rather than topmost, so it is above its owner and nothing else; a tool
-            // window, so it has no taskbar button; and activatable, so it can take the keyboard.
-            let no_activate = if params.focus {
-                WINDOW_EX_STYLE(0)
-            } else {
-                WS_EX_NOACTIVATE
-            };
-            (WS_EX_TOOLWINDOW | no_activate, WS_POPUP)
-        } else if params.kind == WindowKind::PopUp {
+        let (mut dwexstyle, dwstyle) = if params.kind == WindowKind::PopUp {
             (WS_EX_TOOLWINDOW | WS_EX_TOPMOST, WINDOW_STYLE(0x0))
         } else {
             let mut dwstyle = WS_SYSMENU;
@@ -670,27 +512,9 @@ impl WindowsWindow {
         if !disable_direct_composition {
             dwexstyle |= WS_EX_NOREDIRECTIONBITMAP;
         }
-        // A native child window a host embeds paints itself: without this, the `ValidateRect`
-        // that ends each frame of ours validates the child's area too, and the child never
-        // hears that it has to paint.
-        dwstyle |= WS_CLIPCHILDREN;
 
         let hinstance = get_module_handle();
-        // A popup opens on its owner's monitor, at its owner's scale.
-        let initial_popup_bounds = popup
-            .as_ref()
-            .map(|popup| {
-                let options = popup.options.borrow();
-                let owner_scale =
-                    unsafe { GetDpiForWindow(popup.owner) } as f32 / USER_DEFAULT_SCREEN_DPI as f32;
-                anchored_popup_bounds(&options, popup.owner, popup.size.get(), owner_scale)
-                    .context("unable to place an anchored popup on its parent")
-            })
-            .transpose()?;
-        let display = if let Some(popup) = &popup {
-            let monitor = unsafe { MonitorFromWindow(popup.owner, MONITOR_DEFAULTTONEAREST) };
-            WindowsDisplay::new(WindowsDisplay::display_id_for_monitor(monitor))
-        } else if let Some(display_id) = params.display_id {
+        let display = if let Some(display_id) = params.display_id {
             WindowsDisplay::new(display_id)
         } else {
             None
@@ -698,17 +522,14 @@ impl WindowsWindow {
         .or_else(WindowsDisplay::primary_monitor)
         .context("failed to find any monitor")?;
         let appearance = system_appearance().unwrap_or_default();
-        let is_popup = popup.is_some();
-        let owner_hwnd = popup.as_ref().map(|popup| popup.owner);
         let mut context = WindowCreateContext {
             inner: None,
             handle,
             hide_title_bar,
             display,
-            // A popup goes where its anchor is, not where it is dragged.
-            is_movable: params.is_movable && !is_popup,
-            is_resizable: params.is_resizable && !is_popup,
-            is_minimizable: params.is_minimizable && !is_popup,
+            is_movable: params.is_movable,
+            is_resizable: params.is_resizable,
+            is_minimizable: params.is_minimizable,
             min_size: params.window_min_size,
             executor,
             current_cursor,
@@ -718,25 +539,11 @@ impl WindowsWindow {
             main_receiver,
             platform_window_handle,
             appearance,
-            #[cfg(not(feature = "wgpu"))]
             disable_direct_composition,
-            #[cfg(not(feature = "wgpu"))]
             directx_devices,
-            #[cfg(not(feature = "wgpu"))]
             invalidate_devices,
             draw_coordinator,
             parent_hwnd,
-            popup,
-        };
-        // Created where it belongs, so that it takes the DPI of its owner's monitor from the start.
-        let (x, y, cx, cy) = match initial_popup_bounds {
-            Some(bounds) => (
-                bounds.origin.x.0,
-                bounds.origin.y.0,
-                bounds.size.width.0,
-                bounds.size.height.0,
-            ),
-            None => (CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT),
         };
         let creation_result = unsafe {
             CreateWindowExW(
@@ -744,13 +551,11 @@ impl WindowsWindow {
                 WINDOW_CLASS_NAME,
                 &window_name,
                 dwstyle,
-                x,
-                y,
-                cx,
-                cy,
-                // The owner of a dialog or a popup: not `WS_CHILD`, so this is ownership, not
-                // containment. Only a dialog disables its owner (above).
-                parent_hwnd.or(owner_hwnd),
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                parent_hwnd,
                 None,
                 Some(hinstance.into()),
                 Some(&context as *const _ as *const _),
@@ -767,26 +572,8 @@ impl WindowsWindow {
         set_non_rude_hwnd(hwnd, true);
         configure_dwm_dark_mode(hwnd, appearance);
         this.state.border_offset.update(hwnd)?;
-        if let Some(owner) = popup_owner {
-            {
-                let mut owned_popups = owner.owned_popups.borrow_mut();
-                owned_popups.retain(|popup| popup.strong_count() > 0);
-                owned_popups.push(Rc::downgrade(&this));
-            }
-            // Again, now that the popup's own scale is known, in case its monitor's differs.
-            this.follow_anchor();
-            if params.show {
-                show_popup(hwnd, params.focus);
-            }
-            return Ok(Self(this));
-        }
-        let placement = retrieve_window_placement(
-            hwnd,
-            display,
-            params.bounds,
-            this.state.scale_factor.get(),
-            &this.state.border_offset,
-        )?;
+        let placement =
+            retrieve_window_placement(hwnd, display, params.bounds, &this.state.border_offset)?;
         if params.show {
             let mut placement = placement;
             if !params.focus {
@@ -801,35 +588,6 @@ impl WindowsWindow {
         }
 
         Ok(Self(this))
-    }
-}
-
-#[cfg(feature = "wgpu")]
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct RawWindow {
-    pub hwnd: HWND,
-}
-
-#[cfg(feature = "wgpu")]
-unsafe impl Send for RawWindow {}
-#[cfg(feature = "wgpu")]
-unsafe impl Sync for RawWindow {}
-
-#[cfg(feature = "wgpu")]
-impl rwh::HasWindowHandle for RawWindow {
-    fn window_handle(&self) -> std::result::Result<rwh::WindowHandle<'_>, rwh::HandleError> {
-        let raw = rwh::Win32WindowHandle::new(unsafe {
-            NonZeroIsize::new_unchecked(self.hwnd.0 as isize)
-        })
-        .into();
-        Ok(unsafe { rwh::WindowHandle::borrow_raw(raw) })
-    }
-}
-
-#[cfg(feature = "wgpu")]
-impl rwh::HasDisplayHandle for RawWindow {
-    fn display_handle(&self) -> std::result::Result<rwh::DisplayHandle<'_>, rwh::HandleError> {
-        Ok(rwh::DisplayHandle::windows())
     }
 }
 
@@ -851,11 +609,17 @@ impl rwh::HasDisplayHandle for WindowsWindow {
 
 impl Drop for WindowsWindow {
     fn drop(&mut self) {
+        self.0.dialog_owner.close();
+        unsafe { ShowWindowAsync(self.0.hwnd, SW_HIDE).ok().log_err() };
+        // `DestroyWindow` below sends `WM_SHOWWINDOW`; without a callback the
+        // resulting visibility report has nothing to notify.
+        self.0.state.callbacks.visibility_change.take();
         // clone this `Rc` to prevent early release of the pointer
         let this = self.0.clone();
         self.0
             .executor
             .spawn(async move {
+                this.dialog_owner.when_idle().await;
                 let handle = this.hwnd;
                 unsafe {
                     RevokeDragDrop(handle).log_err();
@@ -888,17 +652,6 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn resize(&mut self, size: Size<Pixels>) {
-        if let Some(popup) = &self.0.popup {
-            // Placed again rather than resized in place, so a popup that grows keeps its anchor
-            // and still flips or slides to stay on screen.
-            popup.size.set(size);
-            let this = self.0.clone();
-            self.0
-                .executor
-                .spawn(async move { this.follow_anchor() })
-                .detach();
-            return;
-        }
         let hwnd = self.0.hwnd;
         let bounds = gpui::bounds(self.bounds().origin, size).to_device_pixels(self.scale_factor());
         let rect = calculate_window_rect(bounds, &self.state.border_offset);
@@ -920,20 +673,6 @@ impl PlatformWindow for WindowsWindow {
                     .log_err();
                 }
             })
-            .detach();
-    }
-
-    fn set_popup_anchor(&self, anchor_rect: Bounds<Pixels>) {
-        let Some(popup) = &self.0.popup else {
-            return;
-        };
-        popup.options.borrow_mut().anchor_rect = anchor_rect;
-        // Deferred like `resize`: moving the window synchronously would call back into GPUI
-        // while the caller still has it borrowed.
-        let this = self.0.clone();
-        self.0
-            .executor
-            .spawn(async move { this.follow_anchor() })
             .detach();
     }
 
@@ -978,6 +717,51 @@ impl PlatformWindow for WindowsWindow {
         self.state.input_handler.take()
     }
 
+    fn show_character_palette(&self) {
+        // SendInput targets the foreground window, so don't open the picker for
+        // another application if this window has lost focus.
+        if unsafe { GetForegroundWindow() } != self.0.hwnd {
+            log::warn!("Cannot show the character palette for an inactive window");
+            return;
+        }
+
+        // Windows exposes its emoji picker through Win+period. Temporarily
+        // release the action's modifiers (e.g. Ctrl+Space) so they don't change
+        // that shortcut, then restore them in the same input batch.
+        const MODIFIER_KEYS: [VIRTUAL_KEY; 6] = [
+            VK_LCONTROL,
+            VK_RCONTROL,
+            VK_LSHIFT,
+            VK_RSHIFT,
+            VK_LMENU,
+            VK_RMENU,
+        ];
+        let held_modifiers = MODIFIER_KEYS
+            .into_iter()
+            .filter(|key| unsafe { GetAsyncKeyState(key.0 as i32) } < 0)
+            .collect::<Vec<_>>();
+        let win_held = [VK_LWIN, VK_RWIN]
+            .into_iter()
+            .any(|key| unsafe { GetAsyncKeyState(key.0 as i32) } < 0);
+        let inputs = character_palette_inputs(&held_modifiers, win_held);
+        let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+        if sent as usize != inputs.len() {
+            // A partial send must not leave our synthetic Win/period keys down
+            // or leave the caller's modifiers released.
+            let mut cleanup = vec![character_palette_key(VK_OEM_PERIOD, true)];
+            if !win_held {
+                cleanup.push(character_palette_key(VK_LWIN, true));
+            }
+            cleanup.extend(
+                held_modifiers
+                    .iter()
+                    .map(|&key| character_palette_key(key, false)),
+            );
+            unsafe { SendInput(&cleanup, std::mem::size_of::<INPUT>() as i32) };
+            log::warn!("Failed to open the Windows character palette: sent {sent} input events");
+        }
+    }
+
     fn prompt(
         &self,
         level: PromptLevel,
@@ -985,18 +769,19 @@ impl PlatformWindow for WindowsWindow {
         detail: Option<&str>,
         answers: &[PromptButton],
     ) -> Option<Receiver<usize>> {
-        let (done_tx, done_rx) = oneshot::channel();
+        let (mut done_tx, done_rx) = oneshot::channel();
         let msg = msg.to_string();
         let detail_string = detail.map(|detail| detail.to_string());
-        let handle = self.0.hwnd;
         let answers = answers.to_vec();
-        self.0
-            .executor
-            .spawn(async move {
+        let dialog = crate::dialog::show_dialog(
+            Some(self.0.dialog_owner.clone()),
+            &self.0.executor,
+            move |handle| {
                 unsafe {
                     let mut config = TASKDIALOGCONFIG::default();
                     config.cbSize = std::mem::size_of::<TASKDIALOGCONFIG>() as _;
                     config.hwndParent = handle;
+                    config.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION;
                     let title;
                     let main_icon;
                     match level {
@@ -1044,17 +829,26 @@ impl PlatformWindow for WindowsWindow {
                     config.cButtons = buttons.len() as _;
                     config.pButtons = buttons.as_ptr();
 
-                    config.pfCallback = None;
+                    config.pfCallback = Some(crate::dialog::task_dialog_callback);
+                    config.lpCallbackData = button_id_map.contains(&IDCANCEL.0) as isize;
                     let mut res = std::mem::zeroed();
-                    let _ = TaskDialogIndirect(&config, Some(&mut res), None, None)
-                        .context("unable to create task dialog")
-                        .log_err();
-
-                    if let Some(clicked) =
-                        button_id_map.iter().position(|&button_id| button_id == res)
-                    {
-                        let _ = done_tx.send(clicked);
-                    }
+                    TaskDialogIndirect(&config, Some(&mut res), None, None)
+                        .context("unable to create task dialog")?;
+                    Ok(button_id_map.iter().position(|&button_id| button_id == res))
+                }
+            },
+        );
+        self.0
+            .executor
+            .spawn(async move {
+                if let futures::future::Either::Left((result, _)) =
+                    futures::future::select(dialog, done_tx.cancellation()).await
+                    && let Some(Some(clicked)) = result
+                        .context("native dialog thread stopped")
+                        .and_then(|result| result)
+                        .log_err()
+                {
+                    done_tx.send(clicked).ok();
                 }
             })
             .detach();
@@ -1062,21 +856,12 @@ impl PlatformWindow for WindowsWindow {
         Some(done_rx)
     }
 
-    fn activate(&self) {
+    fn activate(&self, token: Option<&str>) -> bool {
+        if token.is_some() {
+            return false;
+        }
         let hwnd = self.0.hwnd;
         let this = self.0.clone();
-        if self.0.popup.is_some() {
-            // The app is already in front, since the popup's owner is ours, so a popup needs
-            // none of the foreground workarounds below.
-            self.0
-                .executor
-                .spawn(async move {
-                    this.follow_anchor();
-                    show_popup(hwnd, true);
-                })
-                .detach();
-            return;
-        }
         self.0
             .executor
             .spawn(async move {
@@ -1126,6 +911,7 @@ impl PlatformWindow for WindowsWindow {
                 unsafe { SetForegroundWindow(hwnd).as_bool() };
             })
             .detach();
+        true
     }
 
     fn request_attention(&self) {
@@ -1150,7 +936,11 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn is_active(&self) -> bool {
-        self.0.is_effectively_active()
+        self.0.hwnd == unsafe { GetActiveWindow() }
+    }
+
+    fn visibility(&self) -> WindowVisibility {
+        self.0.visibility()
     }
 
     fn is_hovered(&self) -> bool {
@@ -1196,6 +986,31 @@ impl PlatformWindow for WindowsWindow {
                 dwm_set_window_composition_attribute(hwnd, 4);
             }
         }
+    }
+
+    fn set_visible(&self, visible: bool) {
+        let hwnd = self.0.hwnd;
+        let this = self.0.clone();
+        self.0
+            .executor
+            .spawn(async move {
+                if visible {
+                    let initial_placement = this.state.initial_placement.take();
+                    let has_initial_placement = initial_placement.is_some();
+                    this.state.initial_placement.set(initial_placement);
+                    this.set_window_placement().log_err();
+                    if !has_initial_placement {
+                        unsafe {
+                            ShowWindowAsync(hwnd, SW_SHOWNOACTIVATE).ok().log_err();
+                        }
+                    }
+                } else {
+                    unsafe {
+                        ShowWindowAsync(hwnd, SW_HIDE).ok().log_err();
+                    }
+                }
+            })
+            .detach();
     }
 
     fn minimize(&self) {
@@ -1280,6 +1095,11 @@ impl PlatformWindow for WindowsWindow {
             .set(Some(callback));
     }
 
+    fn on_visibility_change(&self, callback: Box<dyn FnMut(WindowVisibility)>) {
+        self.0.state.last_visibility.set(Some(self.0.visibility()));
+        self.0.state.callbacks.visibility_change.set(Some(callback));
+    }
+
     fn on_hover_status_change(&self, callback: Box<dyn FnMut(bool)>) {
         self.0
             .state
@@ -1290,6 +1110,10 @@ impl PlatformWindow for WindowsWindow {
 
     fn on_resize(&self, callback: Box<dyn FnMut(Size<Pixels>, f32)>) {
         self.state.callbacks.resize.set(Some(callback));
+    }
+
+    fn on_display_changed(&self, callback: Box<dyn FnMut()>) {
+        self.state.callbacks.display_changed.set(Some(callback));
     }
 
     fn on_moved(&self, callback: Box<dyn FnMut()>) {
@@ -1321,39 +1145,19 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn draw(&self, scene: &Scene) {
-        #[cfg(not(feature = "wgpu"))]
-        {
-            self.state
-                .renderer
-                .borrow_mut()
-                .draw(scene, self.state.background_appearance.get())
-                .log_err();
-        }
+        self.state
+            .renderer
+            .borrow_mut()
+            .draw(scene, self.state.background_appearance.get())
+            .log_err();
+    }
 
-        #[cfg(feature = "wgpu")]
-        {
-            let mut renderer = self.state.renderer.borrow_mut();
-            if renderer.device_lost() {
-                match renderer.recover(&RawWindow {
-                    hwnd: self.platform_window_handle,
-                }) {
-                    Ok(()) => {}
-                    Err(err) => {
-                        log::warn!("GPU recovery failed, will retry on next frame: {err}");
-                    }
-                }
-
-                self.state.force_render_pending.set(true);
-                return;
-            }
-            if !renderer.draw(scene) {
-                log::error!("failed to render scene");
-            }
-
-            if renderer.needs_redraw() {
-                self.state.force_render_pending.set(true);
-            }
-        }
+    #[cfg(any(test, feature = "test-support"))]
+    fn render_to_image(&self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
+        self.state
+            .renderer
+            .borrow_mut()
+            .render_to_image(scene, self.state.background_appearance.get())
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
@@ -1365,9 +1169,6 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
-        #[cfg(feature = "wgpu")]
-        return Some(self.state.renderer.borrow().gpu_specs());
-        #[cfg(not(feature = "wgpu"))]
         self.state.renderer.borrow().gpu_specs().log_err()
     }
 
@@ -1779,6 +1580,9 @@ unsafe extern "system" fn window_procedure(
     }
     let inner = unsafe { &*ptr };
     let result = if let Some(inner) = inner.upgrade() {
+        if msg == WM_NCDESTROY {
+            inner.dialog_owner.close();
+        }
         inner.handle_msg(hwnd, msg, wparam, lparam)
     } else {
         unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -1790,19 +1594,6 @@ unsafe extern "system" fn window_procedure(
     }
 
     result
-}
-
-/// Whether `hwnd` is one of GPUI's own windows, rather than a native child window a host
-/// embedded in one: an `EDIT` control, a web view. Only GPUI's windows understand GPUI's private
-/// messages, and only theirs can be read through `window_from_hwnd`.
-pub(crate) fn is_gpui_window(hwnd: HWND) -> bool {
-    if hwnd.is_invalid() {
-        return false;
-    }
-    let mut class = [0u16; 32];
-    let length = unsafe { GetClassNameW(hwnd, &mut class) } as usize;
-    // SAFETY: a `w!` literal is NUL-terminated.
-    length > 0 && class[..length] == *unsafe { WINDOW_CLASS_NAME.as_wide() }
 }
 
 pub(crate) fn window_from_hwnd(hwnd: HWND) -> Option<Rc<WindowsWindowInner>> {
@@ -1892,84 +1683,10 @@ fn calculate_client_rect(
     }
 }
 
-/// Where an anchored popup goes, in physical screen pixels: its options resolved against its
-/// owner's client area and the work area of its owner's monitor, all in the owner's logical
-/// space. `size` is the popup's logical size at its own scale, `popup_scale`, which differs from
-/// the owner's only when the two are on monitors with different DPIs.
-fn anchored_popup_bounds(
-    options: &popup::PopupOptions,
-    owner: HWND,
-    size: Size<Pixels>,
-    popup_scale: f32,
-) -> Option<Bounds<DevicePixels>> {
-    let owner_dpi = unsafe { GetDpiForWindow(owner) };
-    if owner_dpi == 0 {
-        return None;
-    }
-    let owner_scale = owner_dpi as f32 / USER_DEFAULT_SCREEN_DPI as f32;
-    let mut client_origin = POINT::default();
-    if !unsafe { ClientToScreen(owner, &mut client_origin) }.as_bool() {
-        return None;
-    }
-    let monitor = unsafe { MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST) };
-    let mut monitor_info = MONITORINFO {
-        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-        ..Default::default()
-    };
-    let work_area = unsafe { GetMonitorInfoW(monitor, &mut monitor_info) }
-        .as_bool()
-        .then(|| {
-            let work = monitor_info.rcWork;
-            Bounds {
-                origin: logical_point(work.left as f32, work.top as f32, owner_scale),
-                size: gpui::size(
-                    DevicePixels(work.right - work.left),
-                    DevicePixels(work.bottom - work.top),
-                )
-                .to_pixels(owner_scale),
-            }
-        });
-    let placed = popup::place_popup(
-        options,
-        logical_point(client_origin.x as f32, client_origin.y as f32, owner_scale),
-        size.map(|length| length * (popup_scale / owner_scale)),
-        work_area,
-    );
-    Some(placed.to_device_pixels(owner_scale))
-}
-
-/// Shows an anchored popup, giving it the keyboard when `focus` is set. Plain activation is
-/// enough: the popup's owner belongs to this app, which is in front when a popup opens.
-fn show_popup(hwnd: HWND, focus: bool) {
-    unsafe {
-        // Above the owner's other popups: a popup opened later — a bar over its scrim — is the
-        // one in front. Never topmost: the band is the owner's.
-        SetWindowPos(
-            hwnd,
-            Some(HWND_TOP),
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        )
-        .ok();
-        if focus {
-            let _ = ShowWindow(hwnd, SW_SHOW);
-            // Both return the previous window, which reads as an error when there was none.
-            SetActiveWindow(hwnd).ok();
-            SetFocus(Some(hwnd)).ok();
-        } else {
-            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        }
-    }
-}
-
 fn retrieve_window_placement(
     hwnd: HWND,
     display: WindowsDisplay,
     initial_bounds: Bounds<Pixels>,
-    scale_factor: f32,
     border_offset: &WindowBorderOffset,
 ) -> Result<WINDOWPLACEMENT> {
     let mut placement = WINDOWPLACEMENT {
@@ -1983,7 +1700,14 @@ fn retrieve_window_placement(
     } else {
         display.default_bounds()
     };
-    let bounds = bounds.to_device_pixels(scale_factor);
+    // `bounds` is expressed in logical pixels for `display`, so it must be converted
+    // to device pixels using that display's own scale factor. The window's current
+    // scale factor can't be used here: `CreateWindowExW` was called with
+    // `CW_USEDEFAULT`, so at this point the window may still be sitting on whichever
+    // monitor Windows picked by default, which can have a different DPI than `display`
+    // and would otherwise throw off the physical position (e.g. leaving the window
+    // partially off-screen when moved to a monitor with a different scale factor).
+    let bounds = bounds.to_device_pixels(display.scale_factor());
     placement.rcNormalPosition = calculate_window_rect(bounds, border_offset);
     Ok(placement)
 }
@@ -2070,11 +1794,87 @@ fn set_non_rude_hwnd(hwnd: HWND, non_rude: bool) {
     }
 }
 
+fn character_palette_key(key: VIRTUAL_KEY, key_up: bool) -> INPUT {
+    let mut flags = KEYBD_EVENT_FLAGS(0);
+    if key_up {
+        flags |= KEYEVENTF_KEYUP;
+    }
+    if matches!(key, VK_LWIN | VK_RWIN | VK_RCONTROL | VK_RMENU) {
+        flags |= KEYEVENTF_EXTENDEDKEY;
+    }
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: key,
+                dwFlags: flags,
+                ..Default::default()
+            },
+        },
+    }
+}
+
+fn character_palette_inputs(held_modifiers: &[VIRTUAL_KEY], win_held: bool) -> Vec<INPUT> {
+    let mut inputs = held_modifiers
+        .iter()
+        .map(|&key| character_palette_key(key, true))
+        .collect::<Vec<_>>();
+    if !win_held {
+        inputs.push(character_palette_key(VK_LWIN, false));
+    }
+    inputs.push(character_palette_key(VK_OEM_PERIOD, false));
+    inputs.push(character_palette_key(VK_OEM_PERIOD, true));
+    if !win_held {
+        inputs.push(character_palette_key(VK_LWIN, true));
+    }
+    inputs.extend(
+        held_modifiers
+            .iter()
+            .map(|&key| character_palette_key(key, false)),
+    );
+    inputs
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ClickState;
+    use super::{ClickState, character_palette_inputs};
     use gpui::{DevicePixels, MouseButton, point};
     use std::time::Duration;
+    use windows::Win32::UI::Input::KeyboardAndMouse::*;
+
+    #[test]
+    fn character_palette_preserves_held_modifiers() {
+        let inputs = character_palette_inputs(&[VK_LCONTROL, VK_RSHIFT], false);
+        let keys = inputs
+            .iter()
+            .map(|input| unsafe {
+                let key = input.Anonymous.ki;
+                (key.wVk, key.dwFlags.contains(KEYEVENTF_KEYUP))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            vec![
+                (VK_LCONTROL, true),
+                (VK_RSHIFT, true),
+                (VK_LWIN, false),
+                (VK_OEM_PERIOD, false),
+                (VK_OEM_PERIOD, true),
+                (VK_LWIN, true),
+                (VK_LCONTROL, false),
+                (VK_RSHIFT, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn character_palette_does_not_release_a_held_windows_key() {
+        let inputs = character_palette_inputs(&[], true);
+        assert_eq!(inputs.len(), 2);
+        for input in inputs {
+            assert_eq!(unsafe { input.Anonymous.ki.wVk }, VK_OEM_PERIOD);
+        }
+    }
 
     #[test]
     fn test_double_click_interval() {

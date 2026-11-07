@@ -1,16 +1,21 @@
 use crate::{
     AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels,
-    DispatchEventResult, GpuSpecs, Pixels, PlatformAtlas, PlatformDisplay,
-    PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, RequestFrameOptions, Scene, Size, TestPlatform, TileId, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
+    DispatchEventResult, DisplayId, GlyphAtlasCache, GlyphAtlasEntry, GpuSpecs, HeadlessAtlas,
+    Pixels, PlatformAtlas, PlatformDisplay, PlatformHeadlessRenderer, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PromptButton, RenderGlyphParams,
+    RequestFrameOptions, Scene, Size, TestDisplay, TestPlatform, TextInputConfiguration,
+    TextInputStateChange, TileId, ValidatedRasterizedGlyph, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowInsets, WindowParams,
+    WindowVisibility,
 };
-use collections::HashMap;
 use gpui_util::ResultExt as _;
+#[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
 use parking_lot::Mutex;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::{
+    cell::Cell,
+    collections::HashMap,
     path::PathBuf,
     rc::{Rc, Weak},
     sync::{self, Arc},
@@ -31,25 +36,53 @@ pub(crate) struct TestWindowState {
     hit_test_window_control_callback: Option<Box<dyn FnMut() -> Option<WindowControlArea>>>,
     input_callback: Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>,
     active_status_change_callback: Option<Box<dyn FnMut(bool)>>,
+    visibility: WindowVisibility,
+    visibility_callback: Option<Box<dyn FnMut(WindowVisibility)>>,
     hover_status_change_callback: Option<Box<dyn FnMut(bool)>>,
     resize_callback: Option<Box<dyn FnMut(Size<Pixels>, f32)>>,
+    visual_viewport: Option<Bounds<Pixels>>,
+    visual_viewport_callback: Option<Box<dyn FnMut()>>,
+    insets: WindowInsets,
+    insets_callback: Option<Box<dyn FnMut(WindowInsets)>>,
+    virtual_keyboard_requests: usize,
+    virtual_keyboard_dismissals: usize,
     moved_callback: Option<Box<dyn FnMut()>>,
+    display_changed_callback: Option<Box<dyn FnMut()>>,
     appearance_change_callback: Option<Box<dyn FnMut()>>,
+    request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
+    frame_wake_count: Rc<Cell<usize>>,
+    frame_scheduled: bool,
+    frame_callback_pending: bool,
     input_handler: Option<PlatformInputHandler>,
+    text_input_configurations: Vec<TextInputConfiguration>,
+    text_input_state_changes: Vec<TextInputStateChange>,
+    visible: bool,
     is_fullscreen: bool,
+    scale_factor: f32,
     appearance: WindowAppearance,
     external_drag_files: Vec<(PathBuf, bool)>,
     start_external_drag_result: bool,
 }
 
+/// A window on the test platform. Tests use it to play the part of the operating system.
+///
+/// GPUI records what it asks of the window, such as frame requests, text input configuration,
+/// and prompts. Tests then simulate what the OS would send back, with methods such as
+/// [`Self::simulate_resize`] and [`Self::simulate_input`]. Nothing happens on its own, so a
+/// frame runs only when a test asks for one.
+///
+/// The scale factor is always 2.0. A headless renderer makes frames renderable;
+/// without one, drawing records the frame as complete without producing pixels.
 #[derive(Clone)]
 pub struct TestWindow(pub(crate) Rc<Mutex<TestWindowState>>);
 
+// Test windows are not backed by a real platform window, so there is no raw
+// handle to report; `NotSupported` is `raw_window_handle`'s variant for exactly this.
 impl HasWindowHandle for TestWindow {
     fn window_handle(
         &self,
     ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
-        unimplemented!("Test Windows are not backed by a real platform window")
+        Err(raw_window_handle::HandleError::NotSupported)
     }
 }
 
@@ -57,7 +90,7 @@ impl HasDisplayHandle for TestWindow {
     fn display_handle(
         &self,
     ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
-        unimplemented!("Test Windows are not backed by a real platform window")
+        Err(raw_window_handle::HandleError::NotSupported)
     }
 }
 
@@ -71,7 +104,7 @@ impl TestWindow {
     ) -> Self {
         let sprite_atlas: Arc<dyn PlatformAtlas> = match &renderer {
             Some(r) => r.sprite_atlas(),
-            None => Arc::new(TestAtlas::new()),
+            None => Arc::new(HeadlessAtlas::default()),
         };
         Self(Rc::new(Mutex::new(TestWindowState {
             bounds: params.bounds,
@@ -87,18 +120,138 @@ impl TestWindow {
             hit_test_window_control_callback: None,
             input_callback: None,
             active_status_change_callback: None,
+            visibility: WindowVisibility::Visible,
+            visibility_callback: None,
             hover_status_change_callback: None,
             resize_callback: None,
+            visual_viewport: None,
+            visual_viewport_callback: None,
+            insets: WindowInsets::default(),
+            insets_callback: None,
+            virtual_keyboard_requests: 0,
+            virtual_keyboard_dismissals: 0,
             moved_callback: None,
+            display_changed_callback: None,
             appearance_change_callback: None,
+            request_frame_callback: None,
+            frame_wake_count: Rc::new(Cell::new(0)),
+            frame_scheduled: false,
+            frame_callback_pending: false,
             input_handler: None,
+            text_input_configurations: Vec::new(),
+            text_input_state_changes: Vec::new(),
+            visible: params.show,
             is_fullscreen: false,
+            // Preserve the test platform's historical 2x default.
+            scale_factor: 2.0,
             appearance: WindowAppearance::Light,
             external_drag_files: Vec::new(),
             start_external_drag_result: false,
         })))
     }
+    /// Runs the frame callback if GPUI has requested a frame. Returns whether a frame ran.
+    ///
+    /// If no frame callback is registered, the request remains pending and this
+    /// method returns `false`.
+    pub fn simulate_scheduled_frame(&self) -> bool {
+        let callback = {
+            let mut state = self.0.lock();
+            if !std::mem::take(&mut state.frame_scheduled) {
+                return false;
+            }
+            state.frame_callback_pending = false;
+            state.request_frame_callback.take()
+        };
+        let Some(mut callback) = callback else {
+            self.0.lock().frame_scheduled = true;
+            return false;
+        };
 
+        callback(RequestFrameOptions::default());
+        self.0.lock().request_frame_callback = Some(callback);
+        true
+    }
+
+    /// Returns whether GPUI has requested a frame that hasn't run yet.
+    pub fn frame_scheduled(&self) -> bool {
+        self.0.lock().frame_scheduled
+    }
+
+    /// Returns whether the window is visible. It starts visible when it was opened with `show` set.
+    pub fn is_visible(&self) -> bool {
+        self.0.lock().visible
+    }
+
+    pub fn simulate_visibility_change(&self, visibility: WindowVisibility) {
+        let callback = {
+            let mut state = self.0.lock();
+            state.visibility = visibility;
+            state.visibility_callback.take()
+        };
+        if let Some(mut callback) = callback {
+            callback(visibility);
+            self.0.lock().visibility_callback = Some(callback);
+        }
+    }
+
+    /// Moves the window to the display with the given ID.
+    pub fn simulate_move_to_display(&self, display_id: DisplayId) {
+        let callback = {
+            let mut state = self.0.lock();
+            state.display = Rc::new(TestDisplay::with_id(display_id));
+            state.display_changed_callback.take()
+        };
+        if let Some(mut callback) = callback {
+            callback();
+            self.0.lock().display_changed_callback = Some(callback);
+        }
+    }
+
+    pub fn simulate_visual_viewport_change(&self, bounds: Bounds<Pixels>) {
+        let callback = {
+            let mut state = self.0.lock();
+            state.visual_viewport = Some(bounds);
+            state.visual_viewport_callback.take()
+        };
+        if let Some(mut callback) = callback {
+            callback();
+            self.0.lock().visual_viewport_callback = Some(callback);
+        }
+    }
+
+    pub fn simulate_insets_change(&self, insets: WindowInsets) {
+        let callback = {
+            let mut state = self.0.lock();
+            state.insets = insets.clone();
+            state.insets_callback.take()
+        };
+        if let Some(mut callback) = callback {
+            callback(insets);
+            self.0.lock().insets_callback = Some(callback);
+        }
+    }
+
+    pub fn virtual_keyboard_requests(&self) -> usize {
+        self.0.lock().virtual_keyboard_requests
+    }
+
+    pub fn virtual_keyboard_dismissals(&self) -> usize {
+        self.0.lock().virtual_keyboard_dismissals
+    }
+
+    /// Every [`TextInputConfiguration`] forwarded to this window, in order.
+    pub fn text_input_configurations(&self) -> Vec<TextInputConfiguration> {
+        self.0.lock().text_input_configurations.clone()
+    }
+
+    /// Returns every [`TextInputStateChange`] sent to this window, oldest first.
+    pub fn text_input_state_changes(&self) -> Vec<TextInputStateChange> {
+        self.0.lock().text_input_state_changes.clone()
+    }
+
+    /// Sets the window's content size and calls the resize callback, as the OS does on resize.
+    ///
+    /// The callback receives the new size and the scale factor, which is 2.0 in tests.
     pub fn simulate_resize(&mut self, size: Size<Pixels>) {
         let scale_factor = self.scale_factor();
         let mut lock = self.0.lock();
@@ -112,6 +265,16 @@ impl TestWindow {
         self.0.lock().resize_callback = Some(callback);
     }
 
+    /// Simulates a display scale change through the resize callback, preserving logical bounds.
+    pub fn simulate_scale_factor_change(&mut self, scale_factor: f32) {
+        let size = {
+            let mut lock = self.0.lock();
+            lock.scale_factor = scale_factor;
+            lock.bounds.size
+        };
+        self.simulate_resize(size);
+    }
+
     pub(crate) fn simulate_active_status_change(&self, active: bool) {
         let mut lock = self.0.lock();
         let Some(mut callback) = lock.active_status_change_callback.take() else {
@@ -122,6 +285,9 @@ impl TestWindow {
         self.0.lock().active_status_change_callback = Some(callback);
     }
 
+    /// Sets the window's appearance and calls the appearance-changed callback.
+    ///
+    /// This is what the OS does when the user switches between light and dark mode.
     pub fn simulate_appearance_change(&self, appearance: WindowAppearance) {
         let mut lock = self.0.lock();
         lock.appearance = appearance;
@@ -133,6 +299,30 @@ impl TestWindow {
         self.0.lock().appearance_change_callback = Some(callback);
     }
 
+    /// Returns how many times GPUI has invoked this window's frame waker.
+    ///
+    /// Use it to check when GPUI asks the platform for a new frame.
+    pub fn frame_wake_count(&self) -> usize {
+        self.0.lock().frame_wake_count.get()
+    }
+
+    /// Delivers a frame request, as the platform's display link would.
+    ///
+    /// GPUI draws the next frame if it registered a frame callback. Otherwise this does nothing.
+    pub fn simulate_frame_request(&self, options: RequestFrameOptions) {
+        let mut lock = self.0.lock();
+        let Some(mut callback) = lock.request_frame_callback.take() else {
+            return;
+        };
+        drop(lock);
+        callback(options);
+        self.0.lock().request_frame_callback = Some(callback);
+    }
+
+    /// Delivers `event` to the window's input callback, as the OS does for a key or mouse event.
+    ///
+    /// Returns `true` if a handler stopped the event from propagating. Returns `false` if the
+    /// event propagated, or if no input callback is registered.
     pub fn simulate_input(&mut self, event: PlatformInput) -> bool {
         let mut lock = self.0.lock();
         let Some(mut callback) = lock.input_callback.take() else {
@@ -144,16 +334,47 @@ impl TestWindow {
         !result.propagate
     }
 
+    /// Returns the files that GPUI offered in external drags, in order.
+    ///
+    /// Each entry pairs a path with `true` if it is a directory.
     pub fn external_drag_files(&self) -> Vec<(PathBuf, bool)> {
         self.0.lock().external_drag_files.clone()
     }
 
+    /// Sets the value that `start_external_drag` returns. The default is `false`.
     pub fn set_start_external_drag_result(&self, result: bool) {
         self.0.lock().start_external_drag_result = result;
     }
 }
 
 impl PlatformWindow for TestWindow {
+    fn visual_viewport_bounds(&self) -> Bounds<Pixels> {
+        let state = self.0.lock();
+        state
+            .visual_viewport
+            .unwrap_or_else(|| Bounds::new(Point::default(), state.bounds.size))
+    }
+
+    fn on_visual_viewport_changed(&self, callback: Box<dyn FnMut()>) {
+        self.0.lock().visual_viewport_callback = Some(callback);
+    }
+
+    fn insets(&self) -> WindowInsets {
+        self.0.lock().insets.clone()
+    }
+
+    fn on_insets_changed(&self, callback: Box<dyn FnMut(WindowInsets)>) {
+        self.0.lock().insets_callback = Some(callback);
+    }
+
+    fn show_soft_keyboard(&self) {
+        self.0.lock().virtual_keyboard_requests += 1;
+    }
+
+    fn hide_soft_keyboard(&self) {
+        self.0.lock().virtual_keyboard_dismissals += 1;
+    }
+
     fn bounds(&self) -> Bounds<Pixels> {
         self.0.lock().bounds
     }
@@ -176,7 +397,7 @@ impl PlatformWindow for TestWindow {
     }
 
     fn scale_factor(&self) -> f32 {
-        2.0
+        self.0.lock().scale_factor
     }
 
     fn appearance(&self) -> WindowAppearance {
@@ -207,6 +428,14 @@ impl PlatformWindow for TestWindow {
         self.0.lock().input_handler.take()
     }
 
+    fn set_text_input_configuration(&mut self, configuration: TextInputConfiguration) {
+        self.0.lock().text_input_configurations.push(configuration);
+    }
+
+    fn text_input_state_changed(&self, change: TextInputStateChange) {
+        self.0.lock().text_input_state_changes.push(change);
+    }
+
     fn prompt(
         &self,
         _level: crate::PromptLevel,
@@ -224,17 +453,25 @@ impl PlatformWindow for TestWindow {
         )
     }
 
-    fn activate(&self) {
+    fn activate(&self, token: Option<&str>) -> bool {
+        if token.is_some() {
+            return false;
+        }
         self.0
             .lock()
             .platform
             .upgrade()
             .unwrap()
-            .set_active_window(Some(self.clone()))
+            .set_active_window(Some(self.clone()));
+        true
     }
 
     fn is_active(&self) -> bool {
         false
+    }
+
+    fn visibility(&self) -> WindowVisibility {
+        self.0.lock().visibility
     }
 
     fn is_hovered(&self) -> bool {
@@ -256,6 +493,10 @@ impl PlatformWindow for TestWindow {
     fn set_app_id(&mut self, _app_id: &str) {}
 
     fn set_background_appearance(&self, _background: WindowBackgroundAppearance) {}
+
+    fn set_visible(&self, visible: bool) {
+        self.0.lock().visible = visible;
+    }
 
     fn set_edited(&mut self, edited: bool) {
         self.0.lock().edited = edited;
@@ -286,7 +527,30 @@ impl PlatformWindow for TestWindow {
         self.0.lock().is_fullscreen
     }
 
-    fn on_request_frame(&self, _callback: Box<dyn FnMut(RequestFrameOptions)>) {}
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        // Tests can inspect wakes without delivering a frame synchronously.
+        let frame_wake_count = self.0.lock().frame_wake_count.clone();
+        #[cfg(feature = "bench-support")]
+        let window = Rc::downgrade(&self.0);
+        Some(Rc::new(move || {
+            frame_wake_count.set(frame_wake_count.get() + 1);
+            #[cfg(feature = "bench-support")]
+            if let Some(window) = window.upgrade() {
+                TestWindow(window).schedule_frame();
+            }
+        }))
+    }
+
+    fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
+        self.0.lock().request_frame_callback = Some(callback);
+    }
+
+    fn schedule_frame(&self) {
+        let mut state = self.0.lock();
+        if !state.frame_callback_pending {
+            state.frame_scheduled = true;
+        }
+    }
 
     fn on_input(&self, callback: Box<dyn FnMut(crate::PlatformInput) -> DispatchEventResult>) {
         self.0.lock().input_callback = Some(callback)
@@ -294,6 +558,10 @@ impl PlatformWindow for TestWindow {
 
     fn on_active_status_change(&self, callback: Box<dyn FnMut(bool)>) {
         self.0.lock().active_status_change_callback = Some(callback)
+    }
+
+    fn on_visibility_change(&self, callback: Box<dyn FnMut(WindowVisibility)>) {
+        self.0.lock().visibility_callback = Some(callback);
     }
 
     fn on_hover_status_change(&self, callback: Box<dyn FnMut(bool)>) {
@@ -306,6 +574,10 @@ impl PlatformWindow for TestWindow {
 
     fn on_moved(&self, callback: Box<dyn FnMut()>) {
         self.0.lock().moved_callback = Some(callback)
+    }
+
+    fn on_display_changed(&self, callback: Box<dyn FnMut()>) {
+        self.0.lock().display_changed_callback = Some(callback)
     }
 
     fn on_should_close(&self, callback: Box<dyn FnMut() -> bool>) {
@@ -325,6 +597,8 @@ impl PlatformWindow for TestWindow {
     fn draw(&self, scene: &Scene) {
         let scale_factor = self.scale_factor();
         let mut state = self.0.lock();
+        state.frame_callback_pending = true;
+        state.frame_scheduled = true;
         let device_size: Size<DevicePixels> = state.bounds.size.to_device_pixels(scale_factor);
         if let Some(renderer) = &mut state.renderer {
             renderer.render_scene(scene, device_size).warn_on_err();
@@ -389,29 +663,66 @@ impl PlatformWindow for TestWindow {
 pub(crate) struct TestAtlasState {
     next_id: u32,
     tiles: HashMap<AtlasKey, AtlasTile>,
+    glyph_cache: GlyphAtlasCache,
 }
 
+/// An in-memory sprite atlas for tests. It records tile ids and sizes but stores no pixel data.
 pub(crate) struct TestAtlas(Mutex<TestAtlasState>);
 
+impl TestAtlasState {
+    fn insert_tile(&mut self, key: AtlasKey, size: Size<DevicePixels>) -> AtlasTile {
+        self.next_id += 1;
+        let texture_id = self.next_id;
+        self.next_id += 1;
+        let tile_id = self.next_id;
+        let tile = AtlasTile {
+            texture_id: AtlasTextureId {
+                index: texture_id,
+                kind: key.texture_kind(),
+            },
+            tile_id: TileId(tile_id),
+            padding: 0,
+            bounds: Bounds {
+                origin: Point::default(),
+                size,
+            },
+        };
+
+        self.tiles.insert(key, tile);
+
+        tile
+    }
+}
+
 impl TestAtlas {
+    /// Creates an empty atlas.
+    #[cfg(test)]
     pub fn new() -> Self {
         TestAtlas(Mutex::new(TestAtlasState {
             next_id: 0,
             tiles: HashMap::default(),
+            glyph_cache: GlyphAtlasCache::default(),
         }))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn clear(&self) {
+        let mut state = self.0.lock();
+        state.tiles.clear();
+        state.glyph_cache.clear();
     }
 }
 
 impl PlatformAtlas for TestAtlas {
     fn get_or_insert_with<'a>(
         &self,
-        key: &crate::AtlasKey,
+        key: crate::AtlasKey,
         build: &mut dyn FnMut() -> anyhow::Result<
             Option<(Size<crate::DevicePixels>, std::borrow::Cow<'a, [u8]>)>,
         >,
     ) -> anyhow::Result<Option<crate::AtlasTile>> {
         let mut state = self.0.lock();
-        if let Some(&tile) = state.tiles.get(key) {
+        if let Some(&tile) = state.tiles.get(&key) {
             return Ok(Some(tile));
         }
         drop(state);
@@ -421,36 +732,47 @@ impl PlatformAtlas for TestAtlas {
         };
 
         let mut state = self.0.lock();
-        state.next_id += 1;
-        let texture_id = state.next_id;
-        state.next_id += 1;
-        let tile_id = state.next_id;
 
-        state.tiles.insert(
-            key.clone(),
-            crate::AtlasTile {
-                texture_id: AtlasTextureId {
-                    index: texture_id,
-                    kind: crate::AtlasTextureKind::Monochrome,
-                },
-                tile_id: TileId(tile_id),
-                padding: 0,
-                bounds: crate::Bounds {
-                    origin: Point::default(),
-                    size,
-                },
-            },
-        );
+        Ok(Some(state.insert_tile(key, size)))
+    }
 
-        Ok(Some(state.tiles[key]))
+    fn get_or_insert_glyph_with(
+        &self,
+        params: &RenderGlyphParams,
+        build: &mut dyn FnMut() -> anyhow::Result<ValidatedRasterizedGlyph>,
+    ) -> anyhow::Result<GlyphAtlasEntry> {
+        if let Some(entry) = self.0.lock().glyph_cache.get(params) {
+            return Ok(entry);
+        }
+
+        let glyph = build()?;
+
+        let mut state = self.0.lock();
+        let tile = if glyph.size == Size::default() {
+            None
+        } else {
+            let key = (params.clone(), glyph.format).into();
+
+            Some(state.insert_tile(key, glyph.size))
+        };
+
+        Ok(state.glyph_cache.insert(params, &glyph, tile))
     }
 
     fn remove(&self, key: &AtlasKey) {
         let mut state = self.0.lock();
+        state.glyph_cache.remove(key);
         state.tiles.remove(key);
     }
 
     fn contains(&self, key: &AtlasKey) -> bool {
-        self.0.lock().tiles.contains_key(key)
+        let state = self.0.lock();
+        match key {
+            AtlasKey::Glyph { params, format } => state
+                .glyph_cache
+                .get(params)
+                .is_some_and(|entry| entry.format == *format),
+            _ => state.tiles.contains_key(key),
+        }
     }
 }

@@ -8,7 +8,7 @@
 use accesskit::{Action, NodeId, TreeUpdate};
 use collections::FxHashMap;
 
-use crate::{Pixels, SharedString, Size};
+use crate::{Bounds, Pixels, SharedString, Size};
 
 #[derive(Default)]
 pub(crate) struct FrameDebugInfo {
@@ -63,6 +63,9 @@ pub(crate) struct A11yDebug {
     frame_number: u64,
     /// Metadata about the most recently captured frame.
     last_frame: Option<CapturedFrame>,
+    /// Window-space bounds of every node in the last update, retained here
+    /// because the live map is cleared at the start of each frame.
+    last_node_bounds: FxHashMap<NodeId, Bounds<Pixels>>,
     #[cfg(debug_assertions)]
     last_node_info: FxHashMap<NodeId, NodeDebugInfo>,
 }
@@ -75,8 +78,10 @@ impl A11yDebug {
         active_descendant: Option<NodeId>,
         window_title: Option<&SharedString>,
         frame: FrameDebugInfo,
+        node_bounds: &FxHashMap<NodeId, Bounds<Pixels>>,
     ) {
         self.last_tree_update = Some(update.clone());
+        self.last_node_bounds = node_bounds.clone();
         self.last_gpui_focus = gpui_focus;
         self.last_active_descendant = active_descendant;
         self.frame_number += 1;
@@ -89,6 +94,21 @@ impl A11yDebug {
             viewport_size: frame.viewport_size,
             scale_factor: frame.scale_factor,
         });
+    }
+
+    /// The last update sent to the platform adapter, if a frame has produced one.
+    pub(crate) fn last_tree_update(&self) -> Option<&TreeUpdate> {
+        self.last_tree_update.as_ref()
+    }
+
+    /// Window-space bounds recorded for `id` in the last captured frame.
+    pub(crate) fn node_bounds(&self, id: NodeId) -> Option<Bounds<Pixels>> {
+        self.last_node_bounds.get(&id).copied()
+    }
+
+    /// Monotonic count of captured frames; zero before the first.
+    pub(crate) fn frame_number(&self) -> u64 {
+        self.frame_number
     }
 
     #[cfg(debug_assertions)]
@@ -127,7 +147,13 @@ impl A11yDebug {
                 .unwrap_or_default();
             #[cfg(not(debug_assertions))]
             let provenance = NodeProvenance::default();
-            let value = node_to_json(*id, node, &ephemeral, &provenance);
+            let value = node_to_json(
+                *id,
+                node,
+                &ephemeral,
+                &provenance,
+                self.last_node_bounds.get(id).copied(),
+            );
             nodes.insert(key, value);
         }
 
@@ -176,11 +202,23 @@ fn node_to_json(
     node: &accesskit::Node,
     ephemeral: &FxHashMap<NodeId, String>,
     provenance: &NodeProvenance,
+    bounds: Option<Bounds<Pixels>>,
 ) -> serde_json::Value {
     use serde_json::json;
 
     let mut map = serde_json::Map::new();
     map.insert("accesskit_id".into(), json!(id.0.to_string()));
+    if let Some(bounds) = bounds {
+        map.insert(
+            "bounds".into(),
+            json!({
+                "x": bounds.origin.x.0,
+                "y": bounds.origin.y.0,
+                "width": bounds.size.width.0,
+                "height": bounds.size.height.0,
+            }),
+        );
+    }
 
     let children: Vec<String> = node
         .children()
@@ -257,8 +295,21 @@ fn node_to_json(
     if let Some(v) = node.role_description() {
         aria.insert("role_description".into(), json!(v));
     }
+    if let Some(v) = node.author_id() {
+        aria.insert("author_id".into(), json!(v));
+    }
+    if let Some(v) = node.url() {
+        aria.insert("url".into(), json!(v));
+    }
+    if node.is_disabled() {
+        aria.insert("disabled".into(), json!(true));
+    }
 
     // Boolean / enum states.
+    if node.is_hidden() {
+        aria.insert("hidden".into(), json!(true));
+    }
+
     if let Some(v) = node.is_selected() {
         aria.insert("selected".into(), json!(v));
     }
@@ -327,4 +378,81 @@ fn ephemeral_id(mut index: usize) -> String {
     }
     bytes.reverse();
     String::from_utf8(bytes).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        AnyWindowHandle, AppContext as _, Context, InteractiveElement as _, IntoElement,
+        ParentElement as _, Render, StatefulInteractiveElement as _, TestAppContext, Window, div,
+        util::FluentBuilder as _,
+    };
+    use accesskit::{Role, TreeUpdate};
+    use accesskit_consumer::{Tree, common_filter};
+    use std::sync::atomic::Ordering;
+
+    struct HiddenSubtree {
+        hidden: bool,
+    }
+
+    impl Render for HiddenSubtree {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .child(
+                    div()
+                        .id("hidden-boundary")
+                        .when(self.hidden, |element| element.aria_hidden())
+                        .child(div().id("inside").role(Role::Button).aria_label("Inside")),
+                )
+                .child(div().id("outside").role(Role::Button).aria_label("Outside"))
+        }
+    }
+
+    #[test]
+    fn aria_hidden_controls_subtree_visibility() {
+        let mut cx = TestAppContext::single();
+        let window = cx.add_window(|_, _| HiddenSubtree { hidden: false });
+        let any_window: AnyWindowHandle = window.into();
+
+        let draw_tree = |window: AnyWindowHandle, cx: &mut TestAppContext| -> TreeUpdate {
+            cx.update_window(window, |_, window, cx| {
+                window.a11y.active_flag.store(true, Ordering::SeqCst);
+                window.draw(cx).clear(cx);
+                window
+                    .a11y
+                    .debug
+                    .last_tree_update
+                    .clone()
+                    .expect("drawing with accessibility active should produce a tree")
+            })
+            .unwrap()
+        };
+        let filtered_labels = |update| {
+            let tree = Tree::new(update, false);
+            tree.state()
+                .root()
+                .filtered_children(common_filter)
+                .filter_map(|node| node.label())
+                .collect::<Vec<_>>()
+        };
+        let set_hidden = |hidden, cx: &mut TestAppContext| {
+            window
+                .update(cx, |view, _, cx| {
+                    view.hidden = hidden;
+                    cx.notify();
+                })
+                .unwrap();
+        };
+
+        let visible_update = draw_tree(any_window, &mut cx);
+        assert_eq!(filtered_labels(visible_update), ["Inside", "Outside"]);
+
+        set_hidden(true, &mut cx);
+        let hidden_update = draw_tree(any_window, &mut cx);
+        assert_eq!(filtered_labels(hidden_update), ["Outside"]);
+
+        set_hidden(false, &mut cx);
+        let restored_update = draw_tree(any_window, &mut cx);
+        assert_eq!(filtered_labels(restored_update), ["Inside", "Outside"]);
+    }
 }

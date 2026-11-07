@@ -11,8 +11,9 @@
 
 [package]
 edition = "2024"
+rust-version = "1.95"
 name = "gpui-ce"
-version = "0.2.2"
+version = "0.3.0"
 authors = ["Nathan Sobo <nathan@zed.dev>"]
 build = "build.rs"
 publish = true
@@ -33,110 +34,132 @@ categories = ["gui"]
 license = "Apache-2.0"
 repository = "https://github.com/gpui-ce/gpui-ce"
 
-[features]
-bench = [
-    "test-support",
-    "dep:criterion",
-    "dep:hdrhistogram",
+[package.metadata.docs.rs]
+features = ["test-support"]
+
+[package.metadata.cargo-shear]
+ignored = [
+    "getrandom",
+    "objc2",
+    "objc2-metal",
+    "tracing",
 ]
+ignored-paths = [
+    "src/_ownership_and_data_flow.rs",
+    "benches/focus_cleanup.rs",
+]
+
+[features]
+bench = ["bench-support"]
+bench-support = [
+    "profiler",
+    "dep:criterion",
+    "dep:libc",
+    "dep:perf-event",
+]
+custom-gpu = []
 default = [
     "font-kit",
     "wayland",
     "x11",
     "windows-manifest",
+    "image-default-formats",
 ]
-input-latency-histogram = ["dep:hdrhistogram"]
+embedded-assets = ["dep:rust-embed"]
+font-kit = []
+hot-patching = [
+    "dep:dioxus-devtools",
+    "dep:subsecond",
+]
+image-default-formats = ["image/default-formats"]
 inspector = ["gpui_macros/inspector"]
-leak-detection = ["backtrace"]
-profiler = []
-screen-capture = ["scap"]
+leak-detection = []
+profiler = ["dep:hdrhistogram"]
+screen-capture = ["dep:windows-capture"]
+stacker = ["dep:stacksafe"]
 test-support = [
     "leak-detection",
     "collections/test-support",
     "wayland",
     "x11",
     "proptest",
+    "dep:futures-concurrency",
+    "dep:postage",
+    "dep:web-time",
 ]
 wayland = []
+wgpu-surfaces = []
 windows-manifest = ["dep:embed-resource"]
-x11 = ["scap?/x11"]
+x11 = []
 
 [lib]
 name = "gpui"
 path = "src/gpui.rs"
-doctest = false
+doctest = true
 
 [[example]]
 name = "animation"
-path = "examples/learn/animation.rs"
+path = "examples/animation.rs"
 
 [[example]]
-name = "async_tasks"
-path = "examples/learn/async_tasks.rs"
+name = "canvas"
+path = "examples/canvas.rs"
 
 [[example]]
-name = "blur"
-path = "examples/learn/blur.rs"
+name = "counter"
+path = "examples/counter.rs"
 
 [[example]]
-name = "creating_components"
-path = "examples/learn/creating_components.rs"
-
-[[example]]
-name = "custom_drawing"
-path = "examples/learn/custom_drawing.rs"
+name = "custom_element"
+path = "examples/custom_element.rs"
 
 [[example]]
 name = "data_table"
 path = "examples/bench/data_table.rs"
 
 [[example]]
-name = "focus_visible"
-path = "examples/legacy/focus_visible.rs"
+name = "events"
+path = "examples/events.rs"
 
 [[example]]
-name = "gif_viewer"
-path = "examples/legacy/gif_viewer.rs"
-
-[[example]]
-name = "gradient"
-path = "examples/legacy/gradient.rs"
-
-[[example]]
-name = "haptic_feedback"
-path = "examples/learn/haptic_feedback.rs"
+name = "haptics"
+path = "examples/haptics.rs"
 
 [[example]]
 name = "hello_world"
-path = "examples/legacy/hello_world.rs"
+path = "examples/hello_world.rs"
 
 [[example]]
-name = "image_loading"
-path = "examples/legacy/image_loading.rs"
+name = "images"
+path = "examples/images.rs"
 
 [[example]]
-name = "interactive_elements"
-path = "examples/learn/interactive_elements.rs"
+name = "interaction"
+path = "examples/interaction.rs"
+
+[[example]]
+name = "keyboard"
+path = "examples/keyboard.rs"
 
 [[example]]
 name = "keyring"
-path = "examples/learn/keyring.rs"
+path = "examples/keyring.rs"
 
 [[example]]
 name = "layer_shell"
-path = "examples/legacy/layer_shell.rs"
+path = "examples/layer_shell.rs"
 
 [[example]]
 name = "layout"
-path = "examples/learn/layout.rs"
+path = "examples/layout.rs"
 
 [[example]]
-name = "on_window_close_quit"
-path = "examples/legacy/on_window_close_quit.rs"
+name = "list"
+path = "examples/list.rs"
 
 [[example]]
-name = "opacity"
-path = "examples/legacy/opacity.rs"
+name = "notifications"
+path = "examples/notifications.rs"
 
 [[example]]
 name = "paths_bench"
@@ -147,64 +170,36 @@ name = "pattern"
 path = "examples/bench/pattern.rs"
 
 [[example]]
-name = "scrollable"
-path = "examples/legacy/scrollable.rs"
-
-[[example]]
 name = "shadow"
 path = "examples/bench/shadow.rs"
 
 [[example]]
 name = "styling"
-path = "examples/learn/styling.rs"
+path = "examples/styling.rs"
 
 [[example]]
-name = "svg"
-path = "examples/legacy/svg/svg.rs"
-
-[[example]]
-name = "system_notifications"
-path = "examples/system_notifications.rs"
-
-[[example]]
-name = "tab_stop"
-path = "examples/legacy/tab_stop.rs"
+name = "tasks"
+path = "examples/tasks.rs"
 
 [[example]]
 name = "text"
-path = "examples/learn/text.rs"
+path = "examples/text.rs"
 
 [[example]]
-name = "text_transform_preview"
-path = "examples/text_transform_preview.rs"
+name = "text_input"
+path = "examples/text_input.rs"
 
 [[example]]
-name = "transition"
-path = "examples/learn/transition.rs"
+name = "todos"
+path = "examples/todos.rs"
 
 [[example]]
-name = "tree"
-path = "examples/legacy/tree.rs"
+name = "toggle_headless"
+path = "examples/toggle_headless.rs"
 
 [[example]]
-name = "uniform_list"
-path = "examples/legacy/uniform_list.rs"
-
-[[example]]
-name = "window"
-path = "examples/legacy/window.rs"
-
-[[example]]
-name = "window_movable"
-path = "examples/window_movable.rs"
-
-[[example]]
-name = "window_positioning"
-path = "examples/legacy/window_positioning.rs"
-
-[[example]]
-name = "window_shadow"
-path = "examples/legacy/window_shadow.rs"
+name = "windows"
+path = "examples/windows.rs"
 
 [[test]]
 name = "action_macros"
@@ -215,6 +210,10 @@ name = "derive_context"
 path = "tests/derive_context.rs"
 
 [[test]]
+name = "derive_element_traits"
+path = "tests/derive_element_traits.rs"
+
+[[test]]
 name = "derive_inspector_reflection"
 path = "tests/derive_inspector_reflection.rs"
 
@@ -222,22 +221,22 @@ path = "tests/derive_inspector_reflection.rs"
 name = "render_macro"
 path = "tests/render_macro.rs"
 
+[[test]]
+name = "renderer_source_audit"
+path = "tests/renderer_source_audit.rs"
+
 [dependencies.accesskit]
-version = "0.24.0"
+version = "0.24.1"
 features = ["enumn"]
 
 [dependencies.anyhow]
 version = "1.0.86"
-
-[dependencies.async-channel]
-version = "2.5.0"
 
 [dependencies.async-task]
 version = "4.7"
 
 [dependencies.backtrace]
 version = "0.3"
-optional = true
 
 [dependencies.bitflags]
 version = "2.6.0"
@@ -245,18 +244,19 @@ version = "2.6.0"
 [dependencies.chrono]
 version = "0.4"
 features = ["serde"]
+default-features = true
 
 [dependencies.collections]
-version = "0.2.2"
+version = "0.3.0"
 package = "gpui_ce_collections"
 
 [dependencies.criterion]
-version = "0.5"
+version = "0.8.2"
 features = ["html_reports"]
 optional = true
 
 [dependencies.ctor]
-version = "1.0.6"
+version = "1.0.12"
 
 [dependencies.derive_more]
 version = "2.1.1"
@@ -270,27 +270,36 @@ features = [
     "mul",
     "mul_assign",
     "not",
+    "add",
+    "add_assign",
+    "mul",
+    "mul_assign",
+    "not",
 ]
+
+[dependencies.derive_setters]
+version = "0.1.9"
 
 [dependencies.etagere]
 version = "0.2"
 
 [dependencies.futures]
-version = "0.3.32"
+version = "0.3.34"
 
 [dependencies.futures-concurrency]
 version = "7.7.1"
+optional = true
 
 [dependencies.gpui_macros]
-version = "0.1.0"
+version = "0.3.0"
 package = "gpui_ce_macros"
 
 [dependencies.gpui_shared_string]
-version = "0.1.0"
+version = "0.3.0"
 package = "gpui_ce_shared_string"
 
 [dependencies.gpui_util]
-version = "0.2.6"
+version = "0.3.0"
 package = "gpui_ce_util"
 
 [dependencies.hdrhistogram]
@@ -305,6 +314,11 @@ version = "1.3"
 
 [dependencies.image]
 version = "0.25.1"
+features = [
+    "gif",
+    "webp",
+]
+default-features = false
 
 [dependencies.inventory]
 version = "0.3.19"
@@ -335,15 +349,20 @@ version = "2.0.0"
 [dependencies.parking_lot]
 version = "0.12.1"
 
+[dependencies.phf]
+version = "0.13.1"
+features = ["macros"]
+
 [dependencies.pin-project]
 version = "1.1.10"
 
-[dependencies.pollster]
-version = "0.4.0"
-
 [dependencies.postage]
 version = "0.5"
-features = ["futures-traits"]
+features = [
+    "futures-traits",
+    "blocking",
+]
+optional = true
 
 [dependencies.profiling]
 version = "1"
@@ -355,16 +374,21 @@ optional = true
 
 [dependencies.rand]
 version = "0.9.4"
+features = [
+    "small_rng",
+    "thread_rng",
+]
 
 [dependencies.raw-window-handle]
 version = "0.6"
 
 [dependencies.refineable]
-version = "0.2.2"
+version = "0.3.0"
 package = "gpui_ce_refineable"
 
 [dependencies.regex]
 version = "1.5"
+default-features = true
 
 [dependencies.resvg]
 version = "0.48.1"
@@ -376,13 +400,20 @@ features = [
 ]
 default-features = false
 
+[dependencies.rust-embed]
+version = "8.12"
+optional = true
+
 [dependencies.scheduler]
-version = "0.2.2"
+version = "0.3.0"
 package = "gpui_ce_scheduler"
 
 [dependencies.schemars]
 version = "1.0"
-features = ["indexmap2"]
+features = [
+    "indexmap2",
+    "derive",
+]
 
 [dependencies.seahash]
 version = "4.1"
@@ -392,6 +423,7 @@ version = "1.0.221"
 features = [
     "derive",
     "rc",
+    "derive",
 ]
 
 [dependencies.serde_json]
@@ -402,7 +434,7 @@ features = [
 ]
 
 [dependencies.skrifa]
-version = "0.46.2"
+version = "0.44.0"
 
 [dependencies.slotmap]
 version = "1.0.6"
@@ -415,24 +447,51 @@ features = [
 ]
 
 [dependencies.spin]
-version = "0.10.0"
+version = "0.10"
+features = [
+    "mutex",
+    "spin_mutex",
+    "lock_api",
+]
+default-features = false
 
 [dependencies.stacksafe]
 version = "1.0"
+optional = true
 
 [dependencies.strum]
-version = "0.27.2"
+version = "0.28"
 features = ["derive"]
 
 [dependencies.sum_tree]
-version = "0.2.2"
+version = "0.3.0"
 package = "gpui_ce_sum_tree"
 
 [dependencies.taffy]
-version = "=0.12.2"
+version = "=0.14.0"
+features = [
+    "std",
+    "flexbox",
+    "grid",
+    "block_layout",
+    "float_layout",
+]
+default-features = false
 
 [dependencies.thiserror]
 version = "2.0.12"
+
+[dependencies.tracing]
+version = "0.1.44"
+features = ["attributes"]
+
+[dependencies.ttf-parser]
+version = "0.25"
+
+[dependencies.unicode-bidi]
+version = "0.3.18"
+features = ["hardcoded-data"]
+default-features = false
 
 [dependencies.unicode-segmentation]
 version = "1.10"
@@ -451,6 +510,7 @@ features = [
     "v5",
     "v7",
     "serde",
+    "v4",
 ]
 
 [dependencies.waker-fn]
@@ -458,49 +518,105 @@ version = "1.2.0"
 
 [dependencies.web-time]
 version = "1.1.0"
+optional = true
+
+[dev-dependencies.accesskit_consumer]
+version = "0.38.0"
 
 [dev-dependencies.backtrace]
 version = "0.3"
 
 [dev-dependencies.collections]
-version = "0.2.2"
+version = "0.3.0"
 features = ["test-support"]
 package = "gpui_ce_collections"
 
 [dev-dependencies.env_logger]
 version = "0.11"
 
+[dev-dependencies.futures-concurrency]
+version = "7.7.1"
+
 [dev-dependencies.gpui_util]
-version = "0.2.6"
+version = "0.3.0"
 package = "gpui_ce_util"
+
+[dev-dependencies.image]
+version = "0.25.1"
+features = [
+    "gif",
+    "webp",
+    "png",
+]
+default-features = false
 
 [dev-dependencies.lyon]
 version = "1.0"
 features = ["extra"]
 
+[dev-dependencies.postage]
+version = "0.5"
+features = [
+    "futures-traits",
+    "blocking",
+]
+
 [dev-dependencies.rand]
 version = "0.9.4"
+default-features = true
 
 [dev-dependencies.scheduler]
-version = "0.2.2"
+version = "0.3.0"
 features = ["test-support"]
 package = "gpui_ce_scheduler"
 
 [dev-dependencies.smol]
 version = "2.0"
 
+[dev-dependencies.unicode-segmentation]
+version = "1.10"
+
+[dev-dependencies.web-time]
+version = "1.1.0"
+
 [build-dependencies.embed-resource]
 version = "3.0"
 optional = true
 
-[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))'.dependencies.pathfinder_geometry]
-version = "0.5"
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies.async-channel]
+version = "2.5.0"
 
-[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))'.dependencies.scap]
-version = "0.0.8-zed"
-optional = true
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies.libc]
+version = "0.2"
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.objc2-core-foundation]
+version = "=0.3.2"
 default-features = false
-package = "zed-scap"
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.objc2-core-video]
+version = "=0.3.2"
+features = [
+    "CVBuffer",
+    "CVImageBuffer",
+    "CVPixelBuffer",
+]
+default-features = false
+
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies.async-channel]
+version = "2.5.0"
+features = ["std"]
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies.dioxus-devtools]
+version = "=0.7.10"
+features = ["serve"]
+optional = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies.pollster]
+version = "0.4.0"
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies.subsecond]
+version = "=0.7.10"
+optional = true
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies.proptest]
 version = "1.10"
@@ -523,38 +639,13 @@ features = [
 [target.'cfg(target_family = "wasm")'.dev-dependencies.wasm-bindgen]
 version = "0.2.120"
 
-[target.'cfg(target_os = "macos")'.dependencies.block]
-version = "0.1"
+[target.'cfg(target_family = "wasm")'.dev-dependencies.web-sys]
+version = "0.3"
 
-[target.'cfg(target_os = "macos")'.dependencies.cocoa]
-version = "=0.26.0"
-
-[target.'cfg(target_os = "macos")'.dependencies.cocoa-foundation]
-version = "=0.2.0"
-
-[target.'cfg(target_os = "macos")'.dependencies.core-foundation]
-version = "=0.10.0"
-
-[target.'cfg(target_os = "macos")'.dependencies.core-foundation-sys]
-version = "0.8.6"
-
-[target.'cfg(target_os = "macos")'.dependencies.core-graphics]
-version = "0.24"
-
-[target.'cfg(target_os = "macos")'.dependencies.core-text]
-version = "21"
-
-[target.'cfg(target_os = "macos")'.dependencies.core-video]
-version = "0.5.2"
-features = ["metal"]
-
-[target.'cfg(target_os = "macos")'.dependencies.font-kit]
-version = "0.14.1-zed"
+[target.'cfg(target_os = "linux")'.dependencies.perf-event]
+version = "0.7.4"
 optional = true
-package = "zed-font-kit"
-
-[target.'cfg(target_os = "macos")'.dependencies.foreign-types]
-version = "0.5"
+package = "perf-event2"
 
 [target.'cfg(target_os = "macos")'.dependencies.log]
 version = "0.4.16"
@@ -563,19 +654,6 @@ features = [
     "serde",
 ]
 
-[target.'cfg(target_os = "macos")'.dependencies.mach2]
-version = "0.5"
-
-[target.'cfg(target_os = "macos")'.dependencies.media]
-version = "0.2.2"
-package = "gpui_ce_media"
-
-[target.'cfg(target_os = "macos")'.dependencies.metal]
-version = "0.33"
-
-[target.'cfg(target_os = "macos")'.dependencies.objc]
-version = "0.2"
-
 [target.'cfg(target_os = "macos")'.dependencies.objc2]
 version = "0.6"
 optional = true
@@ -583,13 +661,6 @@ optional = true
 [target.'cfg(target_os = "macos")'.dependencies.objc2-metal]
 version = "0.3"
 optional = true
-
-[target.'cfg(target_os = "macos")'.build-dependencies.bindgen]
-version = "0.71"
-
-[target.'cfg(target_os = "macos")'.build-dependencies.cbindgen]
-version = "0.28.0"
-default-features = false
 
 [target.'cfg(target_os = "windows")'.dependencies.windows]
 version = "0.62.2"
@@ -606,6 +677,8 @@ features = [
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
     "Win32_Graphics_DirectComposition",
     "Win32_Graphics_DirectWrite",
     "Win32_Graphics_DirectManipulation",
@@ -656,7 +729,22 @@ features = [
     "UI_Notifications",
     "Win32_Foundation",
     "Win32_System_Power",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_WindowsProgramming",
 ]
+
+[target.'cfg(target_os = "windows")'.dependencies.windows-061]
+version = "0.61.3"
+features = ["Win32_Graphics_Direct3D11"]
+package = "windows"
+
+[target.'cfg(target_os = "windows")'.dependencies.windows-capture]
+version = "1.5.0"
+optional = true
+
+[target."cfg(unix)".dependencies.libc]
+version = "0.2"
+optional = true
 
 [lints.clippy]
 dbg_macro = "deny"

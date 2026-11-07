@@ -1,14 +1,13 @@
-#![doc = include_str!("../README.md")]
+#![doc = include_str!("../docs/crate.md")]
 #![warn(missing_docs)]
 #![allow(clippy::type_complexity)] // Not useful, GPUI makes heavy use of callbacks
 #![allow(clippy::collapsible_else_if)] // False positives in platform specific code
 #![allow(unused_mut)] // False positives in platform specific code
 
 extern crate self as gpui;
-#[doc(hidden)]
-pub static GPUI_MANIFEST_DIR: &'static str = env!("CARGO_MANIFEST_DIR");
 #[macro_use]
 mod action;
+mod animated;
 mod app;
 
 mod arena;
@@ -18,11 +17,16 @@ mod bounds_tree;
 mod color;
 /// The default colors used by GPUI.
 pub mod colors;
+#[cfg(feature = "profiler")]
+mod debug_overlay;
 mod element;
 mod elements;
 mod executor;
 mod platform_scheduler;
 pub(crate) use platform_scheduler::PlatformScheduler;
+/// Criterion measurements beyond wall time, for benchmarks built on GPUI.
+#[cfg(feature = "bench-support")]
+pub mod bench_metrics;
 mod geometry;
 mod gestures;
 mod global;
@@ -32,6 +36,7 @@ mod interactive;
 mod key_dispatch;
 mod keymap;
 mod lerp;
+mod motion;
 mod path_builder;
 mod platform;
 pub mod prelude;
@@ -42,13 +47,21 @@ pub mod profiler;
     target_os = "windows",
     target_os = "linux",
     target_family = "wasm",
-    feature = "bench"
+    feature = "test-support",
+    feature = "bench-support"
 ))]
-#[expect(missing_docs)]
 pub mod queue;
+/// A seeded, mutable element tree for benchmarks and tests of GPUI rendering.
+#[cfg(any(test, feature = "bench-support"))]
+pub mod randomized_element_tree;
+mod resize;
 mod scene;
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+mod seeds;
 mod shared_uri;
+mod spring;
 mod style;
+mod style_transitions;
 mod styled;
 mod subscription;
 mod svg_renderer;
@@ -64,17 +77,17 @@ mod window;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use proptest;
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+pub use seeds::calculate_seeds;
 
-#[cfg(doc)]
-pub mod _accessibility;
-#[cfg(doc)]
-pub mod _ownership_and_data_flow;
+pub mod _documentation;
 
 /// Do not touch, here be dragons for use by gpui_macros and such.
 #[doc(hidden)]
 pub mod private {
     pub use anyhow;
     pub use inventory;
+    pub use rand;
     pub use schemars;
     pub use serde;
     pub use serde_json;
@@ -90,6 +103,7 @@ pub use accesskit;
 pub use accesskit::Action as AccessibleAction;
 pub use accesskit::{Orientation, Role, Toggled};
 pub use action::*;
+pub use animated::*;
 pub use anyhow::Result;
 pub use app::*;
 pub(crate) use arena::*;
@@ -97,6 +111,8 @@ pub use asset_cache::*;
 pub use assets::*;
 pub use color::*;
 pub use ctor::ctor;
+#[cfg(feature = "profiler")]
+pub use debug_overlay::*;
 pub use element::*;
 pub use elements::*;
 pub use executor::*;
@@ -104,30 +120,77 @@ pub use geometry::*;
 pub use gestures::*;
 pub use global::*;
 pub use gpui_macros::{
-    AppContext, IntoElement, Render, VisualContext, bench, property_test, register_action, test,
+    AppContext, InteractiveElement, IntoElement, ParentElement, Render, StatefulInteractiveElement,
+    Styled, VisualContext, bench, property_test, register_action, test,
 };
+pub use resize::*;
+pub use spring::*;
 
 /// Defines a Criterion benchmark group for benchmarks annotated with [`gpui::bench`].
 ///
-/// This mirrors `criterion::criterion_group!` so GPUI benchmark files can keep the
-/// same shape as ordinary Criterion benchmarks.
+/// It takes the same arguments as `criterion::criterion_group!`, so GPUI benchmark
+/// files keep the shape of ordinary Criterion benchmarks.
+///
+/// The group measures with the `gpui::BenchMeasurement` configured by `BENCH_MEASUREMENT` (see
+/// `BenchMeasurement::from_env`). By default Criterion analyzes wall time
+/// while retired instructions, cycles, IPC, context switches, and the other
+/// counters this machine supports are printed per iteration in the GPUI bench
+/// report. `BENCH_MEASUREMENT=instructions` makes Criterion analyze
+/// process-wide instructions instead, `foreground-instructions` the benchmark
+/// thread's alone, and `wall-time` disables all counters. A
+/// `config = ...` expression may set any other Criterion option; its
+/// measurement is replaced. To measure with something else, call
+/// `criterion::criterion_group!` directly with
+/// `config = criterion::Criterion::default().with_measurement(gpui::BenchMeasurement::new(...))`.
 ///
 /// [`gpui::bench`]: crate::bench
 #[macro_export]
 macro_rules! bench_group {
-    ($($tokens:tt)*) => {
-        criterion::criterion_group!($($tokens)*);
+    (name = $name:ident; config = $config:expr; targets = $($target:path),+ $(,)?) => {
+        criterion::criterion_group! {
+            name = $name;
+            config = ($config).with_measurement($crate::BenchMeasurement::from_env_or_exit());
+            targets = $($target),+
+        }
+    };
+    ($name:ident, $($target:path),+ $(,)?) => {
+        $crate::bench_group! {
+            name = $name;
+            config = criterion::Criterion::default();
+            targets = $($target),+
+        }
     };
 }
 
 /// Defines the entry point for GPUI Criterion benchmark groups.
 ///
 /// This mirrors `criterion::criterion_main!` so GPUI benchmark files can keep the
-/// same shape as ordinary Criterion benchmarks.
+/// same shape as ordinary Criterion benchmarks. It also installs
+/// `CountingAllocator` as the binary's global allocator, so reports include
+/// heap allocations per iteration. It wraps the system allocator by default;
+/// `allocator = Path;` wraps another unit-struct allocator instead, e.g. to
+/// compare allocators, which pay the same small counting cost:
+///
+/// ```ignore
+/// gpui::bench_main!(allocator = mimalloc::MiMalloc; benches);
+/// ```
+///
+/// `allocator = none;` installs no global allocator, leaving Rust's default and
+/// dropping the allocation metrics from reports.
 #[macro_export]
 macro_rules! bench_main {
-    ($($tokens:tt)*) => {
-        criterion::criterion_main!($($tokens)*);
+    (allocator = none; $($groups:tt)*) => {
+        criterion::criterion_main!($($groups)*);
+    };
+    (allocator = $allocator:path; $($groups:tt)*) => {
+        #[global_allocator]
+        static GPUI_BENCH_ALLOCATOR: $crate::CountingAllocator<$allocator> =
+            $crate::CountingAllocator::new($allocator);
+
+        criterion::criterion_main!($($groups)*);
+    };
+    ($($groups:tt)*) => {
+        $crate::bench_main!(allocator = ::std::alloc::System; $($groups)*);
     };
 }
 pub use gpui_shared_string::*;
@@ -140,6 +203,7 @@ pub use interactive::*;
 use key_dispatch::*;
 pub use keymap::*;
 pub use lerp::*;
+pub use motion::*;
 pub use path_builder::*;
 pub use platform::*;
 pub use profiler::*;
@@ -150,6 +214,7 @@ pub use scene::*;
 pub use shared_uri::*;
 use std::{any::Any, future::Future};
 pub use style::*;
+pub use style_transitions::*;
 pub use styled::*;
 pub use subscription::*;
 pub use svg_renderer::*;
@@ -160,36 +225,83 @@ pub use taffy::{AvailableSpace, LayoutId};
 pub use test::*;
 pub use text_system::*;
 pub use transition::*;
-pub use util::{FutureExt, Timeout};
+pub use util::{FutureExt, TextRangeExt, Timeout};
 pub use view::*;
 pub use window::*;
 
+#[cfg(not(target_family = "wasm"))]
 pub use pollster::block_on;
 
-/// The context trait, allows the different contexts in GPUI to be used
-/// interchangeably for certain operations.
+/// Operations shared by GPUI's app, entity and async contexts.
+///
+/// Write a helper against this trait when it needs only entities, globals or the
+/// app. Operations that need a window are on [`VisualContext`]. See
+/// [contexts](crate::_documentation::concepts::contexts).
+///
+/// # Examples
+///
+/// ```
+/// use gpui::{AppContext, Entity};
+///
+/// fn reset<C: AppContext>(count: &Entity<u64>, cx: &mut C) {
+///     count.update(cx, |count, cx| {
+///         *count = 0;
+///         cx.notify();
+///     });
+/// }
+/// # gpui::TestApp::new().update(|cx| {
+/// #     let count = cx.new(|_| 5_u64);
+/// #     reset(&count, cx);
+/// #     assert_eq!(*count.read(cx), 0);
+/// # });
+/// ```
 pub trait AppContext {
-    /// Create a new entity in the app context.
+    /// Creates an entity from `build_entity`, and returns a handle to it.
+    ///
+    /// `build_entity` receives a [`Context`] for the new entity, so it can subscribe to
+    /// other entities or start work of its own. The entity lives as long as a handle to
+    /// it exists, or as long as it's stored with [`AppContext::insert_global_entity`].
     #[expect(
         clippy::wrong_self_convention,
         reason = "`App::new` is an ubiquitous function for creating entities"
     )]
     fn new<T: 'static>(&mut self, build_entity: impl FnOnce(&mut Context<T>) -> T) -> Entity<T>;
 
-    /// Reserve a slot for a entity to be inserted later.
-    /// The returned [Reservation] allows you to obtain the [EntityId] for the future entity.
+    /// Reserves an entity slot, and returns a [`Reservation`] for it.
+    ///
+    /// The reservation's [`EntityId`] is known now, so you can refer to the entity before
+    /// it exists. Create the entity later with [`AppContext::insert_entity`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gpui::{AppContext, TestApp};
+    ///
+    /// let mut app = TestApp::new();
+    /// app.update(|cx| {
+    ///     let reservation = cx.reserve_entity::<u32>();
+    ///     let id = reservation.entity_id();
+    ///     let number = cx.insert_entity(reservation, |_| 7);
+    ///     assert_eq!(number.entity_id(), id);
+    ///     assert_eq!(*number.read(cx), 7);
+    /// });
+    /// ```
     fn reserve_entity<T: 'static>(&mut self) -> Reservation<T>;
 
-    /// Insert a new entity in the app context based on a [Reservation] previously obtained from [`reserve_entity`].
+    /// Creates the entity for a [`Reservation`] from [`AppContext::reserve_entity`].
     ///
-    /// [`reserve_entity`]: Self::reserve_entity
+    /// The entity gets the reservation's [`EntityId`], and `build_entity` runs with a
+    /// [`Context`] for it.
     fn insert_entity<T: 'static>(
         &mut self,
         reservation: Reservation<T>,
         build_entity: impl FnOnce(&mut Context<T>) -> T,
     ) -> Entity<T>;
 
-    /// Update a entity in the app context.
+    /// Runs `update` with the entity and a [`Context`] for it, and returns the result.
+    ///
+    /// Effects queued by `update`, such as notifications, run when the outermost update
+    /// finishes.
     fn update_entity<T, R>(
         &mut self,
         handle: &Entity<T>,
@@ -198,32 +310,71 @@ pub trait AppContext {
     where
         T: 'static;
 
-    /// Update a entity in the app context.
+    /// Borrows the entity mutably, without a closure.
+    ///
+    /// The returned [`GpuiBorrow`] dereferences to the entity. Dropping it notifies
+    /// observers of the entity. Prefer [`AppContext::update_entity`], which ends the
+    /// borrow when its closure returns. Use this when you need to hold the borrow across
+    /// several statements.
+    ///
+    /// # Panics
+    ///
+    /// Panics in [`AsyncApp`] and [`AsyncWindowContext`], which can't hold a borrow of
+    /// the app across an `.await`. Call `update` there instead.
     fn as_mut<'a, T>(&'a mut self, handle: &Entity<T>) -> GpuiBorrow<'a, T>
     where
         T: 'static;
 
-    /// Read a entity from the app context.
+    /// Reads the entity with a shared borrow, and returns the result of `read`.
+    ///
+    /// `read` also receives the app, so it can read other state at the same time.
     fn read_entity<T, R>(&self, handle: &Entity<T>, read: impl FnOnce(&T, &App) -> R) -> R
     where
         T: 'static;
 
-    /// Update a window for the given handle.
+    /// Tells GPUI that the entity with `entity_id` changed. Its observers run and windows
+    /// that show it redraw.
+    ///
+    /// Inside an entity's update, [`Context::notify`] is more convenient.
+    fn notify(&mut self, entity_id: EntityId);
+
+    /// Emits `event` from `entity`.
+    ///
+    /// Subscribers registered with [`Context::subscribe`] or [`AsyncApp::subscribe`]
+    /// receive it when the current update finishes. Inside an entity's update,
+    /// [`Context::emit`] is more convenient.
+    fn emit<EntityType, EventType>(&mut self, entity: &Entity<EntityType>, event: EventType)
+    where
+        EntityType: EventEmitter<EventType>,
+        EventType: 'static;
+
+    /// Runs `f` with the window's root view, the window and the app, and returns the
+    /// result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the window has closed. Async contexts also return an error when
+    /// the app is already borrowed.
     fn update_window<T, F>(&mut self, window: AnyWindowHandle, f: F) -> Result<T>
     where
         F: FnOnce(AnyView, &mut Window, &mut App) -> T;
 
-    /// Run `f` against the entity's *current* window — the most recently
-    /// rendered window that referenced the entity. Returns `None` if the
-    /// entity has no current window or that window is unavailable. See
-    /// [`App::with_window`] for the underlying lookup.
+    /// Runs `f` with the window that most recently rendered the entity `entity_id`, and
+    /// returns the result.
+    ///
+    /// Returns `None` if no window has rendered the entity, or if that window isn't
+    /// available.
     fn with_window<R>(
         &mut self,
         entity_id: EntityId,
         f: impl FnOnce(&mut Window, &mut App) -> R,
     ) -> Option<R>;
 
-    /// Read a window off of the application context.
+    /// Reads the root view of `window` with the app, and returns the result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the window has closed.
     fn read_window<T, R>(
         &self,
         window: &WindowHandle<T>,
@@ -232,51 +383,84 @@ pub trait AppContext {
     where
         T: 'static;
 
-    /// Spawn a future on a background thread
+    /// Runs `future` on the background executor and returns a task for its result.
+    ///
+    /// Native builds use worker threads; single-threaded web builds use the browser's main
+    /// thread. The future and its result must be `Send + 'static`. No app context is supplied,
+    /// so return to a foreground task to update entities. Dropping the task cancels the future.
+    /// See [`BackgroundExecutor::spawn`] and the [executor concept](crate::_documentation::concepts::executors).
     fn background_spawn<R>(&self, future: impl Future<Output = R> + Send + 'static) -> Task<R>
     where
         R: Send + 'static;
 
-    /// Read a global from this app context
+    /// Calls `callback` with the global of type `G` and the app, and returns the result.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no global of type `G` has been set.
     fn read_global<G, R>(&self, callback: impl FnOnce(&G, &App) -> R) -> R
     where
         G: Global;
+
+    /// Keeps `entity` alive without a handle to it.
+    ///
+    /// The entity stays alive until the app is dropped, or until
+    /// [`AppContext::remove_global_entity`] removes it and no other handle refers to it.
+    fn insert_global_entity<T: 'static>(&mut self, entity: Entity<T>);
+
+    /// Stops keeping `entity` alive. It's dropped once no other handle refers to it.
+    fn remove_global_entity<T: 'static>(&mut self, entity: &Entity<T>);
+
+    /// Returns the entities stored with [`AppContext::insert_global_entity`] whose type is
+    /// `T`.
+    fn global_entities<T: 'static>(&self) -> impl Iterator<Item = Entity<T>>;
 }
 
-/// Returned by [Context::reserve_entity] to later be passed to [Context::insert_entity].
-/// Allows you to obtain the [EntityId] for a entity before it is created.
+/// A slot for an entity that doesn't exist yet.
+///
+/// Get one from [`AppContext::reserve_entity`], and pass it to
+/// [`AppContext::insert_entity`] to create the entity.
 pub struct Reservation<T>(pub(crate) Slot<T>);
 
 impl<T: 'static> Reservation<T> {
-    /// Returns the [EntityId] that will be associated with the entity once it is inserted.
+    /// Returns the [`EntityId`] the entity will have once it's inserted.
     pub fn entity_id(&self) -> EntityId {
         self.0.entity_id()
     }
 }
 
-/// This trait is used for the different visual contexts in GPUI that
-/// require a window to be present.
+/// Operations that need a window.
+///
+/// Contexts that have a window implement this, including [`AsyncWindowContext`].
+/// Import it along with [`AppContext`] from [`gpui::prelude`](crate::prelude).
 pub trait VisualContext: AppContext {
-    /// The result type for window operations.
+    /// The return type of window operations.
+    ///
+    /// [`AsyncWindowContext`] uses [`Result`], because the window may have closed by the
+    /// time the call runs.
     type Result<T>;
 
-    /// Returns the handle of the window associated with this context.
+    /// Returns the handle of the window this context works in.
     fn window_handle(&self) -> AnyWindowHandle;
 
-    /// Update a view with the given callback
+    /// Runs `update` with the entity, its window and a [`Context`] for the entity, and
+    /// returns the result, wrapped in [`VisualContext::Result`](Self::Result).
     fn update_window_entity<T: 'static, R>(
         &mut self,
         entity: &Entity<T>,
         update: impl FnOnce(&mut T, &mut Window, &mut Context<T>) -> R,
     ) -> Self::Result<R>;
 
-    /// Create a new entity, with access to `Window`.
+    /// Creates an entity with access to the window.
+    ///
+    /// `build_entity` receives the window and a [`Context`] for the new entity.
     fn new_window_entity<T: 'static>(
         &mut self,
         build_entity: impl FnOnce(&mut Window, &mut Context<T>) -> T,
     ) -> Self::Result<Entity<T>>;
 
-    /// Replace the root view of a window with a new view.
+    /// Replaces the root view of the window with the view that `build_view` creates, and
+    /// returns a handle to the new view.
     fn replace_root_view<V>(
         &mut self,
         build_view: impl FnOnce(&mut Window, &mut Context<V>) -> V,
@@ -284,26 +468,92 @@ pub trait VisualContext: AppContext {
     where
         V: 'static + Render;
 
-    /// Focus a entity in the window, if it implements the [`Focusable`] trait.
+    /// Moves keyboard focus to `entity`, using its [`Focusable::focus_handle`].
     fn focus<V>(&mut self, entity: &Entity<V>) -> Self::Result<()>
     where
         V: Focusable;
 }
 
-/// A trait for tying together the types of a GPUI entity and the events it can
-/// emit.
+/// Declares that an entity type emits events of type `E`.
+///
+/// Implement it with an empty `impl`. Then emit events with [`Context::emit`], and
+/// receive them with [`Context::subscribe`].
+///
+/// # Examples
+///
+/// ```
+/// use gpui::{AppContext, Context, EventEmitter, TestApp};
+///
+/// struct Counter {
+///     count: usize,
+/// }
+///
+/// struct Incremented(usize);
+///
+/// impl EventEmitter<Incremented> for Counter {}
+///
+/// impl Counter {
+///     fn add(&mut self, amount: usize, cx: &mut Context<Self>) {
+///         self.count += amount;
+///         cx.emit(Incremented(amount));
+///         cx.notify();
+///     }
+/// }
+///
+/// let mut app = TestApp::new();
+/// let (counter, total, _subscription) = app.update(|cx| {
+///     let counter = cx.new(|_| Counter { count: 0 });
+///     let total = cx.new(|_| 0_usize);
+///     let total_for_subscriber = total.clone();
+///     let subscription = cx.subscribe(&counter, move |_, event: &Incremented, cx| {
+///         total_for_subscriber.update(cx, |total, _| *total += event.0);
+///     });
+///     (counter, total, subscription)
+/// });
+/// app.update(|cx| counter.update(cx, |counter, cx| counter.add(2, cx)));
+/// app.read(|cx| assert_eq!(*total.read(cx), 2));
+/// ```
 pub trait EventEmitter<E: Any>: 'static {}
 
-/// A helper trait for auto-implementing certain methods on contexts that
-/// can be used interchangeably.
+/// Helpers for changing globals from any context that can reach the [`App`].
+///
+/// Implemented for every type that implements `BorrowMut<App>`, including [`App`] and
+/// [`Context`].
+///
+/// # Examples
+///
+/// ```
+/// use gpui::{AppContext, BorrowAppContext, Global, TestApp};
+///
+/// struct Scale(f32);
+///
+/// impl Global for Scale {}
+///
+/// let mut app = TestApp::new();
+/// app.update(|cx| {
+///     cx.set_global(Scale(1.5));
+///     cx.update_global(|scale: &mut Scale, _cx| scale.0 *= 2.0);
+///     assert_eq!(cx.read_global(|scale: &Scale, _cx| scale.0), 3.0);
+/// });
+/// ```
 pub trait BorrowAppContext {
-    /// Set a global value on the context.
+    /// Sets the global of type `T` to `global`, replacing any previous value. Observers of
+    /// the global are notified when the current update finishes.
     fn set_global<T: Global>(&mut self, global: T);
-    /// Updates the global state of the given type.
+    /// Updates the global of type `G` with `f`, and returns the result of `f`.
+    ///
+    /// `f` also receives the context. While `f` runs, the global is taken out of the app,
+    /// so reading it through the context panics. Change it only through the reference
+    /// that `f` receives. Observers of the global are notified when the update ends.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no global of type `G` has been set.
     fn update_global<G, R>(&mut self, f: impl FnOnce(&mut G, &mut Self) -> R) -> R
     where
         G: Global;
-    /// Updates the global state of the given type, creating a default if it didn't exist before.
+    /// Like [`BorrowAppContext::update_global`], but first sets `G::default()` if no
+    /// global of type `G` has been set.
     fn update_default_global<G, R>(&mut self, f: impl FnOnce(&mut G, &mut Self) -> R) -> R
     where
         G: Global + Default;
@@ -337,15 +587,18 @@ where
     }
 }
 
-/// Information about the GPU GPUI is running on.
+/// Describes the GPU that GPUI renders with.
+///
+/// Get it from [`Window::gpu_specs`], which returns `None` when the platform doesn't
+/// report it.
 #[derive(Default, Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub struct GpuSpecs {
-    /// Whether the GPU is really a fake (like `llvmpipe`) running on the CPU.
+    /// Whether the GPU is a software renderer, such as `llvmpipe`, running on the CPU.
     pub is_software_emulated: bool,
-    /// The name of the device, as reported by Vulkan.
+    /// The name of the device, as reported by the graphics backend.
     pub device_name: String,
-    /// The name of the driver, as reported by Vulkan.
+    /// The name of the driver, as reported by the graphics backend.
     pub driver_name: String,
-    /// Further information about the driver, as reported by Vulkan.
+    /// Further information about the driver, as reported by the graphics backend.
     pub driver_info: String,
 }

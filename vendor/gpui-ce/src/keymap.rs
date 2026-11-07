@@ -10,12 +10,44 @@ use crate::{Action, AsKeystroke, Keystroke, Unbind, is_no_action, is_unbind};
 use collections::{HashSet, TypeIdHashMap};
 use smallvec::SmallVec;
 
-/// An opaque identifier of which version of the keymap is currently active.
-/// The keymap's version is changed whenever bindings are added or removed.
+/// An identifier for one state of a [`Keymap`].
+///
+/// The version changes whenever bindings are added or the keymap is cleared. Store the version
+/// with a cached result, and recompute the result when the version differs.
 #[derive(Copy, Clone, Eq, PartialEq, Default)]
 pub struct KeymapVersion(usize);
 
-/// A collection of key bindings for the user's application.
+/// The set of key bindings for the application, and the rules for choosing among them.
+///
+/// Usually you don't build a `Keymap` yourself. [`App`](crate::App) holds one, and
+/// [`App::bind_keys`](crate::App::bind_keys) adds to it. It is also the place where the
+/// precedence rules are implemented, so this is the reference for how a keystroke resolves.
+///
+/// # Examples
+///
+/// ```standalone_crate
+/// use gpui::{Action, KeyBinding, KeyContext, Keymap, Keystroke, actions};
+///
+/// actions!(keymap_docs, [Save, Format]);
+///
+/// let keymap = Keymap::new(vec![
+///     KeyBinding::new("cmd-s", Format, Some("Workspace")),
+///     KeyBinding::new("cmd-s", Save, Some("Editor")),
+/// ]);
+///
+/// // In an editor inside a workspace, the deeper `Editor` binding wins.
+/// let typed = [Keystroke::parse("cmd-s").unwrap()];
+/// let context = [
+///     KeyContext::parse("Workspace").unwrap(),
+///     KeyContext::parse("Editor").unwrap(),
+/// ];
+/// let (bindings, pending) = keymap.bindings_for_input(&typed, &context);
+/// assert_eq!(bindings[0].action().name(), "keymap_docs::Save");
+/// assert!(!pending);
+/// ```
+///
+/// See [keyboard input](crate::_documentation::concepts::input_dispatch) for the full precedence
+/// rules as they apply during dispatch.
 #[derive(Default)]
 pub struct Keymap {
     bindings: Vec<KeyBinding>,
@@ -24,7 +56,9 @@ pub struct Keymap {
     version: KeymapVersion,
 }
 
-/// Index of a binding within a keymap.
+/// The position of a binding in a [`Keymap`], counted in the order bindings were added.
+///
+/// A larger index was added later, so it takes precedence over a smaller one at the same depth.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct BindingIndex(usize);
 
@@ -49,19 +83,22 @@ fn binding_is_unbound(disabled_binding: &KeyBinding, binding: &KeyBinding) -> bo
 }
 
 impl Keymap {
-    /// Create a new keymap with the given bindings.
+    /// Creates a keymap that contains `bindings`, in the order given.
     pub fn new(bindings: Vec<KeyBinding>) -> Self {
         let mut this = Self::default();
         this.add_bindings(bindings);
         this
     }
 
-    /// Get the current version of the keymap.
+    /// Returns the current version. See [`KeymapVersion`].
     pub fn version(&self) -> KeymapVersion {
         self.version
     }
 
-    /// Add more bindings to the keymap.
+    /// Adds `bindings` after the existing ones and changes the [`version`](Self::version).
+    ///
+    /// A binding added later wins over an earlier one at the same depth. Add the user's bindings
+    /// after the defaults so that they take precedence.
     pub fn add_bindings<T: IntoIterator<Item = KeyBinding>>(&mut self, bindings: T) {
         for binding in bindings {
             let action_id = binding.action().as_any().type_id();
@@ -79,7 +116,7 @@ impl Keymap {
         self.version.0 += 1;
     }
 
-    /// Reset this keymap to its initial state.
+    /// Removes every binding and changes the [`version`](Self::version).
     pub fn clear(&mut self) {
         self.bindings.clear();
         self.binding_indices_by_action_id.clear();
@@ -87,13 +124,20 @@ impl Keymap {
         self.version.0 += 1;
     }
 
-    /// Iterate over all bindings, in the order they were added.
+    /// Iterates over all bindings, in the order they were added.
+    ///
+    /// The iterator includes [`NoAction`](crate::NoAction) and [`Unbind`](crate::Unbind) entries.
     pub fn bindings(&self) -> impl DoubleEndedIterator<Item = &KeyBinding> + ExactSizeIterator {
         self.bindings.iter()
     }
 
-    /// Iterate over all bindings for the given action, in the order they were added. For display,
-    /// the last binding should take precedence.
+    /// Iterates over the bindings that run `action`, in the order they were added.
+    ///
+    /// Bindings disabled by a later [`NoAction`](crate::NoAction) or [`Unbind`](crate::Unbind) are
+    /// left out. This ignores key contexts, so a binding is included even when it can't fire in the
+    /// current focus. To find the bindings that apply now, use
+    /// [`Window::bindings_for_action`](crate::Window::bindings_for_action). For a shortcut label,
+    /// use the last binding, which was added most recently.
     pub fn bindings_for_action<'a>(
         &'a self,
         action: &'a dyn Action,
@@ -119,7 +163,13 @@ impl Keymap {
                     }
 
                     if is_no_action(&*disabled_binding.action) {
-                        if disabled_binding_matches_context(disabled_binding, binding) {
+                        // Like `bindings_for_input`, a null only hides bindings from
+                        // equal or weaker sources (a larger meta is weaker).
+                        let source = binding.meta.map_or(0, |meta| meta.0);
+                        let removal_source = disabled_binding.meta.map_or(0, |meta| meta.0);
+                        if source >= removal_source
+                            && disabled_binding_matches_context(disabled_binding, binding)
+                        {
                             return None;
                         }
                     } else if is_unbind(&*disabled_binding.action)
@@ -135,8 +185,11 @@ impl Keymap {
         })
     }
 
-    /// Returns all bindings that might match the input without checking context. The bindings
-    /// returned in precedence order (reverse of the order they were added to the keymap).
+    /// Returns every binding that matches all of `input`, ignoring key contexts.
+    ///
+    /// The bindings are in precedence order: the most recently added comes first. Bindings that
+    /// need more keystrokes than `input` are left out. `NoAction` and `Unbind` entries that match
+    /// are included, but their effect on other bindings is not applied.
     pub fn all_bindings_for_input(&self, input: &[Keystroke]) -> Vec<KeyBinding> {
         self.bindings()
             .rev()
@@ -149,30 +202,87 @@ impl Keymap {
             .collect()
     }
 
-    /// Returns a list of bindings that match the given input, and a boolean indicating whether or
-    /// not more bindings might match if the input was longer. Bindings are returned in precedence
-    /// order (higher precedence first, reverse of the order they were added to the keymap).
+    /// Returns the bindings that match `input` in `context_stack`, and whether a longer input
+    /// could still match a binding.
     ///
-    /// Precedence is defined by the depth in the tree (matches on the Editor take precedence over
-    /// matches on the Pane, then the Workspace, etc.). Bindings with no context are treated as the
-    /// same as the deepest context.
+    /// The first value holds the matching bindings, highest precedence first. The second value is
+    /// `true` when some binding needs more keystrokes than `input`, so the caller should wait for
+    /// the next keystroke.
     ///
-    /// In the case of multiple bindings at the same depth, the ones added to the keymap later take
-    /// precedence. User bindings are added after built-in bindings so that they take precedence.
+    /// Precedence works as follows:
     ///
-    /// If a binding has been disabled with `"x": null` it will not be returned. Disabled bindings
-    /// are evaluated with the same precedence rules so you can disable a rule in a given context
-    /// only. A disabled binding only suppresses bindings from sources with equal or weaker
-    /// precedence: a base keymap null hides default bindings, but user bindings still apply.
+    /// - **Depth.** A binding's depth is the deepest point in `context_stack` where its predicate
+    ///   matches. A binding in a deeper context wins over one in a shallower context. A binding
+    ///   without a context is as deep as the stack, so it is at least as deep as any
+    ///   context-specific binding. At equal depth, the order rule below decides.
+    /// - **Order.** At the same depth, the binding added later wins.
+    /// - **`NoAction`.** A winning [`NoAction`](crate::NoAction) removes the lower-precedence
+    ///   bindings for the same keystrokes, unless they come from a stronger source. See
+    ///   [`KeyBindingMetaIndex`](crate::KeyBindingMetaIndex).
+    /// - **`Unbind`.** A winning [`Unbind`](crate::Unbind) removes the lower-precedence binding for
+    ///   the same keystrokes that runs the action it names, whatever that binding's context.
+    ///
+    /// Several bindings can be returned, because a match that isn't suppressed stays in the list.
+    ///
+    /// # Examples
+    ///
+    /// ```standalone_crate
+    /// use gpui::{Action, KeyBinding, KeyContext, Keymap, Keystroke, actions};
+    ///
+    /// actions!(input_docs, [Save, Format]);
+    ///
+    /// let keymap = Keymap::new(vec![
+    ///     KeyBinding::new("cmd-s", Format, Some("Workspace")),
+    ///     KeyBinding::new("cmd-s", Save, Some("Editor")),
+    /// ]);
+    ///
+    /// // The `Editor` binding is at depth 2 and the `Workspace` binding at depth 1.
+    /// let (bindings, _) = keymap.bindings_for_input(
+    ///     &[Keystroke::parse("cmd-s").unwrap()],
+    ///     &[
+    ///         KeyContext::parse("Workspace").unwrap(),
+    ///         KeyContext::parse("Editor").unwrap(),
+    ///     ],
+    /// );
+    /// assert_eq!(bindings[0].action().name(), "input_docs::Save");
+    /// ```
     pub fn bindings_for_input(
         &self,
         input: &[impl AsKeystroke],
         context_stack: &[KeyContext],
     ) -> (SmallVec<[KeyBinding; 1]>, bool) {
+        let (bindings, pending) = self.resolve_bindings_for_input(
+            input,
+            context_stack,
+            self.bindings().enumerate().rev(),
+        );
+        (
+            bindings
+                .into_iter()
+                .map(|(_, binding)| binding.clone())
+                .collect(),
+            pending,
+        )
+    }
+
+    /// Same as `bindings_for_input`, but only looks at `keymap_bindings` instead of the whole
+    /// keymap, and returns each binding with its keymap index.
+    ///
+    /// `keymap_bindings` must be in reverse keymap order and include every binding that could
+    /// match `input`. For example, leaving out a `null` binding would make the binding it disables
+    /// look like it wins. `bindings_for_input` passes the whole keymap, which always meets this but
+    /// goes through every binding on every call. Passing a pre-filtered list is cheaper when
+    /// resolving many inputs against it.
+    fn resolve_bindings_for_input<'a>(
+        &self,
+        input: &[impl AsKeystroke],
+        context_stack: &[KeyContext],
+        keymap_bindings: impl IntoIterator<Item = (usize, &'a KeyBinding)>,
+    ) -> (SmallVec<[(BindingIndex, &'a KeyBinding); 1]>, bool) {
         let mut matched_bindings = SmallVec::<[(usize, BindingIndex, &KeyBinding); 1]>::new();
         let mut pending_bindings = SmallVec::<[(BindingIndex, &KeyBinding); 1]>::new();
 
-        for (ix, binding) in self.bindings().enumerate().rev() {
+        for (ix, binding) in keymap_bindings {
             let Some(depth) = self.binding_enabled(binding, context_stack) else {
                 continue;
             };
@@ -223,7 +333,7 @@ impl Keymap {
                 continue;
             }
 
-            bindings.push(binding.clone());
+            bindings.push((ix, binding));
             first_binding_index.get_or_insert(ix);
         }
 
@@ -253,42 +363,63 @@ impl Keymap {
         }
     }
 
-    /// Find the bindings that can follow the current input sequence.
+    /// Returns the bindings that `input` could still complete with more keystrokes, highest
+    /// precedence first, for the given `context_stack`.
+    ///
+    /// Use it to list the shortcuts available after a prefix, such as after `ctrl-k`. Bindings
+    /// that match `input` exactly, and `NoAction` and `Unbind` entries, are not included.
     pub fn possible_next_bindings_for_input(
         &self,
         input: &[Keystroke],
         context_stack: &[KeyContext],
     ) -> Vec<KeyBinding> {
-        let mut bindings = self
+        // Keeps `null` and `Unbind` bindings, which can disable candidates.
+        let bindings_extending_input = self
             .bindings()
             .enumerate()
             .rev()
-            .filter_map(|(ix, binding)| {
-                let depth = self.binding_enabled(binding, context_stack)?;
-                let pending = binding.match_keystrokes(input);
-                match pending {
-                    None => None,
-                    Some(is_pending) => {
-                        if !is_pending
-                            || is_no_action(&*binding.action)
-                            || is_unbind(&*binding.action)
-                        {
-                            return None;
-                        }
-                        Some((depth, BindingIndex(ix), binding))
-                    }
-                }
+            .filter(|(_, binding)| {
+                binding
+                    .match_keystrokes(input)
+                    .is_some_and(|pending| pending)
             })
             .collect::<Vec<_>>();
 
-        bindings.sort_by(|(depth_a, ix_a, _), (depth_b, ix_b, _)| {
+        let mut full_input = SmallVec::<[&Keystroke; 4]>::new();
+        let mut candidates = bindings_extending_input
+            .iter()
+            .filter(|(_, binding)| !is_no_action(&*binding.action) && !is_unbind(&*binding.action))
+            .filter_map(|&(ix, binding)| {
+                let depth = self.binding_enabled(binding, context_stack)?;
+                // Use the typed input rather than the binding's own keystrokes. A typed keystroke
+                // can match through its physical key, like `alt-s`, or the character it produced,
+                // like `ß`.
+                full_input.clear();
+                full_input.extend(input.iter());
+                full_input.extend(
+                    binding.keystrokes[input.len()..]
+                        .iter()
+                        .map(AsKeystroke::as_keystroke),
+                );
+                let (dispatched, _) = self.resolve_bindings_for_input(
+                    &full_input,
+                    context_stack,
+                    bindings_extending_input.iter().copied(),
+                );
+                dispatched
+                    .iter()
+                    .any(|(dispatched_ix, _)| *dispatched_ix == BindingIndex(ix))
+                    .then_some((depth, ix, binding))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by(|(depth_a, ix_a, _), (depth_b, ix_b, _)| {
             depth_b.cmp(depth_a).then(ix_b.cmp(ix_a))
         });
 
-        bindings
+        candidates
             .into_iter()
             .map(|(_, _, binding)| binding.clone())
-            .collect::<Vec<_>>()
+            .collect()
     }
 }
 
@@ -643,6 +774,41 @@ mod tests {
     }
 
     #[test]
+    fn test_bindings_for_action_disable_weaker_sources_only() {
+        // A base keymap null (meta 2) listed after the binding hides only
+        // bindings from equal or weaker sources, matching `bindings_for_input`.
+        for (source, expected) in [
+            (None, 1),
+            (Some(KeyBindingMetaIndex(0)), 1),
+            (Some(KeyBindingMetaIndex(1)), 1),
+            (Some(KeyBindingMetaIndex(2)), 0),
+            (Some(KeyBindingMetaIndex(3)), 0),
+        ] {
+            let mut binding = KeyBinding::new("ctrl-x", ActionAlpha {}, Some("editor"));
+            if let Some(source) = source {
+                binding.set_meta(source);
+            }
+            let mut keymap = Keymap::default();
+            keymap.add_bindings([
+                binding,
+                KeyBinding::new("ctrl-x", NoAction {}, Some("editor"))
+                    .with_meta(KeyBindingMetaIndex(2)),
+            ]);
+
+            let (candidates, _) = keymap.bindings_for_input(
+                &[Keystroke::parse("ctrl-x").unwrap()],
+                &[KeyContext::parse("editor").unwrap()],
+            );
+            assert_eq!(candidates.len(), expected, "{source:?}");
+            assert_eq!(
+                keymap.bindings_for_action(&ActionAlpha {}).count(),
+                expected,
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_fail_to_disable() {
         // disabled at the wrong level
         let bindings = [
@@ -925,5 +1091,166 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert!(result[0].action.partial_eq(&ActionBeta {}));
         assert!(result[1].action.partial_eq(&ActionAlpha {}));
+    }
+
+    #[test]
+    fn test_possible_next_bindings_exclude_null_bindings() {
+        let keymap = Keymap::new(vec![
+            KeyBinding::new("ctrl-k a", ActionAlpha {}, Some("Editor")),
+            KeyBinding::new("ctrl-k b", ActionBeta {}, Some("Editor")),
+            KeyBinding::new("ctrl-k a", NoAction {}, Some("Editor")),
+        ]);
+
+        let bindings = keymap.possible_next_bindings_for_input(
+            &[Keystroke::parse("ctrl-k").unwrap()],
+            &[KeyContext::parse("Editor").unwrap()],
+        );
+        assert_eq!(
+            describe_bindings(&bindings),
+            vec![("ctrl-k b".to_string(), "test_only::ActionBeta")]
+        );
+    }
+
+    #[test]
+    fn test_possible_next_bindings_exclude_unbound_bindings() {
+        let keymap = Keymap::new(vec![
+            KeyBinding::new("ctrl-k a", ActionAlpha {}, Some("Editor")),
+            KeyBinding::new("ctrl-k b", ActionBeta {}, Some("Editor")),
+            KeyBinding::new(
+                "ctrl-k a",
+                Unbind("test_only::ActionAlpha".into()),
+                Some("Editor"),
+            ),
+        ]);
+
+        let bindings = keymap.possible_next_bindings_for_input(
+            &[Keystroke::parse("ctrl-k").unwrap()],
+            &[KeyContext::parse("Editor").unwrap()],
+        );
+        assert_eq!(
+            describe_bindings(&bindings),
+            vec![("ctrl-k b".to_string(), "test_only::ActionBeta")]
+        );
+    }
+
+    #[test]
+    fn test_possible_next_bindings_keep_user_binding_over_base_keymap_null() {
+        const USER: KeyBindingMetaIndex = KeyBindingMetaIndex(0);
+        const BASE: KeyBindingMetaIndex = KeyBindingMetaIndex(2);
+        const DEFAULT: KeyBindingMetaIndex = KeyBindingMetaIndex(3);
+
+        let mut keymap = Keymap::default();
+        keymap.add_bindings([
+            KeyBinding::new("ctrl-k a", ActionAlpha {}, Some("Editor")).with_meta(DEFAULT),
+            KeyBinding::new("ctrl-k a", NoAction {}, Some("Editor")).with_meta(BASE),
+            KeyBinding::new("ctrl-k a", ActionBeta {}, Some("Editor")).with_meta(USER),
+        ]);
+
+        let bindings = keymap.possible_next_bindings_for_input(
+            &[Keystroke::parse("ctrl-k").unwrap()],
+            &[KeyContext::parse("Editor").unwrap()],
+        );
+        assert_eq!(
+            describe_bindings(&bindings),
+            vec![("ctrl-k a".to_string(), "test_only::ActionBeta")]
+        );
+    }
+
+    #[test]
+    fn test_possible_next_bindings_apply_disabling_by_context() {
+        let keymap = Keymap::new(vec![
+            KeyBinding::new("ctrl-k a", ActionAlpha {}, Some("Workspace")),
+            KeyBinding::new("ctrl-k a", ActionBeta {}, Some("Editor")),
+            KeyBinding::new("ctrl-k b", ActionGamma {}, Some("Editor")),
+            // Only removes the editor binding, so the workspace binding still dispatches.
+            KeyBinding::new(
+                "ctrl-k a",
+                Unbind("test_only::ActionBeta".into()),
+                Some("Editor"),
+            ),
+            // Doesn't apply because `Terminal` isn't in the context stack.
+            KeyBinding::new("ctrl-k b", NoAction {}, Some("Terminal")),
+        ]);
+
+        let bindings = keymap.possible_next_bindings_for_input(
+            &[Keystroke::parse("ctrl-k").unwrap()],
+            &[
+                KeyContext::parse("Workspace").unwrap(),
+                KeyContext::parse("Editor").unwrap(),
+            ],
+        );
+        assert_eq!(
+            describe_bindings(&bindings),
+            vec![
+                ("ctrl-k b".to_string(), "test_only::ActionGamma"),
+                ("ctrl-k a".to_string(), "test_only::ActionAlpha"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_possible_next_bindings_exclude_longer_chord_disabled_in_deeper_context() {
+        let keymap = Keymap::new(vec![
+            KeyBinding::new("space w w", ActionAlpha {}, Some("Workspace")),
+            KeyBinding::new("space w x", ActionBeta {}, Some("Workspace")),
+            KeyBinding::new("space w w", NoAction {}, Some("AgentPanel")),
+        ]);
+        let context_stack = [
+            KeyContext::parse("Workspace").unwrap(),
+            KeyContext::parse("AgentPanel").unwrap(),
+        ];
+
+        for input in ["space", "space w"] {
+            let input = input
+                .split(' ')
+                .map(|keystroke| Keystroke::parse(keystroke).unwrap())
+                .collect::<Vec<_>>();
+            let bindings = keymap.possible_next_bindings_for_input(&input, &context_stack);
+            assert_eq!(
+                describe_bindings(&bindings),
+                vec![("space w x".to_string(), "test_only::ActionBeta")]
+            );
+        }
+    }
+
+    #[test]
+    fn test_possible_next_bindings_exclude_disabled_bindings_with_typed_input() {
+        // Option-S reports both its physical key and the character it produced, so typed input
+        // matches bindings written with either.
+        let typed_input = [Keystroke::parse("alt-s->ß").unwrap()];
+        let keymap = Keymap::new(vec![
+            KeyBinding::new("ß a", ActionAlpha {}, None),
+            KeyBinding::new("alt-s a", NoAction {}, None),
+        ]);
+        assert!(
+            keymap
+                .possible_next_bindings_for_input(&typed_input, &[])
+                .is_empty()
+        );
+
+        // Cross-check against dispatch of the same typed input.
+        let typed_then_a = [
+            Keystroke::parse("alt-s->ß").unwrap(),
+            Keystroke::parse("a").unwrap(),
+        ];
+        let (dispatched, _) = keymap.bindings_for_input(&typed_then_a, &[]);
+        assert!(dispatched.is_empty());
+    }
+
+    fn describe_bindings(bindings: &[KeyBinding]) -> Vec<(String, &'static str)> {
+        bindings
+            .iter()
+            .map(|binding| {
+                (
+                    binding
+                        .keystrokes()
+                        .iter()
+                        .map(|keystroke| keystroke.inner().unparse())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    binding.action().name(),
+                )
+            })
+            .collect()
     }
 }

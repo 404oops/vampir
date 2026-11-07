@@ -1,9 +1,9 @@
 use crate::{
-    AbsoluteLength, App, Background, BackgroundTag, BorderStyle, Bounds, ColorExt, ContentMask,
-    Corners, CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement,
-    Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Length, Pixels, Point,
-    PointRefinement, ScaledPixels, SharedString, Size, SizeRefinement, Styled, TextRun, Window,
-    black, phi, point, px, quad, rems, size,
+    AbsoluteLength, App, Background, BorderStyle, Bounds, ColorExt, ContentMask, Corners,
+    CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Font,
+    FontFallbacks, FontFeatures, FontStyle, FontWeight, FontWidth, GridLocation, Length, PaintQuad,
+    Pixels, Point, PointRefinement, ScaledPixels, SharedString, Size, SizeRefinement, Styled,
+    TextRun, Window, black, phi, point, px, rems, size,
 };
 use collections::HashSet;
 use palette::{Hsla, IntoColor, rgb::Rgba};
@@ -12,31 +12,31 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{iter, mem, ops::Range};
 
-/// Use this struct for interfacing with the 'debug_below' styling from your own elements.
-/// If a parent element has this style set on it, then this struct will be set as a global in
-/// GPUI.
+/// Lets a custom element read the `debug_below` setting in debug builds.
+///
+/// When an ancestor enables that setting, GPUI installs this type as a global.
 #[cfg(debug_assertions)]
 pub struct DebugBelow;
 
 #[cfg(debug_assertions)]
 impl crate::Global for DebugBelow {}
 
-/// How to fit the image into the bounds of the element.
+/// How an image is sized and positioned inside an element's bounds.
 pub enum ObjectFit {
-    /// The image will be stretched to fill the bounds of the element.
+    /// Stretches the image to fill both dimensions, ignoring its aspect ratio.
     Fill,
-    /// The image will be scaled to fit within the bounds of the element.
+    /// Scales the image to fit inside the bounds, preserving its aspect ratio.
     Contain,
-    /// The image will be scaled to cover the bounds of the element.
+    /// Scales the image to cover the bounds, preserving its aspect ratio and cropping overflow.
     Cover,
-    /// The image will be scaled down to fit within the bounds of the element.
+    /// Keeps the image's size when it fits; otherwise scales it down like [`ObjectFit::Contain`].
     ScaleDown,
-    /// The image will maintain its original size.
+    /// Keeps the image's original size and places it at the bounds' origin.
     None,
 }
 
 impl ObjectFit {
-    /// Get the bounds of the image within the given bounds.
+    /// Returns the image rectangle produced by this fit mode.
     pub fn get_bounds(
         &self,
         bounds: Bounds<Pixels>,
@@ -134,7 +134,7 @@ impl ObjectFit {
     }
 }
 
-/// The minimum size of a column or row in a grid layout
+/// The minimum size of a grid column or row.
 #[derive(
     Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default, JsonSchema, Serialize, Deserialize,
 )]
@@ -148,7 +148,7 @@ pub enum GridTemplateMinSize {
     MaxContent,
 }
 
-/// A simplified representation of the grid-template-* value
+/// The portion of a grid template that describes track sizes.
 #[derive(
     Copy,
     Clone,
@@ -170,7 +170,80 @@ pub struct GridTemplate {
     pub min_size: GridTemplateMinSize,
 }
 
-/// The CSS styling that can be applied to an element via the `Styled` trait
+/// A ring's color or gradient.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub enum RingColor {
+    /// Use the element's effective text color, matching CSS `currentColor`.
+    #[default]
+    CurrentColor,
+    /// Use an explicit color or gradient.
+    Color(Background),
+}
+
+impl RingColor {
+    fn resolve(self, current_color: Hsla) -> Background {
+        match self {
+            Self::CurrentColor => current_color.into(),
+            Self::Color(color) => color,
+        }
+    }
+}
+
+/// A ring around or inside an element.
+#[derive(Refineable, Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[refineable(Debug, PartialEq, Serialize, Deserialize)]
+pub struct RingStyle {
+    /// The width of the ring. A zero width disables it.
+    pub width: Pixels,
+    /// The ring color or gradient.
+    pub color: RingColor,
+}
+
+impl RingStyle {
+    fn outer_quad(
+        self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        current_color: Hsla,
+    ) -> Option<PaintQuad> {
+        (self.width > Pixels::ZERO).then(|| {
+            // Quad borders are painted inward, so expanding the quad by the ring width leaves
+            // its transparent interior aligned with the element's original bounds.
+            PaintQuad::new(bounds.dilate(self.width))
+                .corner_radii(corner_radii.map(|radius| *radius + self.width))
+                .border_widths(Edges::all(self.width))
+                .border_color(self.color.resolve(current_color))
+        })
+    }
+
+    fn inset_shadow(self, current_color: Hsla) -> Option<BoxShadow> {
+        (self.width > Pixels::ZERO).then(|| {
+            BoxShadow::new(px(0.), px(0.), self.color.resolve(current_color))
+                .spread_radius(self.width)
+                .inset()
+        })
+    }
+}
+
+/// The resolved styling of an element, which GPUI uses to lay out and paint it.
+///
+/// You rarely build a `Style` yourself. The methods of [`Styled`] write into a
+/// [`StyleRefinement`], and GPUI applies that refinement over `Style::default()` when it
+/// draws the element. A default `Style` uses [`Display::Block`] and is visible.
+///
+/// # Examples
+///
+/// ```
+/// use gpui::{Display, Refineable, Style, StyleRefinement};
+///
+/// let mut style = Style::default();
+/// assert_eq!(style.display, Display::Block);
+///
+/// let mut refinement = StyleRefinement::default();
+/// refinement.display = Some(Display::Flex);
+/// style.refine(&refinement);
+/// assert_eq!(style.display, Display::Flex);
+/// ```
 #[derive(Clone, Refineable, Debug)]
 #[refineable(Debug, PartialEq, Serialize, Deserialize)]
 pub struct Style {
@@ -180,11 +253,24 @@ pub struct Style {
     /// Should the element be painted on screen?
     pub visibility: Visibility,
 
+    /// The inline direction of this element and its descendants.
+    pub direction: LayoutDirection,
+
+    /// How this element participates in Unicode bidirectional text formatting.
+    pub unicode_bidi: UnicodeBidi,
+
+    /// Whether `unicode_bidi` was set explicitly rather than left at its initial value.
+    #[doc(hidden)]
+    pub unicode_bidi_explicit: bool,
+
     // Overflow properties
     /// How children overflowing their container should affect layout
     #[refineable]
     pub overflow: Point<Overflow>,
-    /// How much space (in points) should be reserved for the scrollbars of `Overflow::Scroll` and `Overflow::Auto` nodes.
+    /// Edge fade distances for overflow masking.
+    #[refineable]
+    pub overflow_fade: Edges<AbsoluteLength>,
+    /// How much space (in logical pixels or rems) should be reserved for the scrollbars of `Overflow::Scroll` nodes.
     pub scrollbar_width: AbsoluteLength,
     /// Whether both x and y axis should be scrollable at the same time.
     pub allow_concurrent_scroll: bool,
@@ -200,19 +286,16 @@ pub struct Style {
     ///
     /// ## Motivation
     ///
-    /// On the web when scrolling with the mouse wheel, scrolling up and down will always scroll the Y axis, even when
-    /// the mouse is over a horizontally-scrollable element.
+    /// On the web, a vertical mouse wheel scrolls the Y axis even over a horizontally scrollable
+    /// element.
     ///
     /// The only way to scroll horizontally is to hold down `Shift` while scrolling, which then changes the scroll axis
     /// to the X axis.
     ///
-    /// Currently, GPUI operates differently from the web in that it will scroll an element in either the X or Y axis
-    /// when scrolling with just the mouse wheel. This causes problems when scrolling in a vertical list that contains
-    /// horizontally-scrollable elements, as when you get to the horizontally-scrollable elements the scroll will be
-    /// hijacked.
+    /// GPUI can otherwise choose either axis for mouse-wheel input. In a vertical list with
+    /// horizontally scrollable children, that can send the list's scroll gesture to a child.
     ///
-    /// Ideally we would match the web's behavior and not have a need for this, but right now we're adding this opt-in
-    /// style property to limit the potential blast radius.
+    /// Set this property to keep each gesture on its initial axis.
     pub restrict_scroll_to_axis: bool,
 
     // Position properties
@@ -251,6 +334,8 @@ pub struct Style {
     pub align_items: Option<AlignItems>,
     /// How this node should be aligned in the cross/block axis. Falls back to the parents [`AlignItems`] if not set
     pub align_self: Option<AlignSelf>,
+    /// How this element aligns vertically when it participates in an inline formatting context.
+    pub vertical_align: VerticalAlign,
     /// How should content contained within this item be aligned in the cross/block axis
     pub align_content: Option<AlignContent>,
     /// How should contained within this item be aligned in the main/inline axis
@@ -274,18 +359,36 @@ pub struct Style {
     /// The fill color of this element
     pub background: Option<Fill>,
 
-    /// The border color of this element
-    pub border_color: Option<Hsla>,
+    /// The background painted into the border of this element
+    pub border_color: Option<Background>,
 
     /// The border style of this element
     pub border_style: BorderStyle,
+
+    /// The length of each border dash, as a multiple of the border width.
+    pub border_dashed_length: f32,
+
+    /// The gap between border dashes, as a multiple of the border width.
+    pub border_dashed_gap: f32,
 
     /// The radius of the corners of this element
     #[refineable]
     pub corner_radii: Corners<AbsoluteLength>,
 
+    /// Controls the transition from each rounded corner to the straight edges.
+    /// `0.0` produces circular corners. `1.0` applies maximum smoothing.
+    pub corner_smoothing: Option<f32>,
+
     /// Box shadow of the element
     pub box_shadow: Vec<BoxShadow>,
+
+    /// A solid ring painted outside the element.
+    #[refineable]
+    pub ring: RingStyle,
+
+    /// A solid ring painted inside the element.
+    #[refineable]
+    pub inset_ring: RingStyle,
 
     /// Filters applied to this element's own content and children (CSS `filter`).
     pub filter: Vec<Filter>,
@@ -300,7 +403,7 @@ pub struct Style {
     /// The mouse cursor style shown when the mouse pointer is over an element.
     pub mouse_cursor: Option<CursorStyle>,
 
-    /// The opacity of this element
+    /// Opacity applied to this element and its children after compositing them as a group.
     pub opacity: Option<f32>,
 
     /// The grid columns of this element
@@ -336,7 +439,7 @@ impl StyleRefinement {
     }
 }
 
-/// The value of the visibility property, similar to the CSS property `visibility`
+/// Whether an element is painted while it remains in layout.
 #[derive(Default, Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub enum Visibility {
     /// The element should be drawn as normal.
@@ -346,51 +449,98 @@ pub enum Visibility {
     Hidden,
 }
 
-/// The possible values of the box-shadow property
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// The inline direction established by an element.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize, JsonSchema)]
+pub enum LayoutDirection {
+    /// Use the resolved direction of the logical parent.
+    #[default]
+    Inherit,
+    /// Establish left-to-right directionality.
+    LeftToRight,
+    /// Establish right-to-left directionality.
+    RightToLeft,
+    /// Determine direction from eligible source text.
+    Auto,
+}
+
+/// An element direction after inheritance and automatic detection have been resolved.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum ResolvedDirection {
+    /// Left-to-right inline direction.
+    #[default]
+    LeftToRight,
+    /// Right-to-left inline direction.
+    RightToLeft,
+}
+
+impl ResolvedDirection {
+    /// Returns whether this direction is right-to-left.
+    pub fn is_rtl(self) -> bool {
+        self == Self::RightToLeft
+    }
+
+    pub(crate) fn from_first_strong(text: &str) -> Option<Self> {
+        use unicode_bidi::BidiClass;
+
+        text.chars()
+            .find_map(|character| match unicode_bidi::bidi_class(character) {
+                BidiClass::L => Some(Self::LeftToRight),
+                BidiClass::R | BidiClass::AL => Some(Self::RightToLeft),
+                _ => None,
+            })
+    }
+}
+
+/// Controls the Unicode bidirectional scope established by an element.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize, JsonSchema)]
+pub enum UnicodeBidi {
+    /// Apply ordinary bidirectional processing without another scope.
+    #[default]
+    Normal,
+    /// Establish a directional embedding.
+    Embed,
+    /// Isolate the element's inline content from surrounding content.
+    Isolate,
+    /// Override the ordering of inline content with the element direction.
+    BidiOverride,
+    /// Isolate the content and override its ordering.
+    IsolateOverride,
+    /// Determine each paragraph's direction from its own content.
+    Plaintext,
+}
+
+/// The values accepted by an element's box-shadow style.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, derive_setters::Setters)]
+#[setters(generate = false)]
 pub struct BoxShadow {
-    /// What color should the shadow have?
-    pub color: Hsla,
+    /// The shadow color or gradient.
+    pub color: Background,
     /// How should it be offset from its element?
     pub offset: Point<Pixels>,
     /// How much should the shadow be blurred?
+    #[setters(generate)]
     pub blur_radius: Pixels,
     /// How much should the shadow spread?
+    #[setters(generate)]
     pub spread_radius: Pixels,
     /// Whether this is an inset shadow (drawn inside the element's bounds).
+    #[setters(generate, bool)]
     pub inset: bool,
 }
 
 impl BoxShadow {
-    /// Creates a new [`BoxShadow`] with the given offset and color, matching the order
-    /// of the CSS `box-shadow` property. Use the builder methods to set blur radius,
-    /// spread radius, and inset.
-    pub fn new(offset_x: Pixels, offset_y: Pixels, color: Hsla) -> Self {
+    /// Creates a new [`BoxShadow`] with the given offset and color. The blur and spread
+    /// radii are 0 and the shadow is outset. Use the builder methods to change them, or to
+    /// make the shadow inset.
+    pub fn new(offset_x: Pixels, offset_y: Pixels, color: impl Into<Background>) -> Self {
         Self {
-            color,
+            color: color.into(),
             offset: point(offset_x, offset_y),
             blur_radius: px(0.),
             spread_radius: px(0.),
             inset: false,
         }
-    }
-
-    /// Sets the shadow blur radius.
-    pub fn blur_radius(mut self, blur_radius: Pixels) -> Self {
-        self.blur_radius = blur_radius;
-        self
-    }
-
-    /// Sets the shadow spread radius.
-    pub fn spread_radius(mut self, spread_radius: Pixels) -> Self {
-        self.spread_radius = spread_radius;
-        self
-    }
-
-    /// Marks the shadow as inset (drawn inside the element's bounds).
-    pub fn inset(mut self) -> Self {
-        self.inset = true;
-        self
     }
 }
 
@@ -407,8 +557,7 @@ impl Filter {
     /// Whether this filter has no visible effect, so painting can skip it entirely (and the
     /// element can avoid the offscreen isolation pass when *all* of its filters are identities).
     ///
-    /// Each variant declares its own no-op case here rather than the pipeline special-casing
-    /// blur — adding a filter that this returns `true` for is silently dropped before it ever
+    /// Each variant defines its own no-op case. A filter that returns `true` is dropped before it
     /// reaches the renderer.
     pub fn is_identity(&self) -> bool {
         match self {
@@ -428,17 +577,16 @@ impl Filter {
 /// The scene-space (device-pixel) form of a [`Filter`], carried on the scene primitives that the
 /// renderers consume. Produced by [`Filter::scale`]; pixel magnitudes are in [`ScaledPixels`].
 ///
-/// This is intentionally a separate enum from [`Filter`] (rather than reusing it) so the scene
-/// stays in device space like every other primitive, and so the renderers `match` on it
-/// exhaustively — adding a filter variant breaks each backend's match, forcing a deliberate
-/// implement-or-decline decision per backend instead of silently rendering nothing.
+/// The scene stores filters separately so their magnitudes stay in device pixels alongside the
+/// other scene primitives. Matches are exhaustive: adding a filter variant requires handling it
+/// in the scene conversion and renderer.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ScaledFilter {
     /// A gaussian blur with the given radius, in scaled (device) pixels.
     Blur(ScaledPixels),
 }
 
-/// How to handle whitespace in text
+/// How text handles whitespace and line wrapping.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum WhiteSpace {
     /// Normal line wrapping when text overflows the width of the element
@@ -448,7 +596,7 @@ pub enum WhiteSpace {
     Nowrap,
 }
 
-/// How to truncate text that overflows the width of the element
+/// How text is truncated when it exceeds the element's width.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum TextOverflow {
     /// Truncate the text at the end when it doesn't fit, and represent this truncation by
@@ -464,11 +612,17 @@ pub enum TextOverflow {
     TruncateMiddle(SharedString),
 }
 
-/// How to align text within the element
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// How text is aligned within the element.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum TextAlign {
-    /// Align the text to the left of the element
+    /// Align text to the start edge for the line's direction.
     #[default]
+    Start,
+
+    /// Align text to the end edge for the line's direction.
+    End,
+
+    /// Align the text to the physical left edge of the element.
     Left,
 
     /// Center the text within the element
@@ -480,7 +634,7 @@ pub enum TextAlign {
 
 /// Case mapping applied at layout time while keeping **UTF-8 byte lengths** unchanged.
 ///
-/// [`TextTransform::Uppercase`] and [`TextTransform::Lowercase`] use Unicode full case folding via
+/// [`TextTransform::Uppercase`] and [`TextTransform::Lowercase`] use Unicode case mapping via
 /// [`char::to_uppercase`] / [`char::to_lowercase`]. If mapping a code point would change its UTF-8
 /// length, or would replace one scalar value with more than one character, the **original**
 /// character is kept. That keeps indices into the underlying buffer aligned with hit-testing and
@@ -505,7 +659,30 @@ pub enum TextTransform {
     Capitalize,
 }
 
-/// The properties that can be used to style text in GPUI
+/// The text properties of an element: font, size, color and spacing.
+///
+/// Text properties inherit into child elements, so a value set on a container applies to
+/// its text unless a child sets its own. Set them with the methods of [`Styled`], such as
+/// [`Styled::text_color`] and [`Styled::text_size`], or refine a `TextStyle` directly.
+///
+/// The default text style uses black text, the `.SystemUIFont` family, a font size of
+/// `1rem` (16px at the default rem size), and a line height of the golden ratio times the
+/// font size.
+///
+/// # Examples
+///
+/// ```
+/// use gpui::{AbsoluteLength, Refineable, TextStyle, TextStyleRefinement, hsla, rems};
+///
+/// let mut style = TextStyle::default();
+/// assert_eq!(style.font_size, AbsoluteLength::from(rems(1.)));
+///
+/// let mut refinement = TextStyleRefinement::default();
+/// refinement.color = Some(hsla(0., 1., 0.5, 1.));
+/// refinement.font_size = Some(AbsoluteLength::from(rems(1.5)));
+/// style.refine(&refinement);
+/// assert_eq!(style.color, hsla(0., 1., 0.5, 1.));
+/// ```
 #[derive(Refineable, Clone, Debug, PartialEq)]
 #[refineable(Debug, PartialEq, Serialize, Deserialize)]
 pub struct TextStyle {
@@ -529,6 +706,9 @@ pub struct TextStyle {
 
     /// The font weight, e.g. bold
     pub font_weight: FontWeight,
+
+    /// The font width as a percentage of normal width.
+    pub font_width: FontWidth,
 
     /// The font style, e.g. italic
     pub font_style: FontStyle,
@@ -572,8 +752,9 @@ impl Default for TextStyle {
             font_features: FontFeatures::default(),
             font_fallbacks: None,
             font_size: rems(1.).into(),
-            line_height: phi(),
+            line_height: phi().into(),
             font_weight: FontWeight::default(),
+            font_width: FontWidth::default(),
             font_style: FontStyle::default(),
             background_color: None,
             underline: None,
@@ -595,6 +776,11 @@ impl TextStyle {
         if let Some(weight) = style.font_weight {
             self.font_weight = weight;
         }
+
+        if let Some(width) = style.font_width {
+            self.font_width = width;
+        }
+
         if let Some(style) = style.font_style {
             self.font_style = style;
         }
@@ -629,6 +815,7 @@ impl TextStyle {
             features: self.font_features.clone(),
             fallbacks: self.font_fallbacks.clone(),
             weight: self.font_weight,
+            width: self.font_width,
             style: self.font_style,
         }
     }
@@ -647,6 +834,7 @@ impl TextStyle {
                 features: self.font_features.clone(),
                 fallbacks: self.font_fallbacks.clone(),
                 weight: self.font_weight,
+                width: self.font_width,
                 style: self.font_style,
             },
             color: self.color,
@@ -673,6 +861,9 @@ pub struct HighlightStyle {
     /// The font weight, e.g. bold
     pub font_weight: Option<FontWeight>,
 
+    /// The font width as a percentage of normal width.
+    pub font_width: Option<FontWidth>,
+
     /// The font style, e.g. italic
     pub font_style: Option<FontStyle>,
 
@@ -682,7 +873,7 @@ pub struct HighlightStyle {
     /// The underline style of the text
     pub underline: Option<UnderlineStyle>,
 
-    /// The underline style of the text
+    /// The strikethrough style of the text
     pub strikethrough: Option<StrikethroughStyle>,
 
     /// Similar to the CSS `opacity` property, this will cause the text to be less vibrant.
@@ -690,7 +881,19 @@ pub struct HighlightStyle {
 }
 
 impl Style {
-    /// Returns true if the style is visible and the background is opaque.
+    /// Resolves the initial Unicode bidi behavior against this style's direction.
+    #[doc(hidden)]
+    pub fn effective_unicode_bidi(&self) -> UnicodeBidi {
+        if self.unicode_bidi_explicit {
+            self.unicode_bidi
+        } else if self.direction == LayoutDirection::Inherit {
+            UnicodeBidi::Normal
+        } else {
+            UnicodeBidi::Isolate
+        }
+    }
+
+    /// Returns true if the style has a background that is not fully transparent. Visibility is not checked.
     pub fn has_opaque_background(&self) -> bool {
         self.background
             .as_ref()
@@ -722,7 +925,10 @@ impl Style {
                 let mut min = bounds.origin;
                 let mut max = bounds.bottom_right();
 
-                if self.border_color.is_some_and(|color| color.alpha > 0.) {
+                if self
+                    .border_color
+                    .is_some_and(|background| !background.is_transparent())
+                {
                     min.x += self.border_widths.left.to_pixels(rem_size);
                     max.x -= self.border_widths.right.to_pixels(rem_size);
                     min.y += self.border_widths.top.to_pixels(rem_size);
@@ -749,13 +955,66 @@ impl Style {
                     (false, false) => Bounds::from_corners(min, max),
                 };
 
-                Some(ContentMask { bounds })
+                let mut fade_out = self.overflow_fade.to_pixels(rem_size);
+                if self.overflow.x == Overflow::Visible {
+                    fade_out.left = Pixels::ZERO;
+                    fade_out.right = Pixels::ZERO;
+                }
+                if self.overflow.y == Overflow::Visible {
+                    fade_out.top = Pixels::ZERO;
+                    fade_out.bottom = Pixels::ZERO;
+                }
+
+                Some(ContentMask { bounds, fade_out })
             }
         }
     }
 
+    /// Get the content mask for a container that always clips and scrolls
+    /// vertically, like [`List`](crate::List) and
+    /// [`UniformList`](crate::UniformList): the vertical axis always clips,
+    /// the horizontal axis clips according to `overflow.x`, and
+    /// `overflow_fade` distances apply on each clipped axis.
+    pub fn scroll_mask(&self, bounds: Bounds<Pixels>, rem_size: Pixels) -> ContentMask<Pixels> {
+        let scroll_style = Style {
+            overflow: Point {
+                x: self.overflow.x,
+                y: Overflow::Scroll,
+            },
+            border_color: self.border_color,
+            border_widths: self.border_widths,
+            overflow_fade: self.overflow_fade,
+            ..Style::default()
+        };
+        scroll_style
+            .overflow_mask(bounds, rem_size)
+            .expect("vertical scrolling always clips")
+    }
+
     /// Paints the background of an element styled with this style.
     pub fn paint(
+        &self,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+        continuation: impl FnOnce(&mut Window, &mut App),
+    ) {
+        window.with_element_opacity(self.opacity, |window| {
+            if let Some(fragments) = window.current_inline_fragments.clone() {
+                for fragment in fragments.iter() {
+                    self.paint_box(*fragment, window, cx, |_, _| {});
+                }
+
+                continuation(window, cx);
+
+                return;
+            }
+
+            self.paint_box(bounds, window, cx, continuation);
+        });
+    }
+
+    fn paint_box(
         &self,
         bounds: Bounds<Pixels>,
         window: &mut Window,
@@ -769,7 +1028,11 @@ impl Style {
 
         #[cfg(debug_assertions)]
         if self.debug || cx.has_global::<DebugBelow>() {
-            window.paint_quad(crate::outline(bounds, crate::red(), BorderStyle::default()));
+            window.paint_quad(
+                PaintQuad::new(bounds)
+                    .border_widths(px(1.))
+                    .border_color(crate::red()),
+            );
         }
 
         let rem_size = window.rem_size();
@@ -777,13 +1040,25 @@ impl Style {
             .corner_radii
             .to_pixels(rem_size)
             .clamp_radii_for_quad_size(bounds.size);
+        let corner_smoothing = self.corner_smoothing.unwrap_or_default();
 
-        window.paint_drop_shadows(bounds, corner_radii, &self.box_shadow);
+        let current_color = self.text.color.unwrap_or_else(|| window.text_style().color);
+
+        window.paint_drop_shadows(bounds, corner_radii, corner_smoothing, &self.box_shadow);
+
+        if let Some(ring) = self.ring.outer_quad(bounds, corner_radii, current_color) {
+            window.paint_quad(ring.corner_smoothing(corner_smoothing));
+        }
 
         // Blur the content behind this element before its (typically translucent) background
         // is painted on top, so the background tints the frosted backdrop (CSS `backdrop-filter`).
         if !self.backdrop_filter.is_empty() {
-            window.paint_backdrop_filter(bounds, corner_radii, &self.backdrop_filter);
+            window.paint_backdrop_filter(
+                bounds,
+                corner_radii,
+                corner_smoothing,
+                &self.backdrop_filter,
+            );
         }
 
         // The element's own box — background, inset shadows, children, and border — painted as a
@@ -792,56 +1067,58 @@ impl Style {
         let paint_box = |window: &mut Window, cx: &mut App| {
             let background_color = self.background.as_ref().and_then(Fill::color);
             if background_color.is_some_and(|color| !color.is_transparent()) {
-                let mut border_color = match background_color {
-                    Some(color) => match color.tag {
-                        BackgroundTag::Solid
-                        | BackgroundTag::PatternSlash
-                        | BackgroundTag::Checkerboard => color.solid.into(),
-
-                        BackgroundTag::LinearGradient => color
-                            .colors
-                            .first()
-                            .map(|stop| stop.color.into())
-                            .unwrap_or_default(),
-                    },
-                    None => Hsla::default(),
-                };
-                border_color.alpha = 0.;
-                window.paint_quad(quad(
-                    bounds,
-                    corner_radii,
-                    background_color.unwrap_or_default(),
-                    Edges::default(),
-                    border_color,
-                    self.border_style,
-                ));
+                let background_color = background_color.unwrap_or_default();
+                window.paint_quad(
+                    PaintQuad::new(bounds)
+                        .corner_radii(corner_radii)
+                        .background(background_color)
+                        .border_color(background_color.opacity(0.))
+                        .border_style(self.border_style)
+                        .corner_smoothing(corner_smoothing),
+                );
             }
 
-            window.paint_inset_shadows(bounds, corner_radii, &self.box_shadow);
+            if let Some(ring) = self.inset_ring.inset_shadow(current_color) {
+                window.paint_inset_shadows(
+                    bounds,
+                    corner_radii,
+                    corner_smoothing,
+                    std::slice::from_ref(&ring),
+                );
+            }
+            window.paint_inset_shadows(bounds, corner_radii, corner_smoothing, &self.box_shadow);
 
             continuation(window, cx);
 
             if self.is_border_visible() {
                 let border_widths = self.border_widths.to_pixels(rem_size);
-                let mut background = self.border_color.unwrap_or_default();
-                background.alpha = 0.;
-                window.paint_quad(quad(
-                    bounds,
-                    corner_radii,
-                    background,
-                    border_widths,
-                    self.border_color.unwrap_or_default(),
-                    self.border_style,
-                ));
+                let border_color = self.border_color.unwrap_or_default();
+                window.paint_quad(
+                    PaintQuad::new(bounds)
+                        .corner_radii(corner_radii)
+                        .background(border_color.opacity(0.))
+                        .border_widths(border_widths)
+                        .border_color(border_color)
+                        .border_style(self.border_style)
+                        .corner_smoothing(corner_smoothing)
+                        .border_dashed_length(self.border_dashed_length)
+                        .border_dashed_gap(self.border_dashed_gap),
+                );
             }
         };
 
         if self.filter.is_empty() {
             paint_box(window, cx);
         } else {
-            window.with_filter_layer(bounds, corner_radii, &self.filter, |window| {
-                paint_box(window, cx);
-            });
+            window.with_filter_layer(
+                bounds,
+                corner_radii,
+                corner_smoothing,
+                &self.filter,
+                |window| {
+                    paint_box(window, cx);
+                },
+            );
         }
 
         #[cfg(debug_assertions)]
@@ -851,7 +1128,8 @@ impl Style {
     }
 
     fn is_border_visible(&self) -> bool {
-        self.border_color.is_some_and(|color| color.alpha > 0.)
+        self.border_color
+            .is_some_and(|background| !background.is_transparent())
             && self.border_widths.any(|length| !length.is_zero())
     }
 }
@@ -861,10 +1139,14 @@ impl Default for Style {
         Style {
             display: Display::Block,
             visibility: Visibility::Visible,
+            direction: LayoutDirection::Inherit,
+            unicode_bidi: UnicodeBidi::Normal,
+            unicode_bidi_explicit: false,
             overflow: Point {
                 x: Overflow::Visible,
                 y: Overflow::Visible,
             },
+            overflow_fade: Edges::<AbsoluteLength>::zero(),
             allow_concurrent_scroll: false,
             restrict_scroll_to_axis: false,
             scrollbar_width: AbsoluteLength::default(),
@@ -881,6 +1163,7 @@ impl Default for Style {
             // Alignment
             align_items: None,
             align_self: None,
+            vertical_align: VerticalAlign::Baseline,
             align_content: None,
             justify_content: None,
             // Flexbox
@@ -892,8 +1175,13 @@ impl Default for Style {
             background: None,
             border_color: None,
             border_style: BorderStyle::default(),
+            border_dashed_length: crate::scene::DEFAULT_BORDER_DASHED_LENGTH,
+            border_dashed_gap: crate::scene::DEFAULT_BORDER_DASHED_GAP,
             corner_radii: Corners::default(),
+            corner_smoothing: None,
             box_shadow: Default::default(),
+            ring: Default::default(),
+            inset_ring: Default::default(),
             filter: Default::default(),
             backdrop_filter: Default::default(),
             text: TextStyleRefinement::default(),
@@ -975,6 +1263,7 @@ impl From<&TextStyle> for HighlightStyle {
         Self {
             color: Some(other.color),
             font_weight: Some(other.font_weight),
+            font_width: Some(other.font_width),
             font_style: Some(other.font_style),
             background_color: other.background_color,
             underline: other.underline,
@@ -985,7 +1274,7 @@ impl From<&TextStyle> for HighlightStyle {
 }
 
 impl HighlightStyle {
-    /// Create a highlight style with just a color
+    /// Creates a highlight style with a foreground color.
     pub fn color(color: Hsla) -> Self {
         Self {
             color: Some(color),
@@ -1008,6 +1297,7 @@ impl HighlightStyle {
                 })
                 .or(self.color),
             font_weight: other.font_weight.or(self.font_weight),
+            font_width: other.font_width.or(self.font_width),
             font_style: other.font_style.or(self.font_style),
             background_color: other.background_color.or(self.background_color),
             underline: other.underline.or(self.underline),
@@ -1103,9 +1393,7 @@ pub fn combine_highlights(
     })
 }
 
-/// Used to control how child nodes are aligned.
-/// For Flexbox it controls alignment in the cross axis
-/// For Grid it controls alignment in the block axis
+/// Aligns children along the cross axis in flexbox and the block axis in grid.
 ///
 /// [MDN](https://developer.mozilla.org/en-US/docs/Web/CSS/align-items)
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
@@ -1132,30 +1420,44 @@ pub enum AlignItems {
     /// Stretch to fill the container
     Stretch,
 }
-/// Used to control how child nodes are aligned.
-/// Does not apply to Flexbox, and will be ignored if specified on a flex container
-/// For Grid it controls alignment in the inline axis
+/// Aligns grid children along the inline axis.
+///
+/// Flexbox ignores this property on the container.
 ///
 /// [MDN](https://developer.mozilla.org/en-US/docs/Web/CSS/justify-items)
 pub type JustifyItems = AlignItems;
-/// Used to control how the specified nodes is aligned.
-/// Overrides the parent Node's `AlignItems` property.
-/// For Flexbox it controls alignment in the cross axis
-/// For Grid it controls alignment in the block axis
+/// Aligns one child along the cross axis in flexbox or the block axis in grid.
+///
+/// It overrides the parent's `AlignItems` value for that child.
 ///
 /// [MDN](https://developer.mozilla.org/en-US/docs/Web/CSS/align-self)
 pub type AlignSelf = AlignItems;
-/// Used to control how the specified nodes is aligned.
-/// Overrides the parent Node's `JustifyItems` property.
-/// Does not apply to Flexbox, and will be ignored if specified on a flex child
-/// For Grid it controls alignment in the inline axis
+/// Aligns one grid child along the inline axis.
+///
+/// It overrides the parent's `JustifyItems` value. Flexbox ignores it.
 ///
 /// [MDN](https://developer.mozilla.org/en-US/docs/Web/CSS/justify-self)
 pub type JustifySelf = AlignItems;
 
-/// Sets the distribution of space between and around content items
-/// For Flexbox it controls alignment in the cross axis
-/// For Grid it controls alignment in the block axis
+/// Controls the vertical position of an element box in an inline formatting context.
+///
+/// This property has no effect on ordinary block, flex, or grid layout.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub enum VerticalAlign {
+    /// Align the bottom of the box with the text baseline.
+    #[default]
+    Baseline,
+    /// Align the box midpoint with the parent baseline plus half the parent font's x-height.
+    /// This is CSS text-metric alignment. Use `self_center` or `items_center` for flex or grid
+    /// container centering.
+    Middle,
+    /// Align the top of the box with the top of its line.
+    Top,
+    /// Align the bottom of the box with the bottom of its line.
+    Bottom,
+}
+
+/// Distributes free space between flex lines or grid tracks along the cross axis.
 ///
 /// [MDN](https://developer.mozilla.org/en-US/docs/Web/CSS/align-content)
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
@@ -1190,31 +1492,39 @@ pub enum AlignContent {
     SpaceAround,
 }
 
-/// Sets the distribution of space between and around content items
-/// For Flexbox it controls alignment in the main axis
-/// For Grid it controls alignment in the inline axis
+/// Distributes free space between flex items or grid tracks along the main or inline axis.
 ///
 /// [MDN](https://developer.mozilla.org/en-US/docs/Web/CSS/justify-content)
 pub type JustifyContent = AlignContent;
 
-/// Sets the layout used for the children of this node
+/// Selects the layout algorithm used for this element's children.
 ///
-/// The default values depends on on which feature flags are enabled. The order of precedence is: Flex, Grid, Block, None.
+/// Defaults to flex layout. Block containers arrange text and inline children in paragraphs.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
-// Copy of taffy::style type of the same name, to derive JsonSchema.
+// Inline participation is handled by GPUI before independent box layout in Taffy.
 pub enum Display {
     /// The children will follow the block layout algorithm
     Block,
+
     /// The children will follow the flexbox layout algorithm
     #[default]
     Flex,
+
     /// The children will follow the CSS Grid layout algorithm
     Grid,
-    /// The children will not be laid out, and will follow absolute positioning
+
+    /// Contributes its contents to the surrounding paragraph, wrapping across lines.
+    /// As a root or flex/grid item, lays out its contents independently using block flow.
+    Inline,
+
+    /// An atomic inline box whose children use flex layout.
+    InlineFlex,
+
+    /// The element and its children are hidden and occupy no space.
     None,
 }
 
-/// Controls whether flex items are forced onto one line or can wrap onto multiple lines.
+/// Controls whether flex items stay on one line or wrap onto multiple lines.
 ///
 /// Defaults to [`FlexWrap::NoWrap`]
 ///
@@ -1231,13 +1541,11 @@ pub enum FlexWrap {
     WrapReverse,
 }
 
-/// The direction of the flexbox layout main axis.
+/// The direction of a flex container's main axis.
 ///
-/// There are always two perpendicular layout axes: main (or primary) and cross (or secondary).
-/// Adding items will cause them to be positioned adjacent to each other along the main axis.
-/// By varying this value throughout your tree, you can create complex axis-aligned layouts.
-///
-/// Items are always aligned relative to the cross axis, and justified relative to the main axis.
+/// A flex container has a main axis, where children are placed, and a perpendicular cross axis,
+/// where they are aligned. `justify-*` properties act on the main axis; `align-*` properties act
+/// on the cross axis.
 ///
 /// The default behavior is [`FlexDirection::Row`].
 ///
@@ -1264,17 +1572,16 @@ pub enum FlexDirection {
     ColumnReverse,
 }
 
-/// How children overflowing their container should affect layout
+/// How overflow affects layout and the scroll region.
 ///
-/// In CSS the primary effect of this property is to control whether contents of a parent container that overflow that container should
-/// be displayed anyway, be clipped, or trigger the container to become a scroll container. However it also has secondary effects on layout,
-/// the main ones being:
+/// GPUI uses this enum for the layout effects of CSS `overflow`; clipping and scrolling are
+/// applied while the element is painted. Its main layout effects are:
 ///
 ///   - The automatic minimum size Flexbox/CSS Grid items with non-`Visible` overflow is `0` rather than being content based
 ///   - `Overflow::Scroll` nodes have space in the layout reserved for a scrollbar (width controlled by the `scrollbar_width` property)
 ///
-/// In Taffy, we only implement the layout related secondary effects as we are not concerned with drawing/painting. The amount of space reserved for
-/// a scrollbar is controlled by the `scrollbar_width` property. If this is `0` then `Scroll` behaves identically to `Hidden`.
+/// Taffy supplies the layout effects. The amount of space reserved for a scrollbar is controlled
+/// by `scrollbar_width`; when it is `0`, `Scroll` reserves no space and lays out like `Hidden`.
 ///
 /// <https://developer.mozilla.org/en-US/docs/Web/CSS/overflow>
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
@@ -1301,10 +1608,10 @@ pub enum Overflow {
 /// This controls both how the origin is determined for the [`Style::position`] field,
 /// and whether or not the item will be controlled by flexbox's layout algorithm.
 ///
-/// WARNING: this enum follows the behavior of [CSS's `position` property](https://developer.mozilla.org/en-US/docs/Web/CSS/position),
-/// which can be unintuitive.
+/// The behavior follows [CSS `position`](https://developer.mozilla.org/en-US/docs/Web/CSS/position),
+/// including its interaction with layout and offsets.
 ///
-/// [`Position::Relative`] is the default value, in contrast to the default behavior in CSS.
+/// [`Position::Relative`] is GPUI's default; CSS defaults to `static`.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
 // Copy of taffy::style type of the same name, to derive JsonSchema.
 pub enum Position {
@@ -1316,7 +1623,7 @@ pub enum Position {
     /// Otherwise, it is placed relative to the origin.
     /// No space is created for the item in the page layout, and its size will not be altered.
     ///
-    /// WARNING: to opt-out of layouting entirely, you must use [`Display::None`] instead on your [`Style`] object.
+    /// To remove the item from layout and painting, use [`Display::None`] instead.
     Absolute,
 }
 
@@ -1353,8 +1660,8 @@ impl From<AlignContent> for taffy::style::AlignContent {
 impl From<Display> for taffy::style::Display {
     fn from(value: Display) -> Self {
         match value {
-            Display::Block => Self::Block,
-            Display::Flex => Self::Flex,
+            Display::Block | Display::Inline => Self::Block,
+            Display::Flex | Display::InlineFlex => Self::Flex,
             Display::Grid => Self::Grid,
             Display::None => Self::None,
         }
@@ -1404,10 +1711,32 @@ impl From<Position> for taffy::style::Position {
 
 #[cfg(test)]
 mod tests {
-    use crate::{blue, green, px, red, yellow};
+    use crate::{blue, green, hsla, linear_color_stop, linear_gradient, px, red, yellow};
     use palette::WithAlpha;
 
     use super::*;
+
+    fn ring_gradient() -> Background {
+        linear_gradient(
+            90.,
+            linear_color_stop(red(), 0.),
+            linear_color_stop(blue(), 1.),
+        )
+    }
+
+    #[test]
+    fn border_color_accepts_backgrounds_and_solid_colors() {
+        let gradient = linear_gradient(
+            90.0,
+            linear_color_stop(red(), 0.0),
+            linear_color_stop(blue(), 1.0),
+        );
+        let gradient_style = StyleRefinement::default().border_color(gradient);
+        assert_eq!(gradient_style.border_color, Some(gradient));
+
+        let solid_style = StyleRefinement::default().border_color(red());
+        assert_eq!(solid_style.border_color, Some(red().into()));
+    }
 
     #[test]
     fn test_basic_highlight_style_combination() {
@@ -1429,6 +1758,7 @@ mod tests {
             fade_out: Some(0.),
             font_style: Some(FontStyle::Italic),
             font_weight: Some(FontWeight(300.)),
+            font_width: Some(FontWidth::CONDENSED),
             background_color: Some(yellow()),
             underline: Some(UnderlineStyle {
                 thickness: px(2.),
@@ -1437,6 +1767,11 @@ mod tests {
             }),
         };
         let expected_style = style_b;
+
+        assert_eq!(
+            TextStyle::default().highlight(style_b).font_width,
+            FontWidth::CONDENSED
+        );
 
         let style_a = style_a.highlight(style_b);
         assert_eq!(
@@ -1461,6 +1796,7 @@ mod tests {
             fade_out: Some(0.),
             font_style: Some(FontStyle::Oblique),
             font_weight: Some(FontWeight(800.)),
+            font_width: Some(FontWidth::EXPANDED),
             background_color: Some(green()),
             underline: Some(UnderlineStyle {
                 thickness: px(4.),
@@ -1479,6 +1815,7 @@ mod tests {
             fade_out: Some(0.),
             font_style: Some(FontStyle::Oblique),
             font_weight: Some(FontWeight(800.)),
+            font_width: Some(FontWidth::EXPANDED),
             background_color: Some(green()),
             underline: Some(UnderlineStyle {
                 thickness: px(4.),
@@ -1588,6 +1925,7 @@ mod tests {
         let mut style = Style::default();
         style.refine(&StyleRefinement::default().text_size(px(20.0)));
         style.refine(&StyleRefinement::default().font_weight(FontWeight::SEMIBOLD));
+        style.refine(&StyleRefinement::default().font_width(87.5));
 
         assert_eq!(
             Some(AbsoluteLength::from(px(20.0))),
@@ -1598,5 +1936,127 @@ mod tests {
             Some(FontWeight::SEMIBOLD),
             style.text_style().unwrap().font_weight
         );
+
+        let mut resolved = TextStyle::default();
+        resolved.refine(style.text_style().unwrap());
+        let inherited = resolved.highlight(HighlightStyle::color(red()));
+
+        assert_eq!(inherited.font().width, FontWidth::SEMI_CONDENSED);
+        assert_eq!(inherited.to_run(4).font.width, FontWidth::SEMI_CONDENSED);
+        assert_eq!(
+            HighlightStyle::from(&inherited).font_width,
+            Some(FontWidth::SEMI_CONDENSED)
+        );
+
+        let mut element = crate::div()
+            .font_width(FontWidth::CONDENSED)
+            .font(crate::font("IBM Plex Sans"));
+        assert_eq!(element.text_style().font_width, Some(FontWidth::NORMAL));
+    }
+
+    #[test]
+    fn dashed_border_pattern_has_legacy_defaults_and_refines_independently() {
+        let mut style = Style::default();
+
+        assert_eq!(
+            style.border_dashed_length,
+            crate::scene::DEFAULT_BORDER_DASHED_LENGTH
+        );
+        assert_eq!(
+            style.border_dashed_gap,
+            crate::scene::DEFAULT_BORDER_DASHED_GAP
+        );
+
+        style.refine(
+            &StyleRefinement::default()
+                .border_dashed_length(4.0)
+                .border_dashed_gap(0.5),
+        );
+
+        assert_eq!(style.border_dashed_length, 4.0);
+        assert_eq!(style.border_dashed_gap, 0.5);
+        assert_eq!(style.border_style, BorderStyle::Solid);
+
+        style.refine(&StyleRefinement::default().border_dashed());
+        assert_eq!(style.border_style, BorderStyle::Dashed);
+    }
+
+    #[test]
+    fn outer_ring_is_hollow_and_composes_with_shadows() {
+        let drop_shadow = BoxShadow::new(px(0.), px(2.), blue()).blur_radius(px(4.));
+        let mut style = Style::default();
+        style.refine(
+            &StyleRefinement::default()
+                .ring_2()
+                .shadow(vec![drop_shadow.clone()]),
+        );
+        let current_color = hsla(0.7, 0.5, 0.4, 0.8);
+        style.refine(&StyleRefinement::default().ring(px(3.5)));
+        let element_bounds = Bounds {
+            origin: point(px(10.), px(20.)),
+            size: size(px(100.), px(40.)),
+        };
+        let element_radii = Corners {
+            top_left: px(0.),
+            top_right: px(4.),
+            bottom_right: px(10.),
+            bottom_left: px(20.),
+        };
+        let ring = style
+            .ring
+            .outer_quad(element_bounds, element_radii, current_color)
+            .unwrap();
+
+        assert_eq!(ring.bounds.dilate(-px(3.5)), element_bounds);
+        assert_eq!(ring.border_widths, Edges::all(px(3.5)));
+        assert_eq!(
+            ring.corner_radii.map(|radius| *radius - px(3.5)),
+            element_radii
+        );
+        assert!(ring.background.is_transparent());
+        assert_eq!(ring.border_color, current_color.into());
+        assert_eq!(ring.border_style, BorderStyle::Solid);
+        assert_eq!(style.box_shadow, vec![drop_shadow]);
+
+        let gradient = ring_gradient();
+        style.refine(&StyleRefinement::default().ring_color(gradient));
+        assert_eq!(
+            style
+                .ring
+                .outer_quad(element_bounds, element_radii, current_color)
+                .unwrap()
+                .border_color,
+            gradient
+        );
+
+        style.refine(&StyleRefinement::default().ring_0());
+        assert!(
+            style
+                .ring
+                .outer_quad(element_bounds, element_radii, current_color)
+                .is_none()
+        );
+        assert_eq!(style.box_shadow.len(), 1);
+    }
+
+    #[test]
+    fn inset_ring_utility_refines_independently_and_lowers_to_an_inset_shadow() {
+        let gradient = ring_gradient();
+        let mut style = Style::default();
+        style.refine(
+            &StyleRefinement::default()
+                .inset_ring(px(1.))
+                .inset_ring_color(gradient),
+        );
+        style.refine(&StyleRefinement::default().inset_ring_4());
+
+        let inset = style.inset_ring.inset_shadow(blue()).unwrap();
+
+        assert_eq!(inset.offset, point(px(0.), px(0.)));
+        assert_eq!(inset.blur_radius, px(0.));
+        assert_eq!(inset.spread_radius, px(4.));
+        assert_eq!(inset.color, gradient);
+        assert!(inset.inset);
+        assert_eq!(style.ring, RingStyle::default());
     }
 }

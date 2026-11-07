@@ -12,8 +12,8 @@
 [package]
 edition = "2024"
 name = "gpui_ce_windows"
-version = "0.1.0"
-build = "build.rs"
+version = "0.3.0"
+build = false
 publish = true
 autolib = false
 autobins = false
@@ -26,39 +26,40 @@ license = "Apache-2.0"
 
 [features]
 default = ["gpui/default"]
-screen-capture = [
-    "gpui/screen-capture",
-    "scap",
-]
+screen-capture = ["gpui/screen-capture"]
 test-support = ["gpui/test-support"]
-wgpu = ["dep:gpui_wgpu"]
 
 [lib]
 name = "gpui_ce_windows"
 path = "src/gpui_windows.rs"
+doctest = false
 
 [dependencies.gpui]
-version = "0.2.2"
+version = "0.3.0"
+default-features = false
 package = "gpui-ce"
 
-[dependencies.gpui_wgpu]
-version = "0.1.0"
-features = ["font-kit"]
-optional = true
-package = "gpui_ce_wgpu"
+[dependencies.gpui_render]
+version = "0.3.0"
+package = "gpui_ce_render"
+
+[dependencies.wgsl-rs]
+version = "=0.1.0-beta.1"
+features = ["validation"]
+default-features = false
 
 [target.'cfg(target_os = "windows")'.dependencies.accesskit]
-version = "0.24.0"
+version = "0.24.1"
 features = ["enumn"]
 
 [target.'cfg(target_os = "windows")'.dependencies.accesskit_windows]
-version = "0.33.1"
+version = "0.34"
 
 [target.'cfg(target_os = "windows")'.dependencies.anyhow]
 version = "1.0.86"
 
 [target.'cfg(target_os = "windows")'.dependencies.collections]
-version = "0.2.2"
+version = "0.3.0"
 package = "gpui_ce_collections"
 
 [target.'cfg(target_os = "windows")'.dependencies.dunce]
@@ -68,14 +69,25 @@ version = "1.0"
 version = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies.futures]
-version = "0.3.32"
+version = "0.3.34"
+
+[target.'cfg(target_os = "windows")'.dependencies.gpui_parley]
+version = "0.3.0"
+features = ["system-fonts"]
+default-features = false
+package = "gpui_ce_parley"
 
 [target.'cfg(target_os = "windows")'.dependencies.gpui_util]
-version = "0.2.6"
+version = "0.3.0"
 package = "gpui_ce_util"
 
 [target.'cfg(target_os = "windows")'.dependencies.image]
 version = "0.25.1"
+features = [
+    "gif",
+    "webp",
+]
+default-features = false
 
 [target.'cfg(target_os = "windows")'.dependencies.itertools]
 version = "0.14.0"
@@ -96,11 +108,9 @@ version = "0.9.4"
 [target.'cfg(target_os = "windows")'.dependencies.raw-window-handle]
 version = "0.6"
 
-[target.'cfg(target_os = "windows")'.dependencies.scap]
-version = "0.0.8-zed"
-optional = true
-default-features = false
-package = "zed-scap"
+[target.'cfg(target_os = "windows")'.dependencies.scheduler]
+version = "0.3.0"
+package = "gpui_ce_scheduler"
 
 [target.'cfg(target_os = "windows")'.dependencies.smallvec]
 version = "1.6"
@@ -116,6 +126,7 @@ features = [
     "v5",
     "v7",
     "serde",
+    "v5",
 ]
 
 [target.'cfg(target_os = "windows")'.dependencies.windows]
@@ -133,6 +144,8 @@ features = [
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
     "Win32_Graphics_DirectComposition",
     "Win32_Graphics_DirectWrite",
     "Win32_Graphics_DirectManipulation",
@@ -181,19 +194,49 @@ features = [
     "Win32_Storage_Packaging_Appx",
     "Win32_System_JobObjects",
     "UI_Notifications",
+    "Data_Xml_Dom",
+    "UI_Notifications",
+    "UI_ViewManagement",
+    "Wdk_System_SystemServices",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_DirectComposition",
+    "Win32_Graphics_DirectManipulation",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Hlsl",
+    "Win32_Media",
+    "Win32_Security_Credentials",
+    "Win32_Storage_Packaging_Appx",
+    "Win32_System_DataExchange",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Memory",
+    "Win32_System_Performance",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_Ime",
+    "Win32_UI_Input_Pointer",
 ]
+
+[target.'cfg(target_os = "windows")'.dependencies.windows-061]
+version = "0.61.3"
+features = ["Win32_Graphics_Direct3D11"]
+package = "windows"
 
 [target.'cfg(target_os = "windows")'.dependencies.windows-core]
 version = "0.62.2"
 
 [target.'cfg(target_os = "windows")'.dependencies.windows-numerics]
-version = "0.3.1"
+version = "0.3"
 
 [target.'cfg(target_os = "windows")'.dependencies.windows-registry]
 version = "0.6.1"
 
-[target.'cfg(target_os = "windows")'.build-dependencies.windows-registry]
-version = "0.6.1"
+[target.'cfg(target_os = "windows")'.dev-dependencies]
 
 [lints.clippy]
 dbg_macro = "deny"

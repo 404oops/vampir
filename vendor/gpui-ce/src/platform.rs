@@ -9,61 +9,74 @@ pub mod layer_shell;
 /// Types for configuring parent-anchored popup windows such as menus, dropdowns and tooltips.
 pub mod popup;
 
-#[cfg(any(test, feature = "bench"))]
-mod bench_dispatcher;
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+mod threaded_dispatcher;
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 mod test;
 
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
 mod visual_test;
 
-#[cfg(all(
-    feature = "screen-capture",
-    any(target_os = "windows", target_os = "linux", target_os = "freebsd",)
-))]
-pub mod scap_screen_capture;
+#[cfg(all(feature = "screen-capture", target_os = "windows"))]
+pub mod screen_capture;
+#[cfg(target_os = "windows")]
+mod windows_screen_capture;
+#[cfg(target_os = "windows")]
+pub use windows_screen_capture::WindowsScreenCaptureFrame;
 
-#[cfg(all(
-    any(target_os = "windows", target_os = "linux"),
-    feature = "screen-capture"
-))]
-pub(crate) type PlatformScreenCaptureFrame = scap::frame::Frame;
+#[cfg(all(target_os = "windows", feature = "screen-capture"))]
+pub(crate) type PlatformScreenCaptureFrame = WindowsScreenCaptureFrame;
 #[cfg(not(feature = "screen-capture"))]
 pub(crate) type PlatformScreenCaptureFrame = ();
 #[cfg(all(target_os = "macos", feature = "screen-capture"))]
-pub(crate) type PlatformScreenCaptureFrame = core_video::image_buffer::CVImageBuffer;
+pub(crate) type PlatformScreenCaptureFrame =
+    objc2_core_foundation::CFRetained<objc2_core_video::CVImageBuffer>;
+#[cfg(all(
+    feature = "screen-capture",
+    not(any(target_os = "macos", target_os = "windows"))
+))]
+// Screen capture currently has native frame representations only on macOS and Windows. Keep the
+// cross-platform API well-formed for enabled-but-unsupported targets; source enumeration simply
+// yields no platform sources there.
+pub(crate) type PlatformScreenCaptureFrame = ();
 
+use crate::util::FluentBuilder;
 use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Edges, ExternalDragPayload, Font,
-    FontId, FontMetrics, FontRun, ForegroundExecutor, GlyphId, GpuSpecs, ImageSource, Keymap,
-    LineLayout, Pixels, PlatformGestures, PlatformInput, Point, Priority, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString,
-    Size, SvgRenderer, SystemWindowTab, Task, Window, WindowControlArea, hash, point, px, size,
+    FontId, FontMetrics, ForegroundExecutor, GlyphAtlasEntry, GlyphId, GpuSpecs, ImageSource,
+    InlineLayout, InlineLayoutRequest, Keymap, LineLayout, Pixels, PlatformGestures, PlatformInput,
+    Point, PreparedRasterStyle, Priority, RasterStyleRequest, RasterizedGlyph,
+    RasterizedGlyphFormat, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
+    Scene, SharedString, Size, SvgRenderer, SystemWindowTab, Task, TextLayoutRequest,
+    ValidatedRasterizedGlyph, Window, WindowControlArea, hash, point, px,
 };
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use anyhow::bail;
 use anyhow::{Context as _, Result};
 use async_task::Runnable;
+use collections::FxHashMap;
 use futures::channel::oneshot;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 use image::RgbaImage;
 use image::codecs::gif::GifDecoder;
 use image::{AnimationDecoder as _, DynamicImage, Frame};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use scheduler::Instant;
-pub use scheduler::RunnableMeta;
+pub use scheduler::{LocalTaskScope, RunnableMeta};
 use schemars::JsonSchema;
 use seahash::SeaHasher;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
+use std::collections::hash_map::Entry;
 use std::hash::{Hash, Hasher};
 use std::io::Cursor;
 use std::ops;
 use std::time::Duration;
 use std::{
+    ffi::OsString,
     fmt::{self, Debug},
     ops::Range,
     path::{Path, PathBuf},
@@ -77,17 +90,129 @@ pub use app_menu::*;
 pub use keyboard::*;
 pub use keystroke::*;
 
-#[cfg(any(test, feature = "test-support"))]
+/// Whether the platform is presenting a window's frames.
+///
+/// This is about presentation, not the window's shown/hidden state: a shown
+/// window that is fully covered by other windows, minimized, on another
+/// Space or virtual desktop, or on a display that is asleep is `Hidden`. A
+/// window only partly covered by other windows is `Visible`.
+///
+/// Each platform reports from a single source, and what that source can see
+/// differs:
+///
+/// * macOS: `NSWindow.occlusionState`. Covers all of the cases above.
+/// * Windows: `WS_VISIBLE` and the minimized state. Windows keeps compositing
+///   covered windows for thumbnails and Alt-Tab and offers no occlusion
+///   notification, so a fully covered window stays `Visible`. Display sleep is
+///   not reported either.
+/// * Wayland: the `xdg_toplevel` `suspended` state (xdg-shell v6). Compositors
+///   that don't support it never report `Hidden`.
+/// * X11: mapped state plus `VisibilityNotify`. Compositing window managers
+///   generally never report a window as fully obscured, so covering is only
+///   detected without compositing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowVisibility {
+    /// At least part of the window is being presented; frames drawn for it
+    /// will be shown.
+    Visible,
+    /// No part of the window is being presented. The platform will not
+    /// request frames for it until it becomes visible again.
+    Hidden,
+}
+
+impl WindowVisibility {
+    /// Whether frames drawn for the window will be shown.
+    pub fn is_visible(self) -> bool {
+        self == Self::Visible
+    }
+}
+
+/// A change to the connected displays, reported through
+/// [`App::observe_displays`](crate::App::observe_displays).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DisplayEvent {
+    /// A display was connected.
+    Added(DisplayId),
+    /// A display was disconnected. Windows on it are moved to another
+    /// display by the platform.
+    Removed(DisplayId),
+    /// A connected display's properties changed.
+    Changed {
+        /// The display that changed.
+        id: DisplayId,
+        /// Which of its properties changed.
+        changes: DisplayChanges,
+    },
+}
+
+bitflags::bitflags! {
+    /// The properties of a display that a [`DisplayEvent::Changed`] reports.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct DisplayChanges: u8 {
+        /// [`PlatformDisplay::bounds`] changed.
+        const BOUNDS = 1 << 0;
+        /// [`PlatformDisplay::refresh_interval`] changed.
+        const REFRESH_INTERVAL = 1 << 1;
+    }
+}
+
+/// Converts a refresh rate in hertz to the time between refreshes, rejecting
+/// the zero, negative, and non-finite rates platforms use to mean "unknown".
+pub fn refresh_interval_from_hz(hertz: f64) -> Option<Duration> {
+    (hertz.is_finite() && hertz > 0.0).then(|| Duration::from_secs_f64(1.0 / hertz))
+}
+
+/// Controls whether the application participates in the system's foreground UI.
+///
+/// Only has an effect on macOS; other platforms ignore this setting. There,
+/// [`App::request_windowing`] sets it: `Accessory` while headless and `Regular` while windowed.
+/// Set it directly with [`App::set_activation_policy`] for the one case that doesn't cover: an
+/// accessory app that shows windows, such as a menu bar utility.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationPolicy {
+    /// Participate in foreground application UI, such as the Dock and menu bar on macOS.
+    #[default]
+    Regular,
+    /// Run without foreground application UI while retaining the ability to open windows.
+    Accessory,
+    /// Run in the background without windows; the app cannot be activated.
+    Prohibited,
+}
+
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 pub(crate) use test::*;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use test::{TestDispatcher, TestScreenCaptureSource, TestScreenCaptureStream};
 
-#[cfg(any(test, feature = "bench"))]
-pub use bench_dispatcher::BenchDispatcher;
+#[cfg(any(test, feature = "test-support"))]
+pub use tests::TestTextSystem;
+
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+pub use threaded_dispatcher::ThreadedDispatcher;
 
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
 pub use visual_test::VisualTestPlatform;
+
+/// Keeps an operating system activity, such as an idle sleep inhibitor, alive until dropped.
+pub struct ActivityGuard {
+    _release: gpui_util::Deferred<Box<dyn FnOnce() + Send>>,
+}
+
+impl ActivityGuard {
+    /// Runs `release` when the guard is dropped.
+    pub fn new(release: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            _release: gpui_util::defer(Box::new(release)),
+        }
+    }
+
+    /// A guard for platforms without a corresponding activity.
+    pub fn noop() -> Self {
+        Self::new(|| {})
+    }
+}
 
 // TODO(jk): return an enum instead of a string
 /// Return which compositor we're guessing we'll use.
@@ -98,67 +223,253 @@ pub fn guess_compositor() -> &'static str {
     if std::env::var_os("ZED_HEADLESS").is_some() {
         return "Headless";
     }
+    GraphicalEnvironment::detect().guess_compositor()
+}
 
-    #[cfg(feature = "wayland")]
-    let wayland_display = std::env::var_os("WAYLAND_DISPLAY");
-    #[cfg(not(feature = "wayland"))]
-    let wayland_display: Option<std::ffi::OsString> = None;
+/// The graphical session to connect to: the variables that locate its display server, as some
+/// process sees them.
+///
+/// A long-running process can outlive the graphical session it was started in, so a platform
+/// that attaches to a display server later can be given a fresher environment than its own.
+/// While connected, programs the platform launches (for example to open a URL) get these
+/// variables instead of the ones this process started with. Apply
+/// [`App::graphical_environment`] to the programs an app launches, for the same reason.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[derive(Clone, Debug, Default)]
+pub struct GraphicalEnvironment {
+    /// `WAYLAND_DISPLAY`: a socket name relative to `xdg_runtime_dir`, or an absolute path.
+    pub wayland_display: Option<OsString>,
+    /// `DISPLAY`: the X11 display name.
+    pub x11_display: Option<OsString>,
+    /// `XDG_RUNTIME_DIR`: the directory containing Wayland sockets.
+    pub xdg_runtime_dir: Option<OsString>,
+    /// `XDG_ACTIVATION_TOKEN`: lets the first window take focus on Wayland.
+    ///
+    /// A platform takes this process's token from its environment when it's created, and uses
+    /// it if it starts windowed. Pass one here to switch to windowed mode later, for example
+    /// the token of the process that asked for a window.
+    pub activation_token: Option<String>,
+}
 
-    #[cfg(feature = "x11")]
-    let x11_display = std::env::var_os("DISPLAY");
-    #[cfg(not(feature = "x11"))]
-    let x11_display: Option<std::ffi::OsString> = None;
+/// The graphical session to connect to: the Windows session whose desktop windows appear on.
+///
+/// A process can only show windows in its own session, so switching to windowed mode fails if
+/// this names another one, for example when a process started over SSH is asked to show a
+/// window on the desktop.
+#[cfg(target_os = "windows")]
+#[derive(Clone, Debug, Default)]
+pub struct GraphicalEnvironment {
+    /// The session ID, as `ProcessIdToSessionId` reports it. `None` means this process's own
+    /// session.
+    pub session_id: Option<u32>,
+}
 
-    let use_wayland = wayland_display.is_some_and(|display| !display.is_empty());
-    let use_x11 = x11_display.is_some_and(|display| !display.is_empty());
+#[cfg(target_os = "windows")]
+impl GraphicalEnvironment {
+    /// Returns the environment of this process's session.
+    pub fn detect() -> Self {
+        let mut session_id = 0;
+        // SAFETY: `session_id` is a valid pointer for the call's duration.
+        let result = unsafe {
+            windows::Win32::System::RemoteDesktop::ProcessIdToSessionId(
+                windows::Win32::System::Threading::GetCurrentProcessId(),
+                &mut session_id,
+            )
+        };
+        Self {
+            session_id: result.is_ok().then_some(session_id),
+        }
+    }
 
-    if use_wayland {
-        "Wayland"
-    } else if use_x11 {
-        "X11"
-    } else {
-        "Headless"
+    /// Does nothing on this platform: programs inherit the session of the process that
+    /// starts them.
+    pub fn apply_to(&self, _command: &mut std::process::Command) {}
+}
+
+/// The graphical session to connect to. Carries nothing yet on this platform.
+#[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "windows")))]
+#[derive(Clone, Debug, Default)]
+pub struct GraphicalEnvironment;
+
+#[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "windows")))]
+impl GraphicalEnvironment {
+    /// Returns the environment of this process's graphical session.
+    pub fn detect() -> Self {
+        Self
+    }
+
+    /// Does nothing on this platform.
+    pub fn apply_to(&self, _command: &mut std::process::Command) {}
+}
+
+/// A display mode for [`App::request_windowing`] to switch to.
+#[derive(Clone, Debug)]
+pub enum WindowingRequest {
+    /// No display server. Windows lay out and handle input but draw nothing.
+    Headless,
+    /// Connected to the display server that the environment names.
+    Windowed(GraphicalEnvironment),
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+impl GraphicalEnvironment {
+    /// Reads the display variables from this process's environment.
+    ///
+    /// This only reads environment variables: whether they name a reachable display server is
+    /// checked when a platform connects. Leaves `activation_token` unset: see its documentation.
+    pub fn detect() -> Self {
+        Self {
+            wayland_display: std::env::var_os("WAYLAND_DISPLAY"),
+            x11_display: std::env::var_os("DISPLAY"),
+            xdg_runtime_dir: std::env::var_os("XDG_RUNTIME_DIR"),
+            activation_token: None,
+        }
+    }
+
+    /// Sets this environment's display variables on `command`, and removes the ones it doesn't
+    /// set, so the program connects to this graphical session rather than the one this process
+    /// started in. Leaves `XDG_ACTIVATION_TOKEN` alone.
+    pub fn apply_to(&self, command: &mut std::process::Command) {
+        for (name, value) in [
+            ("WAYLAND_DISPLAY", &self.wayland_display),
+            ("DISPLAY", &self.x11_display),
+            ("XDG_RUNTIME_DIR", &self.xdg_runtime_dir),
+        ] {
+            match value {
+                Some(value) => command.env(name, value),
+                None => command.env_remove(name),
+            };
+        }
+    }
+
+    /// Returns the compositor this environment selects: Wayland, then X11, then headless.
+    ///
+    /// Does not attempt to connect to the compositor.
+    pub fn guess_compositor(&self) -> &'static str {
+        let is_set =
+            |value: &Option<OsString>| value.as_ref().is_some_and(|value| !value.is_empty());
+        if cfg!(feature = "wayland") && is_set(&self.wayland_display) {
+            "Wayland"
+        } else if cfg!(feature = "x11") && is_set(&self.x11_display) {
+            "X11"
+        } else {
+            "Headless"
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+bitflags::bitflags! {
+    /// The windowing modes a platform may start in or switch to.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct WindowingModes: u8 {
+        /// Connected to a Wayland compositor.
+        const WAYLAND = 1 << 0;
+        /// Connected to an X server.
+        const X11 = 1 << 1;
+        /// No display server. Windows lay out and handle input but draw nothing.
+        const HEADLESS = 1 << 2;
     }
 }
 
 /// The activation policy for a macOS application.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum MacActivationPolicy {
-    /// The application is an ordinary app that appears in the Dock and may have a user interface.
-    #[default]
-    Regular,
-    /// The application doesn't appear in the Dock and doesn't have a menu bar, but it may be activated programmatically or by clicking on one of its windows.
-    Accessory,
-    /// The application doesn't appear in the Dock and may not create windows or be activated.
-    Prohibited,
-}
+#[deprecated(note = "renamed to `ActivationPolicy`")]
+pub type MacActivationPolicy = ActivationPolicy;
 
-#[expect(missing_docs)]
+/// The operating system or browser that GPUI runs on, as seen by the [`App`].
+///
+/// Each backend crate implements this trait once: `gpui_macos`, `gpui_windows`,
+/// `gpui_linux` and `gpui_web`. Application code doesn't call most of these methods
+/// directly. It calls the [`App`] methods that wrap them. Use this trait to
+/// implement a new backend, or to reach a platform service that [`App`] doesn't
+/// expose.
+///
+/// Methods without a default body are required. Methods with a default body are
+/// optional platform services: the default supplies the behavior for a backend
+/// that does not provide the service. The [platforms](crate::_documentation::platforms)
+/// table lists the backends that override each default.
 pub trait Platform: 'static {
+    /// Returns the executor for work that runs off the main thread.
     fn background_executor(&self) -> BackgroundExecutor;
+    /// Returns the executor that runs tasks on the main thread, the thread that owns windows.
     fn foreground_executor(&self) -> ForegroundExecutor;
+    /// Returns the platform's text system, which shapes and rasterizes glyphs.
     fn text_system(&self) -> Arc<dyn PlatformTextSystem>;
-
-    fn set_mac_activation_policy(&self, _policy: MacActivationPolicy) {}
+    /// Starts the event loop and calls `on_finish_launching` once the application is ready.
+    ///
+    /// This method blocks until the application exits. Create windows inside
+    /// `on_finish_launching`.
     fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>);
+    /// Asks the application to quit.
+    ///
+    /// On macOS the request is processed asynchronously, so the event loop keeps
+    /// running briefly. The web backend only logs a warning, because a page can't quit
+    /// itself.
     fn quit(&self);
-    fn restart(&self, binary_path: Option<PathBuf>);
+    /// Sets the windowing mode the platform starts in. Called before run. See
+    /// Application::with_windowing.
+    fn set_initial_windowing(&self, _request: WindowingRequest) {}
+    /// Requests a switch between headless and windowed modes while the application is running.
+    ///
+    /// The returned task resolves when the platform has applied the change. Platforms that do
+    /// not support switching return an error from the default implementation.
+    fn request_windowing(&self, _request: WindowingRequest) -> Task<anyhow::Result<()>> {
+        Task::ready(Err(anyhow::anyhow!(
+            "this platform cannot switch between headless and windowed modes"
+        )))
+    }
+    /// Restarts the application by launching a new process and quitting this one.
+    ///
+    /// `binary_path` defaults to the current executable when `None`, and `arguments`
+    /// are passed to the new process. The web backend does nothing.
+    fn restart(&self, binary_path: Option<PathBuf>, arguments: Vec<OsString>);
+    /// Brings the application to the front.
+    ///
+    /// When `ignoring_other_apps` is `true`, the application takes focus even if
+    /// another application is active. The web backend ignores the call.
     fn activate(&self, ignoring_other_apps: bool);
+    /// Sets the initial or current activation policy. Has no effect outside macOS.
+    fn set_activation_policy(&self, _policy: ActivationPolicy) {}
+    /// Hides all of the application's windows. macOS hides them. Windows does nothing,
+    /// and Linux logs a message and ignores the call.
     fn hide(&self);
+    /// Hides all other running applications. macOS does this. Linux and the web do nothing.
+    /// Windows panics, because its implementation is `unimplemented!()`.
     fn hide_other_apps(&self);
+    /// Shows the applications hidden by [`Platform::hide_other_apps`]. macOS does this.
+    /// Linux and the web do nothing.
     fn unhide_other_apps(&self);
 
+    /// Returns every display currently connected, in no particular order.
     fn displays(&self) -> Vec<Rc<dyn PlatformDisplay>>;
+    /// Returns the display that new windows open on by default, or `None` if there is none.
     fn primary_display(&self) -> Option<Rc<dyn PlatformDisplay>>;
+    /// Registers the callback invoked when displays may have been added or
+    /// removed, or a display's properties may have changed. GPUI rereads
+    /// [`Self::displays`] to find out what changed, so calls may be spurious.
+    /// The callback runs on the main thread outside of any window update.
+    fn on_displays_changed(&self, callback: Box<dyn FnMut()>);
+    /// Returns the handle of the window that currently has focus, if any.
     fn active_window(&self) -> Option<AnyWindowHandle>;
+    /// Returns the open windows from front to back, or `None` if the platform doesn't track stacking order.
+    ///
+    /// Implemented on macOS and Linux. The default returns `None`.
     fn window_stack(&self) -> Option<Vec<AnyWindowHandle>> {
         None
     }
 
+    /// Returns `true` if this platform can capture the screen.
+    ///
+    /// Returns `true` on macOS 12.3 or later and on Windows. Other platforms return
+    /// `false`.
     fn is_screen_capture_supported(&self) -> bool {
         false
     }
 
+    /// Lists the displays and windows that can be captured.
+    ///
+    /// The result arrives on the returned channel once enumeration finishes. The
+    /// default sends an error, so backends must override it to list sources.
     fn screen_capture_sources(
         &self,
     ) -> oneshot::Receiver<anyhow::Result<Vec<Rc<dyn ScreenCaptureSource>>>> {
@@ -171,6 +482,11 @@ pub trait Platform: 'static {
         sources_rx
     }
 
+    /// Creates a native window for `handle` with the given `options`.
+    ///
+    /// [`App::open_window`] calls this. The returned [`PlatformWindow`] represents the
+    /// native window. Errors are returned for unsupported options, such as a second
+    /// window on the web.
     fn open_window(
         &self,
         handle: AnyWindowHandle,
@@ -184,36 +500,68 @@ pub trait Platform: 'static {
     /// of the OS-wide setting. Pass `None` to clear the override and follow the system
     /// again. The override is reflected by [`Platform::window_appearance`].
     ///
-    /// Currently only implemented on macOS, where it sets `NSApplication.appearance` so
-    /// the native window chrome (the window border and titlebar) of every window matches
-    /// a dark app theme even when the system is in light mode (or vice versa). A no-op on
-    /// other platforms.
+    /// Only macOS implements this, by setting `NSApplication.appearance`. This keeps
+    /// the native window chrome matching a dark app theme when the system is light, or
+    /// the reverse. Other platforms ignore the call.
     fn set_window_appearance(&self, _appearance: Option<WindowAppearance>) {}
 
-    /// Returns the window button layout configuration when supported.
+    /// Returns the order of window control buttons, or `None` if the platform
+    /// doesn't use the layout. Only Linux returns a value. macOS, Windows and the web return `None`.
     fn button_layout(&self) -> Option<WindowButtonLayout> {
         None
     }
 
+    /// Opens `url` in the default handler for its scheme, such as the browser for `https`.
     fn open_url(&self, url: &str);
+    /// Registers the callback that receives URLs the operating system asks this application to open.
+    ///
+    /// Registering replaces any earlier callback. The web backend stores the callback
+    /// but never calls it.
     fn on_open_urls(&self, callback: Box<dyn FnMut(Vec<String>)>);
+    /// Registers this application as the handler for `url`'s scheme, such as `myapp://`.
+    ///
+    /// The task resolves once registration finishes. The web backend resolves it at once and does nothing.
     fn register_url_scheme(&self, url: &str) -> Task<Result<()>>;
 
+    /// Shows a file or folder picker and resolves to the chosen paths.
+    ///
+    /// The receiver yields `Ok(None)` when the user cancels. The options control whether
+    /// files, directories or several items can be picked. The web backend doesn't
+    /// support this, so the receiver resolves to an error.
     fn prompt_for_paths(
         &self,
         options: PathPromptOptions,
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>>;
+    /// Shows a save dialog in `directory` and resolves to the chosen path.
+    ///
+    /// `suggested_name` pre-fills the file name. The receiver yields `Ok(None)` when
+    /// the user cancels. The web backend doesn't support this.
     fn prompt_for_new_path(
         &self,
         directory: &Path,
         suggested_name: Option<&str>,
     ) -> oneshot::Receiver<Result<Option<PathBuf>>>;
+    /// Returns whether a single file picker can select both files and directories.
+    ///
+    /// Only macOS returns `true`. Other platforms return `false` and need separate
+    /// pickers for files and directories.
     fn can_select_mixed_files_and_dirs(&self) -> bool;
+    /// Shows `path` selected in the file manager, such as Finder or Explorer.
     fn reveal_path(&self, path: &Path);
+    /// Opens `path` with the application the system associates with its file type.
     fn open_with_system(&self, path: &Path);
 
-    fn on_quit(&self, callback: Box<dyn FnMut()>);
+    /// Registers the callback the platform runs when the application is asked to quit.
+    ///
+    /// The callback returns `true` when shutdown has completed, and `false` when it
+    /// couldn't shut down synchronously. macOS calls it while terminating and ignores
+    /// the return value.
+    fn on_quit(&self, callback: Box<dyn FnMut() -> bool>);
+    /// Registers the callback run when the user activates the running application again, such as clicking its Dock icon on macOS.
     fn on_reopen(&self, callback: Box<dyn FnMut()>);
+    /// Registers the callback invoked when the system is about to sleep.
+    fn on_system_sleep(&self, callback: Box<dyn FnMut()>);
+    /// Registers the callback run after the system wakes from sleep.
     fn on_system_wake(&self, callback: Box<dyn FnMut()>);
 
     // Mobile platform methods. On mobile the OS owns the application
@@ -233,21 +581,31 @@ pub trait Platform: 'static {
     /// Desktop platforms never invoke this.
     fn on_memory_warning(&self, _callback: Box<dyn FnMut()>) {}
 
-    /// The platform's gesture recognition services, if it provides any
-    /// beyond gpui's portable recognizers. See
-    /// [`PlatformGestures`](crate::PlatformGestures).
+    /// Returns the platform's gesture recognizers, or `None` to use GPUI's portable ones.
+    /// See [`PlatformGestures`].
     fn gestures(&self) -> Option<Rc<dyn PlatformGestures>> {
         None
     }
 
+    /// Replaces the application menu with `menus`, and uses `keymap` to show each item's shortcut.
+    ///
+    /// Windows stores the menus but doesn't draw them. Linux and the web don't show a
+    /// menu bar.
     fn set_menus(&self, menus: Vec<Menu>, keymap: &Keymap);
+    /// Returns the menus last set with [`Platform::set_menus`], or `None` if the platform doesn't keep them.
     fn get_menus(&self) -> Option<Vec<OwnedMenu>> {
         None
     }
 
+    /// Sets the menu shown when the user right-clicks the app's Dock icon (macOS) or taskbar entry (Windows, as a jump list).
     fn set_dock_menu(&self, menu: Vec<MenuItem>, keymap: &Keymap);
+    /// Runs the dock menu item at index `_action`. Windows implements this.
     fn perform_dock_menu_action(&self, _action: usize) {}
+    /// Adds `path` to the system's recent documents list. Only macOS implements this.
     fn add_recent_document(&self, _path: &Path) {}
+    /// Updates the Windows jump list with `_menus` and the recent-file `_entries`, and returns the entries that were kept.
+    ///
+    /// Other backends return an empty list.
     fn update_jump_list(
         &self,
         _menus: Vec<MenuItem>,
@@ -255,24 +613,35 @@ pub trait Platform: 'static {
     ) -> Task<Vec<SmallVec<[PathBuf; 2]>>> {
         Task::ready(Vec::new())
     }
+    /// Registers the callback that receives actions chosen from the application menu.
     fn on_app_menu_action(&self, callback: Box<dyn FnMut(&dyn Action)>);
+    /// Registers the callback run just before a menu opens, so the app can update its menu items.
     fn on_will_open_app_menu(&self, callback: Box<dyn FnMut()>);
+    /// Registers the callback that decides whether a menu item is enabled. Return `true` to enable the action.
     fn on_validate_app_menu_command(&self, callback: Box<dyn FnMut(&dyn Action) -> bool>);
 
+    /// Returns the device's current thermal state. See [`ThermalState`].
     fn thermal_state(&self) -> ThermalState;
+    /// Registers the callback run when [`Platform::thermal_state`] changes. Read the new state from the platform inside the callback.
     fn on_thermal_state_change(&self, callback: Box<dyn FnMut()>);
-
-    /// Sets the application's process-wide identity and user-visible name.
+    /// Requests that the operating system keep the device awake while the returned guard lives.
     ///
-    /// The identifier is used for platform identity mechanisms such as the
-    /// Windows AppUserModelID. The name is used wherever the operating system
-    /// presents the application to the user. Call this once, early in startup,
-    /// before opening windows or posting notifications.
+    /// The reason explains the activity to the platform and may be shown in system UI. Dropping
+    /// the ActivityGuard releases the request. The task resolves with the guard or an error if
+    /// the platform cannot create the activity request.
+    fn prevent_idle_sleep(&self, reason: &str) -> Task<Result<ActivityGuard>>;
+
+    /// Sets the application's identifier and user-visible name.
+    ///
+    /// Windows sets `identifier` as the AppUserModelID, unless the process already has
+    /// package identity. Linux stores `name`. macOS and the web ignore both values.
+    ///
+    /// Call it once early in startup, before opening windows or posting notifications.
     fn set_app_identity(&self, identifier: &str, name: &str) {
         _ = (identifier, name);
     }
 
-    /// Posts a notification to the operating system's notification center.
+    /// Posts `notification` to the operating system's notification center.
     ///
     /// Posting a notification whose [`SystemNotification::tag`] matches an
     /// earlier one replaces that notification where the platform supports it.
@@ -302,12 +671,23 @@ pub trait Platform: 'static {
         _ = callback;
     }
 
+    /// Returns the name of the display server or compositor, such as `"Wayland"`, `"X11"` or `"Headless"`.
+    ///
+    /// Returns an empty string by default.
     fn compositor_name(&self) -> &'static str {
         ""
     }
+    /// The environment of the display server a platform that can switch windowing modes is
+    /// connected to. See [`App::graphical_environment`].
+    fn graphical_environment(&self) -> Option<GraphicalEnvironment> {
+        None
+    }
+    /// Returns the path of the running application's executable.
     fn app_path(&self) -> Result<PathBuf>;
+    /// Returns the path of a helper executable named `name` that ships alongside the application.
     fn path_for_auxiliary_executable(&self, name: &str) -> Result<PathBuf>;
 
+    /// Shows the mouse cursor `style` over this application's windows.
     fn set_cursor_style(&self, style: CursorStyle);
 
     /// Hides the mouse cursor until the user moves the mouse over one of
@@ -317,70 +697,115 @@ pub trait Platform: 'static {
     /// Returns whether the mouse cursor is currently visible.
     fn is_cursor_visible(&self) -> bool;
 
+    /// Returns `true` when scrollbars should hide until the user scrolls. macOS follows
+    /// the overlay-scroller setting, Windows and Linux read their UI settings, and the
+    /// web returns `true`.
     fn should_auto_hide_scrollbars(&self) -> bool;
 
+    /// Returns the clipboard's contents synchronously, or `None` if it's empty.
+    ///
+    /// The web backend can't read the clipboard synchronously and always returns
+    /// `None`. Use [`Platform::read_from_clipboard_async`] there.
     fn read_from_clipboard(&self) -> Option<ClipboardItem>;
+    /// Replaces the clipboard's contents with `item`.
     fn write_to_clipboard(&self, item: ClipboardItem);
 
+    /// Reads the clipboard, resolving once its contents are available.
+    ///
+    /// Most platforms read synchronously and return a ready task. A platform with
+    /// inherently asynchronous or permission-gated access, such as the browser's
+    /// Async Clipboard API, overrides this method. On those platforms,
+    /// [`Platform::read_from_clipboard`] cannot return the contents; callers that
+    /// can await should use this method.
+    fn read_from_clipboard_async(&self) -> Task<Result<Option<ClipboardItem>, ClipboardReadError>> {
+        Task::ready(Ok(self.read_from_clipboard()))
+    }
+
+    /// Returns the contents of the X11 or Wayland primary selection, the text selected with the mouse.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn read_from_primary(&self) -> Option<ClipboardItem>;
+    /// Sets the primary selection to `item`. The selection is the text highlighted with the mouse, pasted with middle-click.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn write_to_primary(&self, item: ClipboardItem);
 
+    /// Returns the contents of the macOS find pasteboard, which the find bar shares across apps.
     #[cfg(target_os = "macos")]
     fn read_from_find_pasteboard(&self) -> Option<ClipboardItem>;
+    /// Sets the macOS find pasteboard to `item`.
     #[cfg(target_os = "macos")]
     fn write_to_find_pasteboard(&self, item: ClipboardItem);
 
+    /// Stores `username` and `password` for `url` in the system credential store.
+    ///
+    /// The task resolves once the credentials are saved. Use [`Platform::read_credentials`] to read them back.
     fn write_credentials(&self, url: &str, username: &str, password: &[u8]) -> Task<Result<()>>;
+    /// Reads the username and password stored for `url`, resolving to `None` if there are none.
     fn read_credentials(&self, url: &str) -> Task<Result<Option<(String, Vec<u8>)>>>;
+    /// Deletes the credentials stored for `url`.
     fn delete_credentials(&self, url: &str) -> Task<Result<()>>;
 
+    /// Returns the current keyboard layout.
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout>;
+    /// Returns the mapper that converts key codes to the characters the current layout produces.
     fn keyboard_mapper(&self) -> Rc<dyn PlatformKeyboardMapper>;
+    /// Registers the callback run when the keyboard layout changes.
     fn on_keyboard_layout_change(&self, callback: Box<dyn FnMut()>);
 
-    /// Register additional GPU device requirements (features, limits) before
-    /// the first window is opened.  The concrete type inside the `Box` must be
-    /// `gpui_wgpu::WgpuDeviceRequirements`.
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    /// Registers extra GPU device requirements, such as features and limits, before the first window is opened.
+    ///
+    /// The value must be a `gpui_wgpu::WgpuDeviceRequirements`. macOS and Linux use
+    /// it. Other backends ignore it.
     fn set_gpu_requirements(&self, _requirements: Box<dyn std::any::Any>) {}
 
     /// Sets the label applied to credentials stored in the system keyring.
     /// Only Linux/FreeBSD use this label.
     fn set_keyring_label(&self, _label: SharedString) {}
 
-    /// Whether the current platform supports haptic feedback.
+    /// Returns `true` if [`Platform::play_haptic_feedback`] has an effect on this platform.
+    ///
+    /// Only macOS returns `true`, for trackpads with Force Touch.
     fn supports_haptic_feedback(&self) -> bool {
         false
     }
 
-    /// Play a haptic feedback of the given style.
+    /// Plays haptic feedback of the given style.
     ///
     /// No-op on platforms that don't support haptic feedback.
     fn play_haptic_feedback(&self, _style: HapticFeedbackStyle) {}
 }
 
-/// A handle to a platform's display, e.g. a monitor or laptop screen.
+/// A display, such as a monitor or a laptop screen, as the platform reports it.
+///
+/// Obtain one from [`App::displays`] or [`App::primary_display`]. Its bounds are
+/// in logical pixels.
 pub trait PlatformDisplay: Debug {
-    /// Get the ID for this display
+    /// Returns the display's id for the current session. To persist a display across restarts, use [`PlatformDisplay::uuid`].
     fn id(&self) -> DisplayId;
 
-    /// Returns a stable identifier for this display that can be persisted and used
-    /// across system restarts.
+    /// Returns a stable identifier for this display that survives restarts.
+    ///
+    /// Returns an error if the platform can't provide one.
     fn uuid(&self) -> Result<Uuid>;
 
-    /// Get the bounds for this display
+    /// Returns the display's full bounds in logical pixels, including areas such as the taskbar.
     fn bounds(&self) -> Bounds<Pixels>;
 
-    /// Get the visible bounds for this display, excluding taskbar/dock areas.
-    /// This is the usable area where windows can be placed without being obscured.
-    /// Defaults to the full display bounds if not overridden.
+    /// The time between the display's refreshes. Variable refresh rate
+    /// displays report their maximum rate. `None` when the platform doesn't
+    /// report it.
+    ///
+    /// May query the operating system; GPUI caches it per display, see
+    /// [`Window::refresh_interval`](crate::Window::refresh_interval).
+    fn refresh_interval(&self) -> Option<Duration>;
+
+    /// Returns the usable bounds, excluding the menu bar, Dock and taskbar.
+    ///
+    /// Defaults to [`PlatformDisplay::bounds`] when a backend doesn't override it.
     fn visible_bounds(&self) -> Bounds<Pixels> {
         self.bounds()
     }
 
-    /// Get the default bounds for this display to place a window
+    /// Returns the bounds a new window opens at on this display: the default window size, centered and clipped to the display.
     fn default_bounds(&self) -> Bounds<Pixels> {
         let bounds = self.bounds();
         let center = bounds.center();
@@ -392,8 +817,11 @@ pub trait PlatformDisplay: Debug {
     }
 }
 
-/// A notification posted to the operating system's notification center,
-/// rather than rendered as in-app UI.
+/// A notification for the operating system's notification center, rather than
+/// in-app UI.
+///
+/// Post one with [`App::show_system_notification`]. Responses arrive as a
+/// [`SystemNotificationResponse`] with the same `tag`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SystemNotification {
     /// Stable identity for the notification. Posting a new notification with
@@ -404,79 +832,86 @@ pub struct SystemNotification {
     pub title: SharedString,
     /// Additional text displayed below the title.
     pub body: SharedString,
-    /// Buttons offered on the notification. Platforms that cannot display
-    /// action buttons show the notification without them.
+    /// Buttons shown with the notification. Platforms may show fewer than given.
     pub actions: Vec<SystemNotificationAction>,
 }
 
-/// A button offered on a [`SystemNotification`].
+/// A button on a [`SystemNotification`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SystemNotificationAction {
-    /// Identifies the action in [`SystemNotificationResponse::action_id`]
-    /// when the user presses this button.
+    /// Identifies the button in a [`SystemNotificationResponse::action_id`].
     pub id: SharedString,
-    /// The button's user-visible label.
+    /// The text shown on the button.
     pub label: SharedString,
 }
 
-/// The user's activation of a [`SystemNotification`].
+/// The user's response to a [`SystemNotification`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SystemNotificationResponse {
-    /// The [`SystemNotification::tag`] of the activated notification.
+    /// The [`SystemNotification::tag`] of the notification the user activated.
     pub tag: SharedString,
-    /// The pressed action button's [`SystemNotificationAction::id`], or
-    /// `None` when the user activated the notification body itself.
+    /// The [`SystemNotificationAction::id`] of the button clicked, or `None` when the body was clicked.
     pub action_id: Option<SharedString>,
 }
 
-/// Thermal state of the system
+/// The device's thermal pressure, from least to most constrained.
+///
+/// Read it with [`App::thermal_state`]. When it changes, the callback from
+/// [`App::on_thermal_state_change`] runs. Reduce discretionary work, such as
+/// animation frames or background indexing, as the state rises.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThermalState {
-    /// System has no thermal constraints
+    /// The system has no thermal constraints.
     Nominal,
-    /// System is slightly constrained, reduce discretionary work
+    /// The system is slightly constrained. Reduce discretionary work.
     Fair,
-    /// System is moderately constrained, reduce CPU/GPU intensive work
+    /// The system is moderately constrained. Reduce CPU and GPU intensive work.
     Serious,
-    /// System is critically constrained, minimize all resource usage
+    /// The system is critically constrained. Minimize resource use.
     Critical,
 }
 
-/// Styles of haptic feedback that can be played via the platform.
+/// A kind of haptic feedback to play with [`App::play_haptic_feedback`].
 ///
-/// These correspond directly to [`NSHapticFeedbackPattern`](https://developer.apple.com/documentation/appkit/nshapticfeedbackmanager/feedbackpattern)
-/// values on macOS. On other platforms, all styles are no-ops.
+/// The styles map to `NSHapticFeedbackPattern` on macOS. Other platforms do nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HapticFeedbackStyle {
-    /// A generic haptic tap — suitable for most interactions.
+    /// A generic tap, for most interactions.
     Generic,
-    /// A sharp snap — for alignment guides, detents, and snapping.
+    /// A sharp snap, for alignment guides, detents and snapping.
     Alignment,
-    /// A distinct level-change click — for slider steps, toggles, and
-    /// discrete state changes.
+    /// A distinct click, for slider steps, toggles and discrete state changes.
     LevelChange,
 }
 
-/// Metadata for a given [ScreenCaptureSource]
+/// Describes a screen or window that can be captured.
+///
+/// Returned by [`ScreenCaptureSource::metadata`] and [`ScreenCaptureStream::metadata`].
 #[derive(Clone)]
 pub struct SourceMetadata {
-    /// Opaque identifier of this screen.
+    /// An opaque identifier for the source. It is stable only within one session.
     pub id: u64,
-    /// Human-readable label for this source.
+    /// A name to show in a picker, or `None` when the platform gives none.
     pub label: Option<SharedString>,
-    /// Whether this source is the main display.
+    /// Whether this is the main display, or `None` when unknown.
     pub is_main: Option<bool>,
-    /// Video resolution of this source.
+    /// The size of the captured video, in device pixels.
     pub resolution: Size<DevicePixels>,
 }
 
-/// A source of on-screen video content that can be captured.
+/// A screen or window that can be captured.
+///
+/// Get sources from [`Platform::screen_capture_sources`]. Call
+/// [`ScreenCaptureSource::stream`] to start receiving frames.
 pub trait ScreenCaptureSource {
-    /// Returns metadata for this source.
+    /// Returns a description of this source.
     fn metadata(&self) -> Result<SourceMetadata>;
 
-    /// Start capture video from this source, invoking the given callback
-    /// with each frame.
+    /// Starts capturing this source and calls `frame_callback` with each frame.
+    ///
+    /// The returned receiver resolves to the running [`ScreenCaptureStream`], or to an
+    /// error if capture can't start. The platform chooses the thread that runs
+    /// `frame_callback`, so the callback must be `Send`. Drop the stream to stop capture.
     fn stream(
         &self,
         foreground_executor: &ForegroundExecutor,
@@ -484,21 +919,25 @@ pub trait ScreenCaptureSource {
     ) -> oneshot::Receiver<Result<Box<dyn ScreenCaptureStream>>>;
 }
 
-/// A video stream captured from a screen.
+/// A running capture of a [`ScreenCaptureSource`].
 pub trait ScreenCaptureStream {
-    /// Returns metadata for this source.
+    /// Returns a description of the captured source.
     fn metadata(&self) -> Result<SourceMetadata>;
 }
 
-/// A frame of video captured from a screen.
+/// One frame of captured video.
+///
+/// The wrapped value is platform-specific. On macOS it is a `CVImageBuffer`, and on
+/// Windows it is a `WindowsScreenCaptureFrame`. Without the `screen-capture`
+/// feature it is `()`.
 pub struct ScreenCaptureFrame(pub PlatformScreenCaptureFrame);
 
-/// An opaque identifier for a hardware display
+/// An identifier for a display that is valid for the current session.
 #[derive(PartialEq, Eq, Hash, Copy, Clone)]
 pub struct DisplayId(pub(crate) u64);
 
 impl DisplayId {
-    /// Create a new `DisplayId` from a raw platform display identifier.
+    /// Creates a `DisplayId` from a raw platform display identifier.
     pub fn new(id: u64) -> Self {
         Self(id)
     }
@@ -522,7 +961,7 @@ impl Debug for DisplayId {
     }
 }
 
-/// Which part of the window to resize
+/// The edge or corner of a window that a user drags to resize it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResizeEdge {
     /// The top edge
@@ -543,39 +982,62 @@ pub enum ResizeEdge {
     TopLeft,
 }
 
-/// A type to describe the appearance of a window
+impl From<ResizeEdge> for CursorStyle {
+    fn from(edge: ResizeEdge) -> Self {
+        match edge {
+            ResizeEdge::Top => Self::ResizeUp,
+            ResizeEdge::Right => Self::ResizeRight,
+            ResizeEdge::Bottom => Self::ResizeDown,
+            ResizeEdge::Left => Self::ResizeLeft,
+            ResizeEdge::TopLeft => Self::ResizeUpLeft,
+            ResizeEdge::TopRight => Self::ResizeUpRight,
+            ResizeEdge::BottomLeft => Self::ResizeDownLeft,
+            ResizeEdge::BottomRight => Self::ResizeDownRight,
+        }
+    }
+}
+
+/// Whether a window draws its own titlebar and borders, or the window server does.
+///
+/// Set this with [`WindowOptions::window_decorations`]. Linux's Wayland and X11
+/// backends honor it. The other backends ignore it.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Default)]
 pub enum WindowDecorations {
+    /// The window server draws the titlebar and borders.
     #[default]
-    /// Server side decorations
     Server,
-    /// Client side decorations
+    /// GPUI draws the titlebar and borders.
     Client,
 }
 
-/// A type to describe how this window is currently configured
+/// The decorations a window is currently using.
+///
+/// Read it with [`Window::window_decorations`] to decide whether to draw resize handles or
+/// window controls yourself.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Default)]
 pub enum Decorations {
-    /// The window is configured to use server side decorations
+    /// The window server draws the decorations.
     #[default]
     Server,
-    /// The window is configured to use client side decorations
+    /// GPUI draws the decorations. `tiling` says which edges are snapped to the screen.
     Client {
-        /// The edge tiling state
+        /// Which edges of the window are tiled.
         tiling: Tiling,
     },
 }
 
-/// What window controls this platform supports
+/// The window controls a platform supports.
+///
+/// The default assumes that every control is available.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub struct WindowControls {
-    /// Whether this platform supports fullscreen
+    /// Whether the window can enter fullscreen.
     pub fullscreen: bool,
-    /// Whether this platform supports maximize
+    /// Whether the window can be maximized.
     pub maximize: bool,
-    /// Whether this platform supports minimize
+    /// Whether the window can be minimized.
     pub minimize: bool,
-    /// Whether this platform supports a window menu
+    /// Whether the window has a window menu.
     pub window_menu: bool,
 }
 
@@ -591,7 +1053,7 @@ impl Default for WindowControls {
     }
 }
 
-/// A window control button type used in [`WindowButtonLayout`].
+/// A window control button, used in [`WindowButtonLayout`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WindowButton {
     /// The minimize button
@@ -603,7 +1065,10 @@ pub enum WindowButton {
 }
 
 impl WindowButton {
-    /// Returns a stable element ID for rendering this button.
+    /// Returns a stable element id for rendering this button.
+    ///
+    /// Use the id to find the button's element in a titlebar. The ids are `"minimize"`,
+    /// `"maximize"` and `"close"`.
     pub fn id(&self) -> &'static str {
         match self {
             WindowButton::Minimize => "minimize",
@@ -622,24 +1087,25 @@ impl WindowButton {
     }
 }
 
-/// Maximum number of [`WindowButton`]s per side in the titlebar.
+/// The largest number of [`WindowButton`]s on one side of the titlebar.
 pub const MAX_BUTTONS_PER_SIDE: usize = 3;
 
-/// Describes which [`WindowButton`]s appear on each side of the titlebar.
+/// Which [`WindowButton`]s appear on each side of the titlebar, in order.
 ///
 /// On Linux, this is read from the desktop environment's configuration
-/// (e.g. GNOME's `gtk-decoration-layout` gsetting) via [`WindowButtonLayout::parse`].
+/// (the `button-layout` key of `org.gnome.desktop.wm.preferences`) via `WindowButtonLayout::parse`.
+/// Empty slots are `None`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowButtonLayout {
-    /// Buttons on the left side of the titlebar.
+    /// The buttons on the left side of the titlebar, from the edge inwards.
     pub left: [Option<WindowButton>; MAX_BUTTONS_PER_SIDE],
-    /// Buttons on the right side of the titlebar.
+    /// The buttons on the right side of the titlebar, from the edge inwards.
     pub right: [Option<WindowButton>; MAX_BUTTONS_PER_SIDE],
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 impl WindowButtonLayout {
-    /// Returns Zed's built-in fallback button layout for Linux titlebars.
+    /// Returns GPUI's fallback layout for Linux titlebars: minimize, maximize and close on the right.
     pub fn linux_default() -> Self {
         Self {
             left: [None; MAX_BUTTONS_PER_SIDE],
@@ -651,7 +1117,15 @@ impl WindowButtonLayout {
         }
     }
 
-    /// Parses a GNOME-style `button-layout` string (e.g. `"close,minimize:maximize"`).
+    /// Parses a GNOME-style `button-layout` string such as `"close,minimize:maximize"`.
+    ///
+    /// The text before the `:` is the left side and the text after it is the right side.
+    /// Names are `minimize`, `maximize` and `close`. Unknown names and repeated buttons
+    /// are skipped, and each side keeps at most [`MAX_BUTTONS_PER_SIDE`] buttons.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the string names no valid buttons and at least one name is unknown.
     pub fn parse(layout_string: &str) -> Result<Self> {
         fn parse_side(
             s: &str,
@@ -730,21 +1204,21 @@ impl WindowButtonLayout {
     }
 }
 
-/// A type to describe which sides of the window are currently tiled in some way
+/// Which edges of a window are tiled against the screen edge.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Default)]
 pub struct Tiling {
-    /// Whether the top edge is tiled
+    /// Whether the top edge is tiled.
     pub top: bool,
-    /// Whether the left edge is tiled
+    /// Whether the left edge is tiled.
     pub left: bool,
-    /// Whether the right edge is tiled
+    /// Whether the right edge is tiled.
     pub right: bool,
-    /// Whether the bottom edge is tiled
+    /// Whether the bottom edge is tiled.
     pub bottom: bool,
 }
 
 impl Tiling {
-    /// Initializes a [`Tiling`] type with all sides tiled
+    /// Returns a [`Tiling`] with every edge tiled.
     pub fn tiled() -> Self {
         Self {
             top: true,
@@ -754,29 +1228,140 @@ impl Tiling {
         }
     }
 
-    /// Whether any edge is tiled
+    /// Returns `true` if any edge is tiled.
     pub fn is_tiled(&self) -> bool {
         self.top || self.left || self.right || self.bottom
     }
 }
 
-/// Callbacks for the accessibility adapter.
+/// The callbacks an accessibility adapter uses to talk to the application.
+///
+/// The platform's accessibility adapter calls these when a screen reader connects,
+/// disconnects, or asks for an action. Register them with
+/// [`PlatformWindow::a11y_init`].
 pub struct A11yCallbacks {
-    /// Called when the adapter is activated (a screen reader connects).
+    /// Returns the accessibility tree to send when a screen reader connects.
     pub activation: Box<dyn Fn() -> Option<accesskit::TreeUpdate> + Send + 'static>,
-    /// Called when an action is requested by the screen reader.
+    /// Handles an action, such as focusing or activating an element, that a screen reader requested.
     pub action: Box<dyn Fn(accesskit::ActionRequest) + Send + 'static>,
-    /// Called when the adapter is deactivated (screen reader disconnects).
+    /// Runs when the screen reader disconnects.
     pub deactivation: Box<dyn Fn() + Send + 'static>,
 }
 
+/// The source of a platform frame request's timestamp.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
-#[expect(missing_docs)]
+pub enum FrameRequestSource {
+    /// An OS callback or compositor-paced frame request.
+    #[default]
+    NativeCallback,
+    /// A refresh timer, retry, queued wakeup, or fallback sleep paced by the app.
+    LocalSchedule,
+}
+
+/// Options for a frame the platform asks GPUI to draw. The platform passes them to
+/// the callback registered with [`PlatformWindow::on_request_frame`].
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
 pub struct RequestFrameOptions {
-    /// Whether a presentation is required.
+    /// Whether the frame must be presented to the screen, not only drawn.
     pub require_presentation: bool,
-    /// Force refresh of all rendering states when true.
+    /// Whether to redraw everything, ignoring cached rendering state.
     pub force_render: bool,
+    /// When the platform first requested this frame, before main-thread dispatch.
+    ///
+    /// `None` means the captured request time is unavailable.
+    /// Coalesced requests carry their first request time, not their delivery time.
+    /// Built-in backends collect timestamps only with the `profiler` feature.
+    pub signal_at: Option<Instant>,
+    /// Distinguishes native callbacks from local scheduling requests.
+    pub signal_source: FrameRequestSource,
+}
+
+/// Preserves the first platform frame request time across coalesced notifications.
+///
+/// Producers may record from a platform thread without waiting for the UI thread.
+/// The consumer drains the timestamp before dispatching the request on the UI thread.
+/// The timestamp offset and source share one atomic word so coalescing cannot
+/// mix a request's time with another request's source. The low bit encodes the
+/// source; the remaining bits encode nanoseconds from `origin`. `u64::MAX` is empty.
+/// Without the `profiler` feature, this accumulator has no timestamp storage.
+pub struct PlatformFrameSignal {
+    #[cfg(feature = "profiler")]
+    origin: Instant,
+    #[cfg(feature = "profiler")]
+    first_signal: std::sync::atomic::AtomicU64,
+}
+
+impl Default for PlatformFrameSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PlatformFrameSignal {
+    /// Creates an empty signal accumulator.
+    pub fn new() -> Self {
+        Self {
+            #[cfg(feature = "profiler")]
+            origin: Instant::now(),
+            #[cfg(feature = "profiler")]
+            first_signal: std::sync::atomic::AtomicU64::new(u64::MAX),
+        }
+    }
+
+    /// Captures a platform request timestamp only when profiling is enabled.
+    ///
+    /// The closure is not invoked in profiler-disabled builds.
+    #[inline]
+    pub fn capture(capture: impl FnOnce() -> Instant) -> Option<Instant> {
+        if cfg!(feature = "profiler") {
+            Some(capture())
+        } else {
+            None
+        }
+    }
+
+    /// Records a platform frame request, retaining the first undrained timestamp.
+    #[inline]
+    #[cfg_attr(not(feature = "profiler"), expect(unused_variables))]
+    pub fn record(&self, at: Instant, source: FrameRequestSource) {
+        #[cfg(feature = "profiler")]
+        {
+            let nanoseconds = at
+                .saturating_duration_since(self.origin)
+                .as_nanos()
+                .min(u128::from((u64::MAX >> 1) - 1)) as u64;
+            let source_bit = match source {
+                FrameRequestSource::NativeCallback => 0,
+                FrameRequestSource::LocalSchedule => 1,
+            };
+            self.first_signal.fetch_min(
+                (nanoseconds << 1) | source_bit,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// Drains the first platform frame request time and source, leaving the accumulator empty.
+    #[inline]
+    pub fn take(&self) -> Option<(Instant, FrameRequestSource)> {
+        #[cfg(feature = "profiler")]
+        {
+            let signal = self
+                .first_signal
+                .swap(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+            (signal != u64::MAX).then(|| {
+                let source = match signal & 1 {
+                    0 => FrameRequestSource::NativeCallback,
+                    _ => FrameRequestSource::LocalSchedule,
+                };
+                (self.origin + Duration::from_nanos(signal >> 1), source)
+            })
+        }
+        #[cfg(not(feature = "profiler"))]
+        {
+            None
+        }
+    }
 }
 
 /// The application's lifecycle phase, as owned and reported by a mobile OS.
@@ -802,6 +1387,10 @@ pub enum AppLifecyclePhase {
     Background,
     /// Becoming visible again, before input is restored.
     Foreground,
+    /// The native scene has disconnected. Its windows may reconnect later.
+    /// This is not a process-termination notification or a guaranteed final
+    /// opportunity to save state.
+    Disconnected,
 }
 
 /// Regions of a window that are obscured or reserved by the system.
@@ -824,7 +1413,9 @@ pub struct WindowInsets {
 }
 
 impl WindowInsets {
-    /// The combined inset content should avoid.
+    /// Returns, on each side, the larger of the system inset and the keyboard inset.
+    ///
+    /// Content should stay clear of this area.
     pub fn effective(&self) -> Edges<Pixels> {
         Edges {
             top: self.safe_area.top.max(self.ime.top),
@@ -838,9 +1429,9 @@ impl WindowInsets {
 /// A change in the state of the focused text input.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub enum TextInputStateChange {
-    /// An editable element gained focus.
+    /// The window changed from having no active text input to having one.
     FocusGained,
-    /// The focused editable element lost focus.
+    /// The window no longer has an active text input.
     FocusLost,
     /// The selection or caret moved
     SelectionChanged,
@@ -848,27 +1439,73 @@ pub enum TextInputStateChange {
     ContentChanged,
 }
 
-#[expect(missing_docs)]
+/// The native window that GPUI draws into, implemented by each backend.
+///
+/// [`App::open_window`] creates one through [`Platform::open_window`] for each
+/// [`Window`]. Application code doesn't call these methods directly. [`Window`] and
+/// the [`Platform`] wrap them. Each backend implements the trait for its windowing
+/// system. Methods with a default body are optional, and the default is the behavior
+/// for a platform that lacks the feature.
+///
+/// Methods that a platform doesn't support are commented with the platform that
+/// does.
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+    /// Returns the window's frame in screen coordinates, in logical pixels.
     fn bounds(&self) -> Bounds<Pixels>;
+    /// Returns whether the window is maximized.
     fn is_maximized(&self) -> bool;
+    /// Returns the window's state, and the bounds to restore when it leaves that state.
     fn window_bounds(&self) -> WindowBounds;
+    /// Returns the drawable size, excluding the titlebar, in logical pixels.
     fn content_size(&self) -> Size<Pixels>;
+    /// Returns the visible viewport in logical pixels relative to the content origin.
+    ///
+    /// This may be smaller or offset when a keyboard or zoom obscures content;
+    /// it must not change the full layout size returned by `content_size`.
+    /// Implementations should return a frame snapshot, not query platform layout here.
+    fn visual_viewport_bounds(&self) -> Bounds<Pixels> {
+        Bounds::new(Point::default(), self.content_size())
+    }
+    /// Registers a callback when visible geometry may have changed.
+    ///
+    /// This requests a frame; backends can sample the new viewport and safe-area
+    /// geometry in `prepare_frame` rather than updating it inside the callback.
+    fn on_visual_viewport_changed(&self, _callback: Box<dyn FnMut()>) {}
+    /// Samples platform geometry before a draw, returning whether view caches must be invalidated.
+    ///
+    /// Geometry getters must remain consistent throughout the ensuing draw.
+    /// Do not invoke callbacks here: GPUI is already updating this window.
+    fn prepare_frame(&self) -> bool {
+        false
+    }
+    /// Resizes the window's content area to `size`, in logical pixels.
     fn resize(&mut self, size: Size<Pixels>);
-    /// Moves a [`WindowKind::AnchoredPopup`] to a new anchor rectangle on its parent, for a
-    /// popup whose anchor moved without its parent moving: the parent was resized, or what the
-    /// popup is anchored to was laid out again. Following the parent as a whole is the
-    /// backend's job and needs no call. Does nothing for any other kind of window, and on
-    /// platforms without native popups.
-    fn set_popup_anchor(&self, _anchor_rect: Bounds<Pixels>) {}
+    /// Returns the number of device pixels per logical pixel.
     fn scale_factor(&self) -> f32;
+    /// Returns the window's light or dark appearance.
     fn appearance(&self) -> WindowAppearance;
+    /// Returns the display the window is on, or `None` if the platform can't tell.
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>>;
+    /// Returns the mouse position in window coordinates, in logical pixels.
     fn mouse_position(&self) -> Point<Pixels>;
+    /// Returns the modifier keys currently held down.
     fn modifiers(&self) -> Modifiers;
+    /// Returns the state of the Caps Lock key.
     fn capslock(&self) -> Capslock;
+    /// Installs the handler that receives text input for the focused element.
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler);
+    /// Removes and returns the installed input handler.
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler>;
+    /// Apply the focused text region's [`TextInputConfiguration`] to the
+    /// platform's text input session (e.g. attributes of the hidden editable
+    /// element on web). Called only when the configuration changes, because
+    /// reconfiguring a live input session can restart the IME connection.
+    fn set_text_input_configuration(&mut self, _configuration: TextInputConfiguration) {}
+    /// Shows a native alert or prompt with `answers` as its buttons.
+    ///
+    /// The returned receiver yields the index in `answers` of the button the user
+    /// chose. Returns `None` when the platform can't show a prompt. The web backend
+    /// always returns `None`.
     fn prompt(
         &self,
         level: PromptLevel,
@@ -876,98 +1513,223 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         detail: Option<&str>,
         answers: &[PromptButton],
     ) -> Option<oneshot::Receiver<usize>>;
-    fn activate(&self);
+    /// Request activation, optionally using an externally supplied token.
+    /// Returns whether a request was sent, not whether focus was granted.
+    fn activate(&self, token: Option<&str>) -> bool;
     /// Requests that the operating system draw attention to this window.
     fn request_attention(&self) {}
+    /// Returns whether this window has keyboard focus.
     fn is_active(&self) -> bool;
+    /// The current [`WindowVisibility`]. Read once when the window is created;
+    /// afterwards changes arrive through [`Self::on_visibility_change`].
+    fn visibility(&self) -> WindowVisibility;
+    /// Returns whether the mouse is over this window.
     fn is_hovered(&self) -> bool;
+    /// Returns how the window background is drawn.
     fn background_appearance(&self) -> WindowBackgroundAppearance;
+    /// Sets the window title.
     fn set_title(&mut self, title: &str);
+    /// Sets how the window background is drawn: opaque, transparent or blurred.
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance);
+    /// Show or hide the window without explicitly requesting focus.
+    ///
+    /// The default implementation does nothing for platforms that do not support
+    /// changing window visibility at runtime.
+    fn set_visible(&self, _visible: bool) {}
+    /// Minimizes the window. The web backend logs a warning and does nothing.
     fn minimize(&self);
+    /// Zooms the window with the platform's zoom behavior. The web backend logs a
+    /// warning and does nothing.
     fn zoom(&self);
+    /// Enters fullscreen, or leaves it if the window is already fullscreen.
     fn toggle_fullscreen(&self);
+    /// Returns whether the window is fullscreen.
     fn is_fullscreen(&self) -> bool;
+    /// Returns a function that wakes the event loop to draw a frame, or `None` if the
+    /// platform doesn't provide one.
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        None
+    }
+    /// Registers the callback that draws a frame when the platform asks for one.
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>);
+    /// Registers the callback that receives input events. Its return value tells the
+    /// platform whether GPUI handled the event.
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> DispatchEventResult>);
+    /// Registers the callback run when the window gains or loses focus. It receives `true` when the window is active.
     fn on_active_status_change(&self, callback: Box<dyn FnMut(bool)>);
+    /// Registers the callback invoked when [`Self::visibility`] changes. Only
+    /// transitions are reported; the callback runs on the main thread outside
+    /// of any window update.
+    fn on_visibility_change(&self, callback: Box<dyn FnMut(WindowVisibility)>);
+    /// Registers the callback run when the mouse enters or leaves the window. It receives `true` on enter.
     fn on_hover_status_change(&self, callback: Box<dyn FnMut(bool)>);
+    /// Registers the callback run when the content size or scale factor changes. It
+    /// receives the new size and the scale factor.
     fn on_resize(&self, callback: Box<dyn FnMut(Size<Pixels>, f32)>);
+    /// Registers the callback run when the window moves.
     fn on_moved(&self, callback: Box<dyn FnMut()>);
+    /// Registers the callback invoked when the window moves to another
+    /// display. Calls may be spurious. The callback runs on the main thread
+    /// outside of any window update.
+    fn on_display_changed(&self, callback: Box<dyn FnMut()>);
+    /// Registers the callback run when the user asks to close the window. Return `false` to keep it open.
     fn on_should_close(&self, callback: Box<dyn FnMut() -> bool>);
+    /// Registers the callback the platform calls to find out which titlebar control, if any, the mouse is over.
     fn on_hit_test_window_control(&self, callback: Box<dyn FnMut() -> Option<WindowControlArea>>);
+    /// Registers the callback run once the window has closed.
     fn on_close(&self, callback: Box<dyn FnOnce()>);
+    /// Registers the callback run when the window's appearance changes.
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
+    /// Registers the callback run when the titlebar button layout changes. The default does nothing.
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
+    /// Draws `scene` into the window. GPUI calls this once per frame.
     fn draw(&self, scene: &Scene);
-    fn completed_frame(&self) {}
+    /// Asks the platform to request another frame soon. The default does nothing.
+    fn schedule_frame(&self) {}
+    /// Returns the atlas that stores the glyph and image textures for this window.
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
+    /// Returns whether the renderer supports subpixel (LCD) text antialiasing. macOS returns `false`.
     fn is_subpixel_rendering_supported(&self) -> bool;
 
     // macOS specific methods
+    /// Returns the window title. macOS and the Linux headless window override this. The default returns an empty string.
     fn get_title(&self) -> String {
         String::new()
     }
+    /// Returns the windows in this window's native tab group, or `None` if the window isn't tabbed. macOS only.
     fn tabbed_windows(&self) -> Option<Vec<SystemWindowTab>> {
         None
     }
+    /// Returns whether the native tab bar is visible. macOS only.
     fn tab_bar_visible(&self) -> bool {
         false
     }
+    /// Marks the window's document as edited or unedited. macOS only.
     fn set_edited(&mut self, _edited: bool) {}
+    /// Sets the document path that the titlebar shows for the window. macOS only.
     fn set_document_path(&self, _path: Option<&std::path::Path>) {}
+    /// Toggles simple fullscreen, which fills the screen without creating a new Space. macOS only.
+    fn toggle_simple_fullscreen(&self) {}
+    /// Returns whether the window is in simple fullscreen. macOS only.
+    fn is_simple_fullscreen(&self) -> bool {
+        false
+    }
+    /// Moves the traffic-light buttons to `position`, in logical pixels. macOS only.
     #[cfg(target_os = "macos")]
     fn set_traffic_light_position(&self, _position: Point<Pixels>) {}
-    fn show_character_palette(&self) {}
-    fn titlebar_double_click(&self) {}
+    /// Show the platform character palette.
+    ///
+    /// The default implementation logs a warning when the backend does not
+    /// support showing a character palette.
+    fn show_character_palette(&self) {
+        log::warn!("show_character_palette is not implemented by this platform backend");
+    }
+    /// Runs the titlebar double-click action. macOS only, and the default does nothing.
+    fn titlebar_double_click(&self, _is_resizable: bool, _is_minimizable: bool) {}
+    /// Registers the callback for the Move Tab to New Window action. macOS only.
     fn on_move_tab_to_new_window(&self, _callback: Box<dyn FnMut()>) {}
+    /// Registers the callback for the Merge All Windows action. macOS only.
     fn on_merge_all_windows(&self, _callback: Box<dyn FnMut()>) {}
+    /// Registers the callback for selecting the previous tab. macOS only.
     fn on_select_previous_tab(&self, _callback: Box<dyn FnMut()>) {}
+    /// Registers the callback for selecting the next tab. macOS only.
     fn on_select_next_tab(&self, _callback: Box<dyn FnMut()>) {}
+    /// Registers the callback for showing or hiding the tab bar. macOS only.
     fn on_toggle_tab_bar(&self, _callback: Box<dyn FnMut()>) {}
+    /// Merges all windows into one tab group. macOS only.
     fn merge_all_windows(&self) {}
+    /// Moves this window's tab into a new window. macOS only.
     fn move_tab_to_new_window(&self) {}
+    /// Shows or hides the tab overview. macOS only.
     fn toggle_window_tab_overview(&self) {}
+    /// Sets the identifier that groups windows into one native tab group. macOS only.
     fn set_tabbing_identifier(&self, _identifier: Option<String>) {}
 
+    /// Captures opaque, platform-specific state for restoring this native window later.
+    ///
+    /// Returns None when the backend has no restorable state. The bytes are only meaningful to
+    /// the backend that produced them; the default implementation returns None.
+    fn native_window_state(&self) -> Option<Vec<u8>> {
+        None
+    }
+    /// Restores state previously returned by PlatformWindow::native_window_state.
+    ///
+    /// The default implementation does nothing on platforms without native state restoration.
+    fn restore_native_window_state(&self, _state: &[u8]) {}
+
+    /// Returns the window's Win32 `HWND`. Windows only.
     #[cfg(target_os = "windows")]
     fn get_raw_handle(&self) -> windows::Win32::Foundation::HWND;
 
     // Linux specific methods
+    /// Returns the window's state and bounds, excluding decorations. Defaults to [`PlatformWindow::window_bounds`].
     fn inner_window_bounds(&self) -> WindowBounds {
         self.window_bounds()
     }
+    /// Asks for server-side or client-side decorations. Linux only.
     fn request_decorations(&self, _decorations: WindowDecorations) {}
+    /// Shows the window menu at `position`, in logical pixels. Linux only.
     fn show_window_menu(&self, _position: Point<Pixels>) {}
+    /// Starts an interactive move, as if the user dragged the titlebar. Implemented on macOS, Windows and Linux; the web backend does nothing.
     fn start_window_move(&self) {}
+    /// Returns whether this window can start a drag to another application.
     fn can_start_external_drag(&self) -> bool {
         false
     }
+    /// Starts a drag of `payload` to another application. Returns `true` if the drag started.
     fn start_external_drag(&self, _payload: &ExternalDragPayload) -> bool {
         false
     }
+    /// Starts an interactive resize from `edge`. Linux only.
     fn start_window_resize(&self, _edge: ResizeEdge) {}
+    /// Reserves `zone` logical pixels at the screen edge for a layer-shell surface. Wayland only.
     fn set_exclusive_zone(&self, _zone: Pixels) {}
+    /// Sets the screen edge that a layer-shell exclusive zone uses. Wayland only.
     #[cfg(all(target_os = "linux", feature = "wayland"))]
     fn set_exclusive_edge(&self, _edge: layer_shell::Anchor) {}
+    /// Limits input to `region`, in logical pixels. `None` lets the whole window take input. Linux only.
     fn set_input_region(&self, _region: Option<&[Bounds<Pixels>]>) {}
+    /// Returns the decorations the window is using. The default is [`Decorations::Server`].
     fn window_decorations(&self) -> Decorations {
         Decorations::Server
     }
+    /// Sets the application id that the window manager uses to group windows and find the desktop entry. Linux only.
     fn set_app_id(&mut self, _app_id: &str) {}
+    /// Maps the window so the platform shows it. The default does nothing and returns `Ok(())`.
     fn map_window(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
+    /// Returns which window controls the platform supports.
     fn window_controls(&self) -> WindowControls {
         WindowControls::default()
     }
+    /// Sets the width of the client-side shadow that surrounds the window, in logical pixels. Linux only.
     fn set_client_inset(&self, _inset: Pixels) {}
+    /// Returns the GPU's name and driver details, or `None` if they're unavailable.
     fn gpu_specs(&self) -> Option<GpuSpecs>;
 
     /// Returns the GPU context for this window's renderer.
     /// The returned `Box` contains `(Arc<wgpu::Device>, Arc<wgpu::Queue>)`.
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "windows",
+        target_os = "macos"
+    ))]
     fn gpu_context(&self) -> Option<Box<dyn std::any::Any>> {
+        None
+    }
+
+    /// Returns typed backend-specific GPU context information for custom
+    /// controls. The value is intentionally type-erased in this crate so the
+    /// core UI crate does not depend on a rendering backend.
+    #[cfg(any(
+        target_family = "wasm",
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "macos"
+    ))]
+    fn gpu_context_info(&self) -> Option<Box<dyn std::any::Any>> {
         None
     }
 
@@ -977,11 +1739,17 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// captured the device from `gpu_context` should stop submitting while
     /// this is `Some(true)` and re-acquire the device once it reads
     /// `Some(false)` again.
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "windows",
+        target_os = "macos"
+    ))]
     fn gpu_device_lost(&self) -> Option<bool> {
         None
     }
 
+    /// Moves the input method's candidate window next to `bounds`, in window coordinates.
     fn update_ime_position(&self, _bounds: Bounds<Pixels>);
 
     // Mobile platform methods.
@@ -1007,15 +1775,16 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// back action (e.g. navigation depth > 0).
     fn set_back_enabled(&self, _enabled: bool) {}
 
-    /// Requests that the soft keyboard be shown.
+    /// Requests that the soft keyboard be shown. Mobile only.
     fn show_soft_keyboard(&self) {}
 
-    /// Requests that the soft keyboard be hidden.
+    /// Requests that the soft keyboard be hidden. Mobile only.
     fn hide_soft_keyboard(&self) {}
 
-    /// Inform the operating system that the text input state has changed
+    /// Tells the platform that the focused text input changed.
     fn text_input_state_changed(&self, _change: TextInputStateChange) {}
 
+    /// Plays the system alert sound.
     fn play_system_bell(&self) {}
 
     /// Initialize the accessibility adapter with callbacks.
@@ -1027,7 +1796,8 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// Inform the adapter of updated window bounds.
     fn a11y_update_window_bounds(&self) {}
 
-    #[cfg(any(test, feature = "test-support"))]
+    /// Returns this window as a `TestWindow`, if it is one. Only the test platform's windows are.
+    #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
     fn as_test(&mut self) -> Option<&mut TestWindow> {
         None
     }
@@ -1041,10 +1811,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
 }
 
-/// A renderer for headless windows that can produce real rendered output.
-#[cfg(any(test, feature = "test-support"))]
+/// Renders scenes offscreen for windows that have no display, such as in tests and benchmarks.
+#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 pub trait PlatformHeadlessRenderer {
-    /// Render a scene and return the result as an RGBA image.
+    /// Renders `scene` at `size` and returns the pixels as an RGBA image.
     fn render_scene_to_image(
         &mut self,
         scene: &Scene,
@@ -1094,6 +1864,55 @@ pub trait PlatformDispatcher: Send + Sync {
         self.dispatch_on_main_thread(runnable, Priority::Low);
     }
 
+    /// Creates an owner-thread local-task scope for platforms that retire event loops.
+    #[doc(hidden)]
+    fn create_local_task_scope(&self) -> Option<Arc<LocalTaskScope>> {
+        None
+    }
+
+    /// Dispatches a scoped runnable through the normal owner-thread queue.
+    #[doc(hidden)]
+    fn dispatch_local_task(&self, _scope: Arc<LocalTaskScope>, runnable: RunnableVariant) {
+        self.dispatch_on_main_thread(runnable, Priority::default());
+    }
+
+    /// Dispatches a scoped runnable through the owner's idle queue.
+    #[doc(hidden)]
+    fn dispatch_local_task_when_idle(
+        &self,
+        _scope: Arc<LocalTaskScope>,
+        runnable: RunnableVariant,
+        timeout: Option<Duration>,
+    ) {
+        self.dispatch_on_main_thread_when_idle(runnable, timeout);
+    }
+
+    /// Enqueues a scoped runnable for owner-thread destruction without polling.
+    #[doc(hidden)]
+    fn dispatch_local_task_cancellation(
+        &self,
+        _scope: Arc<LocalTaskScope>,
+        runnable: RunnableVariant,
+    ) {
+        self.dispatch_on_main_thread(runnable, Priority::High);
+    }
+
+    /// Begins retiring a scope after switching its queue to cancellation mode.
+    #[doc(hidden)]
+    fn begin_local_task_retirement(&self, scope: &Arc<LocalTaskScope>) {
+        scope.begin_retirement();
+    }
+
+    /// Drops one batch of queued cancellation runnables on the owner thread.
+    #[doc(hidden)]
+    fn drain_local_task_retirements(&self, _scope: &Arc<LocalTaskScope>) {}
+
+    /// Finishes retirement only after all scoped queues and tasks are empty.
+    #[doc(hidden)]
+    fn finish_local_task_retirement(&self, scope: &Arc<LocalTaskScope>) -> bool {
+        scope.seal_if_quiescent()
+    }
+
     fn idle_time_remaining(&self) -> Option<Duration> {
         None
     }
@@ -1108,201 +1927,660 @@ pub trait PlatformDispatcher: Send + Sync {
         gpui_util::defer(Box::new(|| {}))
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    fn prevent_app_nap(&self, _reason: &str) -> ActivityGuard {
+        ActivityGuard::noop()
+    }
+
+    #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
     fn as_test(&self) -> Option<&TestDispatcher> {
         None
     }
 
-    // This cfg must match the `bench_dispatcher` module's, which implements
+    // This cfg must match the `threaded_dispatcher` module's, which implements
     // this method whenever it compiles.
-    #[cfg(any(test, feature = "bench"))]
-    fn as_bench(&self) -> Option<&BenchDispatcher> {
+    #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+    fn as_threaded(&self) -> Option<&ThreadedDispatcher> {
         None
     }
 }
 
-#[expect(missing_docs)]
+/// Loads fonts and lays out text for one platform. Each backend implements this trait.
+///
+/// Application code uses [`TextSystem`](crate::TextSystem), which calls these methods and caches the
+/// results. Glyph and layout methods run on whatever thread the caller uses, so
+/// implementations must be `Send + Sync`.
 pub trait PlatformTextSystem: Send + Sync {
+    /// Adds fonts from their file bytes, such as TTF or OTF data, so layout can find them by family name.
+    ///
+    /// Returns an error if any of the bytes can't be parsed as a font.
     fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()>;
-    /// Get all available font names.
+    /// Returns the names of every font family available to layout.
     fn all_font_names(&self) -> Vec<String>;
-    /// Get the font ID for a font descriptor.
-    fn font_id(&self, descriptor: &Font) -> Result<FontId>;
-    /// Get metrics for a font.
-    fn font_metrics(&self, font_id: FontId) -> FontMetrics;
-    /// Get typographic bounds for a glyph.
-    fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>>;
-    /// Get the advance width for a glyph.
-    fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>>;
-    /// Get the glyph ID for a character.
-    fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId>;
-    /// Get raster bounds for a glyph.
-    fn glyph_raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>>;
-    /// Rasterize a glyph.
-    fn rasterize_glyph(
-        &self,
-        params: &RenderGlyphParams,
-        raster_bounds: Bounds<DevicePixels>,
-    ) -> Result<(Size<DevicePixels>, Vec<u8>)>;
-    /// Layout a line of text with the given font runs.
-    fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout;
-    /// Returns the recommended text rendering mode for the given font and size.
-    fn recommended_rendering_mode(&self, _font_id: FontId, _font_size: Pixels)
-    -> TextRenderingMode;
-    /// Returns the dilation level to use for a glyph painted in the given color.
-    fn glyph_dilation_for_color(&self, _color: palette::Hsla) -> u8 {
+    /// Returns a number that changes whenever the font collection changes, so caches can detect stale entries.
+    ///
+    /// The default returns `0`, which means the collection never changes.
+    fn font_generation(&self) -> u64 {
         0
     }
-}
-
-#[expect(missing_docs)]
-pub struct NoopTextSystem;
-
-#[expect(missing_docs)]
-impl NoopTextSystem {
-    #[allow(dead_code)]
-    pub fn new() -> Self {
-        Self
+    /// Returns the id of the font that best matches `descriptor`.
+    fn font_id(&self, descriptor: &Font) -> Result<FontId>;
+    /// Loads the caches that shaping needs for `font_ids`, so the first layout with them is fast.
+    /// The default does nothing.
+    fn prewarm_fonts(&self, _font_ids: &[FontId]) {}
+    /// Returns the metrics, such as ascent, descent and line gap, for `font_id`.
+    fn font_metrics(&self, font_id: FontId) -> FontMetrics;
+    /// Returns the glyph's bounding box, relative to its origin on the baseline.
+    fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>>;
+    /// Returns the distance the pen moves after drawing this glyph.
+    fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>>;
+    /// Returns the glyph that `font_id` uses for `ch`, or `None` if the font has no glyph for it.
+    fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId>;
+    /// Rasterizes a glyph, including its atlas placement and pixels.
+    fn rasterize_glyph(&self, params: &RenderGlyphParams) -> Result<RasterizedGlyph>;
+    /// Returns the raster style to use for `request`, normalized so that cached glyph
+    /// pixels can be shared. The default uses the requested mode unchanged.
+    fn prepare_raster_style(&self, request: RasterStyleRequest) -> PreparedRasterStyle {
+        PreparedRasterStyle::independent(request.requested_mode)
     }
-}
-
-impl PlatformTextSystem for NoopTextSystem {
-    fn add_fonts(&self, _fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
-        Ok(())
-    }
-
-    fn all_font_names(&self) -> Vec<String> {
-        Vec::new()
-    }
-
-    fn font_id(&self, _descriptor: &Font) -> Result<FontId> {
-        Ok(FontId(1))
-    }
-
-    fn font_metrics(&self, _font_id: FontId) -> FontMetrics {
-        FontMetrics {
-            units_per_em: 1000,
-            ascent: 1025.0,
-            descent: -275.0,
-            line_gap: 0.0,
-            underline_position: -95.0,
-            underline_thickness: 60.0,
-            cap_height: 698.0,
-            x_height: 516.0,
-            bounding_box: Bounds {
-                origin: Point {
-                    x: -260.0,
-                    y: -245.0,
-                },
-                size: Size {
-                    width: 1501.0,
-                    height: 1364.0,
-                },
-            },
-        }
-    }
-
-    fn typographic_bounds(&self, _font_id: FontId, _glyph_id: GlyphId) -> Result<Bounds<f32>> {
-        Ok(Bounds {
-            origin: Point { x: 54.0, y: 0.0 },
-            size: size(392.0, 528.0),
-        })
-    }
-
-    fn advance(&self, _font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
-        Ok(size(600.0 * glyph_id.0 as f32, 0.0))
-    }
-
-    fn glyph_for_char(&self, _font_id: FontId, ch: char) -> Option<GlyphId> {
-        Some(GlyphId(ch.len_utf16() as u32))
-    }
-
-    fn glyph_raster_bounds(&self, _params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
-        Ok(Default::default())
-    }
-
-    fn rasterize_glyph(
-        &self,
-        _params: &RenderGlyphParams,
-        raster_bounds: Bounds<DevicePixels>,
-    ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
-        Ok((raster_bounds.size, Vec::new()))
-    }
-
-    fn layout_line(&self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
-        let mut position = px(0.);
-        let metrics = self.font_metrics(FontId(0));
-        let em_width = font_size
-            * self
-                .advance(FontId(0), self.glyph_for_char(FontId(0), 'm').unwrap())
-                .unwrap()
-                .width
-            / metrics.units_per_em as f32;
-        let mut glyphs = Vec::new();
-        for (ix, c) in text.char_indices() {
-            if let Some(glyph) = self.glyph_for_char(FontId(0), c) {
-                glyphs.push(ShapedGlyph {
-                    id: glyph,
-                    position: point(position, px(0.)),
-                    index: ix,
-                    is_emoji: glyph.0 == 2,
-                });
-                if glyph.0 == 2 {
-                    position += em_width * 2.0;
-                } else {
-                    position += em_width;
-                }
-            } else {
-                position += em_width
-            }
-        }
-        let mut shaped_runs = Vec::default();
-        if !glyphs.is_empty() {
-            shaped_runs.push(ShapedRun {
-                font_id: FontId(0),
-                glyphs,
-            });
-        } else {
-            position = px(0.);
-        }
-
-        let mut tracking = px(0.);
-        let mut byte_offset = 0usize;
-        for run in font_runs {
-            let end = byte_offset.saturating_add(run.len).min(text.len());
-            let slice = text.get(byte_offset..end).unwrap_or("");
-            let n = slice.chars().count();
-            if n > 1 {
-                if let Some(spacing) = run.letter_spacing {
-                    tracking += spacing * (n - 1) as f32;
-                }
-            }
-            byte_offset = byte_offset.saturating_add(run.len);
-        }
-
-        LineLayout {
-            font_size,
-            width: position + tracking,
-            ascent: font_size * (metrics.ascent / metrics.units_per_em as f32),
-            descent: font_size * (metrics.descent / metrics.units_per_em as f32),
-            runs: shaped_runs,
-            len: text.len(),
-        }
-    }
-
+    /// Lays out one complete text document, including hard breaks and optional wrapping.
+    fn layout_text(&self, request: TextLayoutRequest<'_>) -> LineLayout;
+    /// Lays out one complete text document that contains atomic element boxes, which
+    /// keep their size and sit on the text line.
+    fn layout_inline(&self, request: InlineLayoutRequest<'_>) -> InlineLayout;
+    /// Returns the text rendering mode the platform recommends for `font_id` at `font_size`.
+    ///
+    /// The default returns [`TextRenderingMode::Subpixel`].
     fn recommended_rendering_mode(
         &self,
         _font_id: FontId,
         _font_size: Pixels,
     ) -> TextRenderingMode {
-        TextRenderingMode::Grayscale
+        TextRenderingMode::Subpixel
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+mod tests {
+    use crate::{
+        Bounds, CaretAffinity, CaretMovement, CaretPosition, Font, FontId, FontMetrics, GlyphId,
+        InlineLayout, InlineLayoutRequest, InlineVisualLine, LineLayout, PaintFragment, PaintStyle,
+        Pixels, PlatformTextLayout, PlatformTextSystem, Point, PositionedInlineBox,
+        RasterizedGlyph, RasterizedGlyphFormat, RenderGlyphParams, ResolvedDirection, ShapedGlyph,
+        Size, TextAlign, TextBoundary, TextDirection, TextLayoutRequest, TextMovement,
+        TextRenderingMode, TextSelectionKind, VisualDirection, VisualLine, align_inline_boxes,
+        point, px, size,
+    };
+    use anyhow::Result;
+    use std::{borrow::Cow, ops::Range, sync::Arc};
+
+    #[expect(missing_docs)]
+    pub struct TestTextSystem;
+
+    #[derive(Debug)]
+    /// A deterministic test layout with exactly one visual and hard line.
+    struct TestPlatformTextLayout {
+        /// Source text.
+        text: String,
+        /// Ordered (byte index, x position) caret stops.
+        stops: Vec<(usize, Pixels)>,
+        /// Size of the single visual line.
+        size: Size<Pixels>,
+    }
+
+    impl TestPlatformTextLayout {
+        fn caret_stop(&self, byte_offset: usize) -> (usize, Pixels) {
+            let stop_index = self
+                .stops
+                .partition_point(|(index, _position)| *index <= byte_offset)
+                .saturating_sub(1);
+
+            self.stops[stop_index]
+        }
+    }
+
+    impl PlatformTextLayout for TestPlatformTextLayout {
+        fn len(&self) -> usize {
+            self.stops.last().map_or(0, |(index, _)| *index)
+        }
+
+        fn line_count(&self) -> usize {
+            // This test layout deliberately reports its single visual line.
+            1
+        }
+
+        fn size(&self) -> Size<Pixels> {
+            self.size
+        }
+
+        fn byte_index_from_pixel_point(
+            &self,
+            pixel_point: Point<Pixels>,
+            line_height: Pixels,
+        ) -> Result<usize, usize> {
+            let closest = self
+                .caret_from_pixel_point(pixel_point, line_height)
+                .unwrap_or_else(|caret| caret)
+                .index;
+            self.stops
+                .windows(2)
+                .find_map(|stops| {
+                    let [(start_index, start_x), (_end_index, end_x)] = stops else {
+                        return None;
+                    };
+
+                    (pixel_point.x >= *start_x && pixel_point.x < *end_x)
+                        .then_some(Ok(*start_index))
+                })
+                .unwrap_or(Err(closest))
+        }
+
+        fn caret_from_pixel_point(
+            &self,
+            pixel_point: Point<Pixels>,
+            line_height: Pixels,
+        ) -> Result<CaretPosition, CaretPosition> {
+            let index = self
+                .stops
+                .iter()
+                .min_by(|(_, left), (_, right)| {
+                    (f32::from(*left) - f32::from(pixel_point.x))
+                        .abs()
+                        .total_cmp(&(f32::from(*right) - f32::from(pixel_point.x)).abs())
+                })
+                .map_or(0, |(index, _)| *index);
+            let caret = self.normalized_caret(CaretPosition {
+                index,
+                affinity: CaretAffinity::Downstream,
+            });
+
+            if pixel_point.y >= Pixels::ZERO
+                && pixel_point.y < line_height
+                && pixel_point.x >= Pixels::ZERO
+                && pixel_point.x < self.size.width
+            {
+                Ok(caret)
+            } else {
+                Err(caret)
+            }
+        }
+
+        fn caret_bounds(
+            &self,
+            caret: CaretPosition,
+            line_height: Pixels,
+        ) -> Option<Bounds<Pixels>> {
+            let caret = self.normalized_caret(caret);
+            let (_index, position) = self.caret_stop(caret.index);
+
+            Some(Bounds::new(
+                point(position, Pixels::ZERO),
+                size(Pixels::ZERO, line_height),
+            ))
+        }
+
+        fn normalized_caret(&self, caret: CaretPosition) -> CaretPosition {
+            let (index, _position) = self.caret_stop(caret.index);
+            let affinity = if index == self.len() && index != 0 {
+                CaretAffinity::Upstream
+            } else {
+                caret.affinity
+            };
+
+            CaretPosition { index, affinity }
+        }
+
+        fn adjacent_visual_caret(
+            &self,
+            caret: CaretPosition,
+            direction: VisualDirection,
+        ) -> Option<CaretPosition> {
+            let caret = self.normalized_caret(caret);
+            let position = self
+                .stops
+                .iter()
+                .position(|(index, _)| *index == caret.index)?;
+            let position = match direction {
+                VisualDirection::Left => position.checked_sub(1)?,
+                VisualDirection::Right => position.checked_add(1)?,
+            };
+
+            let index = self.stops.get(position)?.0;
+            Some(self.normalized_caret(CaretPosition {
+                index,
+                affinity: CaretAffinity::Downstream,
+            }))
+        }
+
+        fn selection_bounds(
+            &self,
+            byte_range: Range<usize>,
+            line_height: Pixels,
+        ) -> Vec<Bounds<Pixels>> {
+            if byte_range.is_empty() {
+                return Vec::new();
+            }
+
+            let (_start_index, start) = self.caret_stop(byte_range.start);
+            let (_end_index, end) = self.caret_stop(byte_range.end);
+
+            // The platform contract returns one bound per visual line. Since this test
+            // layout has exactly one visual line, every non-empty selection has one bound.
+            vec![Bounds::from_corners(
+                point(start.min(end), Pixels::ZERO),
+                point(start.max(end), line_height),
+            )]
+        }
+
+        fn logical_cluster_before(&self, caret: CaretPosition) -> Option<Range<usize>> {
+            self.stops
+                .windows(2)
+                .rev()
+                .find(|stops| stops[1].0 <= caret.index)
+                .map(|stops| stops[0].0..stops[1].0)
+        }
+
+        fn logical_cluster_after(&self, caret: CaretPosition) -> Option<Range<usize>> {
+            self.stops
+                .windows(2)
+                .find(|stops| stops[0].0 >= caret.index)
+                .map(|stops| stops[0].0..stops[1].0)
+        }
+
+        fn caret_movement(
+            &self,
+            caret: CaretPosition,
+            movement: TextMovement,
+            vertical_navigation_x: Option<Pixels>,
+        ) -> CaretMovement {
+            use TextBoundary::*;
+            use TextDirection::*;
+
+            let index = match (movement.direction, movement.boundary) {
+                (Left, Cluster) => {
+                    self.adjacent_visual_caret(caret, VisualDirection::Left)
+                        .unwrap_or(caret)
+                        .index
+                }
+                (Right, Cluster) => {
+                    self.adjacent_visual_caret(caret, VisualDirection::Right)
+                        .unwrap_or(caret)
+                        .index
+                }
+                (Left, Word) => {
+                    let prefix = &self.text[..caret.index.min(self.text.len())];
+                    let trimmed = prefix.trim_end_matches(char::is_whitespace);
+                    trimmed.rfind(char::is_whitespace).map_or(0, |index| {
+                        index + trimmed[index..].chars().next().unwrap().len_utf8()
+                    })
+                }
+                (Right, Word) => {
+                    let start = caret.index.min(self.text.len());
+                    let suffix = &self.text[start..];
+                    let word_end = suffix.find(char::is_whitespace).unwrap_or(suffix.len());
+                    let rest = &suffix[word_end..];
+                    start
+                        + word_end
+                        + rest
+                            .find(|character: char| !character.is_whitespace())
+                            .unwrap_or(rest.len())
+                }
+                // This test layout has one visual and hard line. Without wrapping or
+                // additional hard lines, these movements resolve to the document endpoints.
+                (Up | Start, VisualLine) | (Start, HardLine | Document) => 0,
+                (Down | End, VisualLine) | (End, HardLine | Document) => self.len(),
+                _ => caret.index,
+            };
+
+            let vertical_navigation_x =
+                matches!(movement.direction, TextDirection::Up | TextDirection::Down).then(|| {
+                    vertical_navigation_x.unwrap_or_else(|| {
+                        self.caret_bounds(caret, self.size.height)
+                            .map_or(Pixels::ZERO, |bounds| bounds.origin.x)
+                    })
+                });
+
+            CaretMovement {
+                result: self.normalized_caret(CaretPosition {
+                    index,
+                    affinity: CaretAffinity::Downstream,
+                }),
+                vertical_navigation_x,
+            }
+        }
+
+        fn selection_from_pixel_point(
+            &self,
+            pixel_point: Point<Pixels>,
+            line_height: Pixels,
+            kind: TextSelectionKind,
+        ) -> Range<usize> {
+            if !matches!(kind, TextSelectionKind::Word) {
+                return 0..self.len();
+            }
+
+            let index = self
+                .caret_from_pixel_point(pixel_point, line_height)
+                .unwrap_or_else(|caret| caret)
+                .index
+                .min(self.text.len());
+            let start = self.text[..index]
+                .rfind(char::is_whitespace)
+                .map_or(0, |offset| {
+                    offset + self.text[offset..].chars().next().unwrap().len_utf8()
+                });
+            let end = self.text[index..]
+                .find(char::is_whitespace)
+                .map_or(self.text.len(), |offset| index + offset);
+            start..end
+        }
+    }
+
+    #[expect(missing_docs)]
+    impl TestTextSystem {
+        #[allow(dead_code)]
+        pub fn new() -> Self {
+            Self
+        }
+
+        fn em_width(&self, font_size: Pixels) -> Pixels {
+            let metrics = self.font_metrics(FontId(0));
+            let advance = self
+                .advance(FontId(0), self.glyph_for_char(FontId(0), 'm').unwrap())
+                .unwrap();
+
+            font_size * advance.width / metrics.units_per_em as f32
+        }
+    }
+
+    fn position_test_inline_boxes(
+        request: InlineLayoutRequest<'_>,
+        em_width: Pixels,
+        baseline: Pixels,
+    ) -> Vec<PositionedInlineBox> {
+        let mut preceding_width = Pixels::ZERO;
+        request
+            .boxes
+            .iter()
+            .map(|inline_box| {
+                let text_width = em_width
+                    * request.text[..inline_box.index]
+                        .chars()
+                        .map(|character| character.len_utf16() as f32)
+                        .sum::<f32>();
+                let positioned = PositionedInlineBox {
+                    id: inline_box.id,
+                    line_index: 0,
+                    bounds: Bounds::new(
+                        point(
+                            text_width + preceding_width,
+                            baseline - inline_box.size.height,
+                        ),
+                        inline_box.size,
+                    ),
+                };
+
+                preceding_width += inline_box.size.width;
+                positioned
+            })
+            .collect()
+    }
+
+    fn add_test_inline_box_advances(layout: &mut LineLayout, request: InlineLayoutRequest<'_>) {
+        for fragment in &mut layout.paint_fragments {
+            // This layout owns its freshly built glyphs. If they become shared,
+            // make_mut copies the slice before changing their positions.
+            for (glyph, (index, _)) in Arc::make_mut(&mut fragment.glyphs)
+                .iter_mut()
+                .zip(request.text.char_indices())
+            {
+                glyph.position.x += request
+                    .boxes
+                    .iter()
+                    .filter(|inline_box| inline_box.index <= index)
+                    .map(|inline_box| inline_box.size.width)
+                    .sum::<Pixels>();
+            }
+        }
+
+        let box_width = request
+            .boxes
+            .iter()
+            .map(|inline_box| inline_box.size.width)
+            .sum::<Pixels>();
+        for fragment in &mut layout.paint_fragments {
+            fragment.x_range.end += box_width;
+        }
+
+        layout.width += box_width;
+
+        if let Some(line) = layout.visual_lines.first_mut() {
+            line.advance_width += box_width;
+        }
+    }
+
+    impl PlatformTextSystem for TestTextSystem {
+        fn add_fonts(&self, _fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
+            Ok(())
+        }
+
+        fn all_font_names(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn font_id(&self, _descriptor: &Font) -> Result<FontId> {
+            Ok(FontId(1))
+        }
+
+        fn font_metrics(&self, _font_id: FontId) -> FontMetrics {
+            FontMetrics {
+                units_per_em: 1000,
+                ascent: 1025.0,
+                descent: -275.0,
+                line_gap: 0.0,
+                underline_position: -95.0,
+                underline_thickness: 60.0,
+                cap_height: 698.0,
+                x_height: 516.0,
+                bounding_box: Bounds {
+                    origin: Point {
+                        x: -260.0,
+                        y: -245.0,
+                    },
+                    size: Size {
+                        width: 1501.0,
+                        height: 1364.0,
+                    },
+                },
+            }
+        }
+
+        fn typographic_bounds(&self, _font_id: FontId, _glyph_id: GlyphId) -> Result<Bounds<f32>> {
+            Ok(Bounds {
+                origin: Point { x: 54.0, y: 0.0 },
+                size: size(392.0, 528.0),
+            })
+        }
+
+        fn advance(&self, _font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
+            Ok(size(600.0 * glyph_id.0 as f32, 0.0))
+        }
+
+        fn glyph_for_char(&self, _font_id: FontId, ch: char) -> Option<GlyphId> {
+            Some(GlyphId(ch.len_utf16() as u32))
+        }
+
+        fn rasterize_glyph(&self, _params: &RenderGlyphParams) -> Result<RasterizedGlyph> {
+            Ok(RasterizedGlyph {
+                bounds: Default::default(),
+                size: Default::default(),
+                format: RasterizedGlyphFormat::AlphaMask,
+                pixels: Vec::new(),
+            })
+        }
+
+        fn layout_text(&self, request: TextLayoutRequest<'_>) -> LineLayout {
+            let text = request.text;
+            let font_size = request.font_size;
+            let shaping_runs = request.runs;
+            let mut position = px(0.);
+            let metrics = self.font_metrics(FontId(0));
+            let em_width = self.em_width(font_size);
+            let mut glyphs = Vec::new();
+            let mut stops = vec![(0, Pixels::ZERO)];
+
+            for (idx, character) in text.char_indices() {
+                let glyph_id = GlyphId(character.len_utf16() as u32);
+                glyphs.push(ShapedGlyph {
+                    id: glyph_id,
+                    position: point(position, Pixels::ZERO),
+                    is_emoji: glyph_id.0 == 2,
+                });
+
+                position += em_width * glyph_id.0 as f32;
+                stops.push((idx + character.len_utf8(), position));
+            }
+
+            let mut tracking = px(0.);
+            let mut tracking_covered = 0usize;
+            for run in shaping_runs {
+                let start = tracking_covered.min(text.len());
+                let end = start.saturating_add(run.len).min(text.len()).max(start);
+                let slice = text.get(start..end).unwrap_or("");
+                let n = slice.chars().count();
+                if n > 1 {
+                    if let Some(spacing) = run.letter_spacing {
+                        tracking += spacing * (n - 1) as f32;
+                    }
+                }
+                tracking_covered = end;
+            }
+
+            let direction = match request.options.direction {
+                crate::ParagraphDirection::LeftToRight => ResolvedDirection::LeftToRight,
+                crate::ParagraphDirection::RightToLeft => ResolvedDirection::RightToLeft,
+                crate::ParagraphDirection::Auto => {
+                    ResolvedDirection::from_first_strong(text).unwrap_or_default()
+                }
+            };
+            let advance = position + tracking;
+            let alignment_width = request.options.alignment_width.unwrap_or(advance);
+            let offset = match request.options.text_align {
+                TextAlign::Start if direction.is_rtl() => alignment_width - advance,
+                TextAlign::Start | TextAlign::Left => Pixels::ZERO,
+                TextAlign::Center => (alignment_width - advance) / 2.0,
+                TextAlign::End if direction.is_rtl() => Pixels::ZERO,
+                TextAlign::End | TextAlign::Right => alignment_width - advance,
+            };
+
+            for (_idx, position) in &mut stops {
+                *position += offset;
+            }
+
+            let visual_lines = [VisualLine {
+                text_range: 0..text.len(),
+                paint_fragment_range: 0..usize::from(!glyphs.is_empty()),
+                advance_width: advance,
+                offset,
+                direction,
+            }]
+            .into_iter()
+            .collect();
+            let paint_fragments = (!glyphs.is_empty())
+                .then(|| PaintFragment {
+                    source_run: 0,
+                    font_id: FontId(0),
+                    font_size,
+                    glyphs: glyphs.into(),
+                    x_range: Pixels::ZERO..advance,
+                    style: shaping_runs
+                        .first()
+                        .map_or_else(PaintStyle::default, PaintStyle::from),
+                    underline_offset: Some(font_size * 0.1),
+                    strikethrough_offset: Some(-font_size * 0.3),
+                })
+                .into_iter()
+                .collect();
+            LineLayout {
+                font_size,
+                width: advance,
+                ascent: font_size * (metrics.ascent / metrics.units_per_em as f32),
+                descent: font_size * (metrics.descent / metrics.units_per_em as f32),
+                visual_lines,
+                paint_fragments,
+                len: text.len(),
+                platform_layout: Arc::new(TestPlatformTextLayout {
+                    text: text.to_owned(),
+                    stops,
+                    size: size(advance, font_size),
+                }),
+            }
+        }
+
+        fn layout_inline(&self, request: InlineLayoutRequest<'_>) -> InlineLayout {
+            let mut layout = self.layout_text(TextLayoutRequest {
+                text: request.text,
+                font_size: request.font_size,
+                runs: request.runs,
+                options: request.options,
+            });
+
+            let em_width = self.em_width(request.font_size);
+            let baseline = request
+                .boxes
+                .iter()
+                .map(|inline_box| inline_box.size.height)
+                .fold(request.line_height, Pixels::max);
+            let positioned_boxes = position_test_inline_boxes(request, em_width, baseline);
+            add_test_inline_box_advances(&mut layout, request);
+            let line_width = request
+                .options
+                .wrap_width
+                .unwrap_or(Pixels::MAX)
+                .min(layout.width);
+            let line_offset = layout.visual_lines[0].offset;
+            let mut inline = InlineLayout {
+                size: size(layout.width, baseline),
+                layout: Arc::new(layout),
+                lines: [InlineVisualLine {
+                    origin: point(line_offset, Pixels::ZERO),
+                    size: size(line_width, baseline),
+                    baseline,
+                }]
+                .into_iter()
+                .collect(),
+                boxes: positioned_boxes,
+                alignment_offset: Pixels::ZERO,
+            };
+
+            align_inline_boxes(
+                &mut inline.lines,
+                &mut inline.boxes,
+                &mut inline.size,
+                request.boxes,
+                &[request.text_metrics],
+                &[],
+                request.text_metrics,
+                request.line_height,
+            );
+            inline
+        }
+
+        fn recommended_rendering_mode(
+            &self,
+            _font_id: FontId,
+            _font_size: Pixels,
+        ) -> TextRenderingMode {
+            TextRenderingMode::Grayscale
+        }
     }
 }
 
 // Adapted from https://github.com/microsoft/terminal/blob/1283c0f5b99a2961673249fa77c6b986efb5086c/src/renderer/atlas/dwrite.cpp
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
-/// Compute gamma correction ratios for subpixel text rendering.
+/// Returns the gamma correction ratios for subpixel text at `gamma`.
+///
+/// `gamma` is rounded to one decimal place and clamped to the range `1.0` to `2.2`.
 #[allow(dead_code)]
 pub fn get_gamma_correction_ratios(gamma: f32) -> [f32; 4] {
     const GAMMA_INCORRECT_TARGET_RATIOS: [[f32; 4]; 13] = [
@@ -1335,43 +2613,40 @@ pub fn get_gamma_correction_ratios(gamma: f32) -> [f32; 4] {
     ]
 }
 
+/// Identifies one entry in a [`PlatformAtlas`]: a glyph, an SVG or a raster image.
 #[derive(PartialEq, Eq, Hash, Clone)]
-#[expect(missing_docs)]
 pub enum AtlasKey {
-    Glyph(RenderGlyphParams),
+    /// A rasterized glyph, with the format it was rasterized in.
+    Glyph {
+        /// The glyph and how it is rendered.
+        params: RenderGlyphParams,
+        /// The pixel format it was rasterized in.
+        format: RasterizedGlyphFormat,
+    },
+    /// An SVG rendered at specific parameters.
     Svg(RenderSvgParams),
+    /// A raster image, identified by its render parameters.
     Image(RenderImageParams),
 }
 
 impl AtlasKey {
-    #[cfg_attr(
-        all(
-            any(target_os = "linux", target_os = "freebsd"),
-            not(any(feature = "x11", feature = "wayland"))
-        ),
-        allow(dead_code)
-    )]
     /// Returns the texture kind for this atlas key.
     pub fn texture_kind(&self) -> AtlasTextureKind {
         match self {
-            AtlasKey::Glyph(params) => {
-                if params.is_emoji {
-                    AtlasTextureKind::Polychrome
-                } else if params.subpixel_rendering {
-                    AtlasTextureKind::Subpixel
-                } else {
-                    AtlasTextureKind::Monochrome
-                }
-            }
+            AtlasKey::Glyph { format, .. } => match format {
+                RasterizedGlyphFormat::AlphaMask => AtlasTextureKind::Monochrome,
+                RasterizedGlyphFormat::BgraSubpixelMask => AtlasTextureKind::Subpixel,
+                RasterizedGlyphFormat::BgraColor => AtlasTextureKind::Polychrome,
+            },
             AtlasKey::Svg(_) => AtlasTextureKind::Monochrome,
             AtlasKey::Image(_) => AtlasTextureKind::Polychrome,
         }
     }
 }
 
-impl From<RenderGlyphParams> for AtlasKey {
-    fn from(params: RenderGlyphParams) -> Self {
-        Self::Glyph(params)
+impl From<(RenderGlyphParams, RasterizedGlyphFormat)> for AtlasKey {
+    fn from((params, format): (RenderGlyphParams, RasterizedGlyphFormat)) -> Self {
+        Self::Glyph { params, format }
     }
 }
 
@@ -1387,18 +2662,242 @@ impl From<RenderImageParams> for AtlasKey {
     }
 }
 
-#[expect(missing_docs)]
+#[doc(hidden)]
+#[derive(Default)]
+pub struct GlyphAtlasCache {
+    entries: FxHashMap<RenderGlyphParams, GlyphAtlasEntry>,
+}
+
+impl GlyphAtlasCache {
+    pub fn get(&self, params: &RenderGlyphParams) -> Option<GlyphAtlasEntry> {
+        self.entries.get(params).copied()
+    }
+
+    pub fn insert(
+        &mut self,
+        params: &RenderGlyphParams,
+        glyph: &RasterizedGlyph,
+        tile: Option<AtlasTile>,
+    ) -> GlyphAtlasEntry {
+        let entry = GlyphAtlasEntry {
+            tile,
+            bounds: glyph.bounds,
+            format: glyph.format,
+        };
+        self.entries.insert(params.clone(), entry);
+
+        entry
+    }
+
+    pub fn remove(&mut self, key: &AtlasKey) {
+        let AtlasKey::Glyph { params, format } = key else {
+            return;
+        };
+
+        if self
+            .entries
+            .get(params)
+            .is_some_and(|entry| entry.format == *format)
+        {
+            self.entries.remove(params);
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+/// A texture atlas that packs glyphs, SVGs and images into shared GPU textures.
+///
+/// Each window's renderer owns one atlas. Methods that insert tiles build the pixels
+/// only on a cache miss, so callers don't pay for rasterizing a tile they already
+/// have.
 pub trait PlatformAtlas {
+    /// Returns the tile for `key`, calling `build` on a cache miss to produce the pixels.
+    ///
+    /// `build` returns `None` when there is nothing to draw, and then this returns
+    /// `Ok(None)`. Returns an error if the pixels fail validation or the atlas is full.
+    /// The builder runs with the atlas locked and must not re-enter the same atlas.
     fn get_or_insert_with<'a>(
         &self,
-        key: &AtlasKey,
+        key: AtlasKey,
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>>;
+    /// Returns the atlas entry for the glyph `params`, calling `build` on a cache miss.
+    ///
+    /// `build` returns a [`ValidatedRasterizedGlyph`], which is inserted into the atlas.
+    fn get_or_insert_glyph_with(
+        &self,
+        params: &RenderGlyphParams,
+        build: &mut dyn FnMut() -> Result<ValidatedRasterizedGlyph>,
+    ) -> Result<GlyphAtlasEntry>;
+    /// Removes the tile for `key`, freeing its space in the atlas.
     fn remove(&self, key: &AtlasKey);
 
-    #[cfg(any(test, feature = "test-support"))]
+    /// Returns `true` if the atlas has a tile for `key`. Atlases that don't track this return `false`.
+    #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
     fn contains(&self, _key: &AtlasKey) -> bool {
         false
+    }
+}
+
+#[doc(hidden)]
+pub trait AtlasBackend {
+    fn insert(
+        &mut self,
+        kind: AtlasTextureKind,
+        size: Size<DevicePixels>,
+        bytes: &[u8],
+    ) -> Result<AtlasTile>;
+
+    fn remove(&mut self, tile: AtlasTile);
+}
+
+#[doc(hidden)]
+pub struct AtlasState<Backend> {
+    tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
+    pub backend: Backend,
+}
+
+impl<Backend> AtlasState<Backend> {
+    pub fn new(backend: Backend) -> Self {
+        Self {
+            tiles_by_key: FxHashMap::default(),
+            backend,
+        }
+    }
+
+    pub fn contains(&self, key: &AtlasKey) -> bool {
+        self.tiles_by_key.contains_key(key)
+    }
+
+    pub fn clear(&mut self, reset_backend: impl FnOnce(&mut Backend)) {
+        self.tiles_by_key.clear();
+        reset_backend(&mut self.backend);
+    }
+}
+
+impl<Backend: Default> Default for AtlasState<Backend> {
+    fn default() -> Self {
+        Self::new(Backend::default())
+    }
+}
+
+impl<Backend: AtlasBackend> AtlasState<Backend> {
+    pub fn get_or_insert_with<'a>(
+        &mut self,
+        key: AtlasKey,
+        build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
+    ) -> Result<Option<AtlasTile>> {
+        match self.tiles_by_key.entry(key) {
+            Entry::Occupied(entry) => Ok(Some(*entry.get())),
+            Entry::Vacant(entry) => {
+                profiling::scope!("new tile");
+                let Some((size, bytes)) = build()? else {
+                    return Ok(None);
+                };
+                let tile = self
+                    .backend
+                    .insert(entry.key().texture_kind(), size, &bytes)?;
+                entry.insert(tile);
+                Ok(Some(tile))
+            }
+        }
+    }
+
+    pub fn remove(&mut self, key: &AtlasKey) {
+        if let Some(tile) = self.tiles_by_key.remove(key) {
+            self.backend.remove(tile);
+        }
+    }
+}
+
+/// A sprite atlas for windows without a GPU. It hands out uniquely identified
+/// tiles without uploading any pixels, so glyph, SVG, and image painting can
+/// run to completion in tests and headless platforms.
+#[derive(Default)]
+pub struct HeadlessAtlas(parking_lot::Mutex<HeadlessAtlasState>);
+
+#[derive(Default)]
+struct HeadlessAtlasState {
+    atlas: AtlasState<HeadlessAtlasBackend>,
+    glyph_cache: GlyphAtlasCache,
+}
+
+#[doc(hidden)]
+#[derive(Default)]
+pub struct HeadlessAtlasBackend {
+    next_id: u32,
+}
+
+impl AtlasBackend for HeadlessAtlasBackend {
+    fn insert(
+        &mut self,
+        kind: AtlasTextureKind,
+        size: Size<DevicePixels>,
+        _bytes: &[u8],
+    ) -> Result<AtlasTile> {
+        self.next_id += 1;
+        let texture_id = self.next_id;
+        self.next_id += 1;
+        let tile_id = self.next_id;
+        Ok(AtlasTile {
+            texture_id: AtlasTextureId {
+                index: texture_id,
+                kind,
+            },
+            tile_id: TileId(tile_id),
+            padding: 0,
+            bounds: Bounds {
+                origin: Point::default(),
+                size,
+            },
+        })
+    }
+
+    fn remove(&mut self, _tile: AtlasTile) {}
+}
+
+impl PlatformAtlas for HeadlessAtlas {
+    fn get_or_insert_with<'a>(
+        &self,
+        key: AtlasKey,
+        build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
+    ) -> Result<Option<AtlasTile>> {
+        self.0.lock().atlas.get_or_insert_with(key, build)
+    }
+
+    fn get_or_insert_glyph_with(
+        &self,
+        params: &RenderGlyphParams,
+        build: &mut dyn FnMut() -> Result<ValidatedRasterizedGlyph>,
+    ) -> Result<GlyphAtlasEntry> {
+        let mut state = self.0.lock();
+        if let Some(entry) = state.glyph_cache.get(params) {
+            return Ok(entry);
+        }
+
+        let glyph = build()?;
+        let tile = if glyph.size == Size::default() {
+            None
+        } else {
+            let key = AtlasKey::from((params.clone(), glyph.format));
+            let mut pixels = || Ok(Some((glyph.size, Cow::Borrowed(glyph.pixels.as_slice()))));
+            state.atlas.get_or_insert_with(key, &mut pixels)?
+        };
+        Ok(state.glyph_cache.insert(params, &glyph, tile))
+    }
+
+    fn remove(&self, key: &AtlasKey) {
+        let mut state = self.0.lock();
+        state.glyph_cache.remove(key);
+        state.atlas.remove(key);
+    }
+
+    #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+    fn contains(&self, key: &AtlasKey) -> bool {
+        self.0.lock().atlas.contains(key)
     }
 }
 
@@ -1438,9 +2937,9 @@ impl<T> AtlasTextureList<T> {
     }
 }
 
+/// Where a glyph, SVG or image sits in an atlas texture.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(C)]
-#[expect(missing_docs)]
 pub struct AtlasTile {
     /// The texture this tile belongs to.
     pub texture_id: AtlasTextureId,
@@ -1452,9 +2951,9 @@ pub struct AtlasTile {
     pub bounds: Bounds<DevicePixels>,
 }
 
+/// Identifies one texture in an atlas.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(C)]
-#[expect(missing_docs)]
 pub struct AtlasTextureId {
     // We use u32 instead of usize for Metal Shader Language compatibility
     /// The index of this texture in the atlas.
@@ -1472,16 +2971,44 @@ pub struct AtlasTextureId {
     ),
     allow(dead_code)
 )]
-#[expect(missing_docs)]
+/// The kind of pixels a texture in an atlas stores.
 pub enum AtlasTextureKind {
+    /// One coverage byte per pixel, used for alpha-masked glyphs and SVGs.
     Monochrome = 0,
+    /// Four bytes per pixel, used for full-color images and emoji.
     Polychrome = 1,
+    /// Four bytes per pixel, used for subpixel (LCD) antialiased glyphs.
     Subpixel = 2,
 }
 
+impl AtlasTextureKind {
+    /// Validates a tightly packed bitmap before an atlas allocates or caches its tile.
+    /// Monochrome tiles contain one coverage byte; color and LCD tiles contain four bytes.
+    pub fn validate_upload(self, size: Size<DevicePixels>, bytes: &[u8]) -> Result<()> {
+        anyhow::ensure!(
+            size.width.0 > 0 && size.height.0 > 0,
+            "{self:?} atlas upload requires positive dimensions, got {size:?}"
+        );
+        let channels = match self {
+            Self::Monochrome => 1,
+            Self::Polychrome | Self::Subpixel => 4,
+        };
+        let expected = (size.width.0 as usize)
+            .checked_mul(size.height.0 as usize)
+            .and_then(|pixels| pixels.checked_mul(channels))
+            .ok_or_else(|| anyhow::anyhow!("atlas upload byte count overflow for {size:?}"))?;
+        anyhow::ensure!(
+            bytes.len() == expected,
+            "{self:?} atlas upload for {size:?} requires {expected} bytes, got {}",
+            bytes.len()
+        );
+        Ok(())
+    }
+}
+
+/// Identifies a tile within its atlas texture.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(C)]
-#[expect(missing_docs)]
 pub struct TileId(pub u32);
 
 impl From<etagere::AllocId> for TileId {
@@ -1496,13 +3023,17 @@ impl From<TileId> for etagere::AllocId {
     }
 }
 
-#[expect(missing_docs)]
+/// Connects the platform's input method (IME) to the focused [`InputHandler`].
+///
+/// GPUI creates one for the focused element while it's focused. Each method
+/// runs the matching [`InputHandler`] method inside an update of the window. If the
+/// window has closed, the methods return `None` or do nothing.
 pub struct PlatformInputHandler {
     cx: AsyncWindowContext,
     handler: Box<dyn InputHandler>,
+    focus_id: Option<crate::FocusId>,
 }
 
-#[expect(missing_docs)]
 #[cfg_attr(
     all(
         any(target_os = "linux", target_os = "freebsd"),
@@ -1511,10 +3042,29 @@ pub struct PlatformInputHandler {
     allow(dead_code)
 )]
 impl PlatformInputHandler {
+    /// Wraps `handler` so the platform can call it through the window context `cx`.
     pub fn new(cx: AsyncWindowContext, handler: Box<dyn InputHandler>) -> Self {
-        Self { cx, handler }
+        Self {
+            cx,
+            handler,
+            focus_id: None,
+        }
     }
 
+    pub(crate) fn with_focus(mut self, focus_id: crate::FocusId) -> Self {
+        self.focus_id = Some(focus_id);
+        self
+    }
+
+    /// Identifies the input field registered through [`Window::handle_input`].
+    ///
+    /// This identity survives adapter replacement during repaint. Backends can
+    /// use it to detect a field change without restarting the keyboard session.
+    pub fn focus_id(&self) -> Option<crate::FocusId> {
+        self.focus_id
+    }
+
+    /// Returns the selection, in UTF-16 units, or `None` if the handler has no selection.
     pub fn selected_text_range(&mut self, ignore_disabled_input: bool) -> Option<UTF16Selection> {
         self.cx
             .update(|window, cx| {
@@ -1525,6 +3075,7 @@ impl PlatformInputHandler {
             .flatten()
     }
 
+    /// Returns the range of composing (marked) text in UTF-16 units, or `None` when no text is being composed.
     #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub fn marked_text_range(&mut self) -> Option<Range<usize>> {
         self.cx
@@ -1537,6 +3088,9 @@ impl PlatformInputHandler {
         any(target_os = "linux", target_os = "freebsd", target_os = "windows"),
         allow(dead_code)
     )]
+    /// Returns the document text in `range_utf16`, or `None` if the handler has none.
+    ///
+    /// `adjusted` receives the range the handler actually used, which may differ from the request.
     pub fn text_for_range(
         &mut self,
         range_utf16: Range<usize>,
@@ -1551,6 +3105,7 @@ impl PlatformInputHandler {
             .flatten()
     }
 
+    /// Replaces `replacement_range`, in UTF-16 units, with `text`. `None` replaces the selection.
     pub fn replace_text_in_range(&mut self, replacement_range: Option<Range<usize>>, text: &str) {
         self.cx
             .update(|window, cx| {
@@ -1560,6 +3115,8 @@ impl PlatformInputHandler {
             .ok();
     }
 
+    /// Replaces `range_utf16` with `new_text` and marks the new text as composing, as an
+    /// IME does while the user types. `new_selected_range` sets the selection inside the composing text.
     pub fn replace_and_mark_text_in_range(
         &mut self,
         range_utf16: Option<Range<usize>>,
@@ -1579,6 +3136,7 @@ impl PlatformInputHandler {
             .ok();
     }
 
+    /// Ends the composition and keeps the marked text.
     #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub fn unmark_text(&mut self) {
         self.cx
@@ -1586,6 +3144,14 @@ impl PlatformInputHandler {
             .ok();
     }
 
+    /// Pastes `item` at the selection through [`InputHandler::paste`].
+    pub fn paste(&mut self, item: ClipboardItem) {
+        self.cx
+            .update(|window, cx| self.handler.paste(item, window, cx))
+            .ok();
+    }
+
+    /// Returns the screen bounds of `range_utf16`, in logical pixels. The platform uses these to place the IME candidate window.
     pub fn bounds_for_range(&mut self, range_utf16: Range<usize>) -> Option<Bounds<Pixels>> {
         self.cx
             .update(|window, cx| self.handler.bounds_for_range(range_utf16, window, cx))
@@ -1593,20 +3159,48 @@ impl PlatformInputHandler {
             .flatten()
     }
 
+    /// Returns selection rectangles for a range of UTF-16 code units in document order.
+    ///
+    /// The platform uses these logical-pixel bounds to position selection UI. A backend may
+    /// return an empty vector when selection geometry is unavailable; IME candidate placement
+    /// can still use bounds_for_range. If the window has closed, this also returns an empty vector.
+    pub fn selection_bounds_for_range(&mut self, range_utf16: Range<usize>) -> Vec<Bounds<Pixels>> {
+        self.cx
+            .update(|window, cx| {
+                self.handler
+                    .selection_bounds_for_range(range_utf16, window, cx)
+            })
+            .unwrap_or_default()
+    }
+
+    /// Returns whether macOS press-and-hold should stay enabled for this handler.
     #[allow(dead_code)]
     pub fn apple_press_and_hold_enabled(&mut self) -> bool {
         self.handler.apple_press_and_hold_enabled()
     }
 
+    /// Replaces the selection with `input`, using the handler's [`InputHandler::replace_text_in_range`].
     pub fn dispatch_input(&mut self, input: &str, window: &mut Window, cx: &mut App) {
         self.handler.replace_text_in_range(None, input, window, cx);
     }
 
+    /// Returns where the IME candidate window should appear.
+    ///
+    /// While text is composing, this is the start of the composing text's visual line,
+    /// found by walking back from the caret until the line changes. Otherwise it's the
+    /// caret position. `bounds_for_range` returns the bounds of each position it's asked for.
     pub fn compute_ime_candidate_bounds(
         marked_range: Option<Range<usize>>,
         selection: &UTF16Selection,
         mut bounds_for_range: impl FnMut(Range<usize>) -> Option<Bounds<Pixels>>,
     ) -> Option<Bounds<Pixels>> {
+        // The active end of the selection, which is `start` when it is reversed.
+        let caret = if selection.reversed {
+            selection.range.start
+        } else {
+            selection.range.end
+        };
+
         if let Some(marked_range) = marked_range {
             // Default to the start of the marked (composing) range.
             let mut line_start = marked_range.start;
@@ -1614,7 +3208,6 @@ impl PlatformInputHandler {
             // Walk backward from the caret looking for a line break. A change in
             // the Y coordinate means we crossed into the previous visual line, so
             // the line start is one position after the break point.
-            let caret = selection.range.end;
             if let Some(caret_bounds) = bounds_for_range(caret..caret) {
                 for i in (marked_range.start..caret).rev() {
                     if let Some(b) = bounds_for_range(i..i) {
@@ -1628,15 +3221,11 @@ impl PlatformInputHandler {
             bounds_for_range(line_start..line_start)
         } else {
             // No active composition — use the selection endpoint.
-            let offset = if selection.reversed {
-                selection.range.start
-            } else {
-                selection.range.end
-            };
-            bounds_for_range(offset..offset)
+            bounds_for_range(caret..caret)
         }
     }
 
+    /// Returns the IME candidate position for the current selection.
     pub fn selected_bounds(&mut self, window: &mut Window, cx: &mut App) -> Option<Bounds<Pixels>> {
         let marked_range = self.handler.marked_text_range(window, cx);
         let selection = self.handler.selected_text_range(true, window, cx)?;
@@ -1645,6 +3234,7 @@ impl PlatformInputHandler {
         })
     }
 
+    /// Returns the IME candidate position for the current selection, through the window context.
     pub fn ime_candidate_bounds(&mut self) -> Option<Bounds<Pixels>> {
         let marked_range = self.marked_text_range();
         let selection = self.selected_text_range(true)?;
@@ -1653,6 +3243,7 @@ impl PlatformInputHandler {
         })
     }
 
+    /// Returns the UTF-16 index of the character at `point`, in window coordinates, or `None` if there is none.
     #[allow(unused)]
     pub fn character_index_for_point(&mut self, point: Point<Pixels>) -> Option<usize> {
         self.cx
@@ -1687,16 +3278,33 @@ impl PlatformInputHandler {
             .flatten()
     }
 
+    /// Returns whether the handler accepts text input right now.
     #[allow(dead_code)]
     pub fn accepts_text_input(&mut self, window: &mut Window, cx: &mut App) -> bool {
         self.handler.accepts_text_input(window, cx)
     }
 
+    /// Returns whether the handler accepts text input. Returns `true` if the window is gone.
     #[allow(dead_code)]
     pub fn query_accepts_text_input(&mut self) -> bool {
         self.cx
             .update(|window, cx| self.handler.accepts_text_input(window, cx))
             .unwrap_or(true)
+    }
+
+    /// Checks eligibility against the current focus, including before the next frame is drawn.
+    ///
+    /// Unlike the legacy acceptance query, this fails closed when the window cannot
+    /// be updated and requires registration through `Window::handle_input`.
+    pub fn query_accepts_focused_text_input(&mut self) -> bool {
+        let focus_id = self.focus_id;
+        self.cx
+            .update(|window, cx| {
+                focus_id.is_some()
+                    && window.focus == focus_id
+                    && self.handler.accepts_text_input(window, cx)
+            })
+            .unwrap_or(false)
     }
 
     /// See [`InputHandler::prefers_ime_for_printable_keys`].
@@ -1713,6 +3321,23 @@ impl PlatformInputHandler {
             })
             .unwrap_or(false)
     }
+
+    /// Returns the text input configuration the handler requests.
+    pub fn text_input_configuration(
+        &mut self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> TextInputConfiguration {
+        self.handler.text_input_configuration(window, cx)
+    }
+
+    /// See [`InputHandler::text_input_editable_range`].
+    pub fn text_input_editable_range(&mut self) -> Option<Range<usize>> {
+        self.cx
+            .update(|window, cx| self.handler.text_input_editable_range(window, cx))
+            .ok()
+            .flatten()
+    }
 }
 
 /// A struct representing a selection in a text buffer, in UTF16 characters.
@@ -1727,10 +3352,15 @@ pub struct UTF16Selection {
     pub reversed: bool,
 }
 
-/// Zed's interface for handling text input from the platform's IME system
-/// This is currently a 1:1 exposure of the NSTextInputClient API:
+/// Receives text from the platform's input method (IME) on behalf of a focused element.
 ///
-/// <https://developer.apple.com/documentation/appkit/nstextinputclient>
+/// Implement this on the element that accepts text, and return it from
+/// [`Window::handle_input`]. The methods mirror the macOS `NSTextInputClient`
+/// protocol. All ranges are in UTF-16 code units, because that is what platforms
+/// use, not bytes or characters.
+///
+/// Methods without a default body must be implemented. The others have defaults, so
+/// override only what your text needs. See [text input](crate::_documentation::guides::text_input).
 pub trait InputHandler: 'static {
     /// Get the range of the user's currently selected text, if any
     /// Corresponds to [selectedRange()](https://developer.apple.com/documentation/appkit/nstextinputclient/1438242-selectedrange)
@@ -1792,7 +3422,19 @@ pub trait InputHandler: 'static {
     /// Corresponds to [unmarkText()](https://developer.apple.com/documentation/appkit/nstextinputclient/1438239-unmarktext)
     fn unmark_text(&mut self, window: &mut Window, cx: &mut App);
 
-    /// Get the bounds of the given document range in screen coordinates
+    /// Insert a platform-initiated paste at the current selection.
+    ///
+    /// Platforms that deliver paste as an input event rather than through an
+    /// application-defined action (e.g. the DOM `paste` event on web) call
+    /// this with the full clipboard contents. The default implementation
+    /// inserts only the plain-text portion of the item.
+    fn paste(&mut self, item: ClipboardItem, window: &mut Window, cx: &mut App) {
+        if let Some(text) = item.text() {
+            self.replace_text_in_range(None, &text, window, cx);
+        }
+    }
+
+    /// Get the bounds of the given document range in window coordinates.
     /// Corresponds to [firstRect(forCharacterRange:actualRange:)](https://developer.apple.com/documentation/appkit/nstextinputclient/1438240-firstrect)
     ///
     /// This is used for positioning the IME candidate window
@@ -1802,6 +3444,21 @@ pub trait InputHandler: 'static {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<Bounds<Pixels>>;
+
+    /// Returns selection rectangles in document order, in window coordinates.
+    ///
+    /// Return line or shaped-run fragments, not one rectangle per character. The
+    /// first and last rectangles contain the range's start and end respectively.
+    /// Empty means native selection geometry is unavailable; caret/IME geometry can
+    /// still be supplied by `bounds_for_range`.
+    fn selection_bounds_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Vec<Bounds<Pixels>> {
+        Vec::new()
+    }
 
     /// Get the character offset for the given point in terms of UTF16 characters
     ///
@@ -1859,6 +3516,24 @@ pub trait InputHandler: 'static {
         true
     }
 
+    /// The contiguous range of text, in UTF-16 code units, that platform text
+    /// input may read and edit around the current selection.
+    ///
+    /// Platforms that mirror document text into an IME-editable buffer clamp
+    /// the mirrored window to this range, so multi-step IME edit gestures
+    /// (word deletion, autocorrect rewrites, suggestion picks) cannot reach
+    /// content outside it. The range should contain the current selection;
+    /// when it cannot (a selection spanning a region boundary), platforms
+    /// degrade the mirrored IME context rather than widening the range.
+    /// `None` places no bound.
+    fn text_input_editable_range(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<Range<usize>> {
+        None
+    }
+
     /// Returns whether printable keys should be routed to the IME before keybinding
     /// matching when a non-ASCII input source (e.g. Japanese, Korean, Chinese IME)
     /// is active. This prevents multi-stroke keybindings like `jj` from intercepting
@@ -1870,31 +3545,156 @@ pub trait InputHandler: 'static {
     fn prefers_ime_for_printable_keys(&mut self, _window: &mut Window, _cx: &mut App) -> bool {
         false
     }
+
+    /// Get this handler's preferences for platform text assistance.
+    ///
+    /// GPUI re-queries this every frame and forwards it to the platform window
+    /// only when it changes, so implementations must be cheap and may vary the
+    /// result with application state (e.g. with the cursor's position).
+    fn text_input_configuration(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> TextInputConfiguration {
+        TextInputConfiguration::default()
+    }
 }
 
-/// The variables that can be configured when creating a new window
-#[derive(Debug)]
+/// Platform text-assistance preferences for the focused text region.
+///
+/// Returned by [`InputHandler::text_input_configuration`] and forwarded to the
+/// platform whenever it changes; the platform maps the fields onto its native
+/// input-session attributes (on web, DOM attributes of the hidden editable
+/// element such as `autocorrect` and `enterkeyhint`).
+///
+/// The default disables all text assistance and requests no particular action
+/// key presentation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TextInputConfiguration {
+    /// Whether the platform may automatically correct entered text.
+    pub autocorrect: bool,
+    /// How software keyboards automatically capitalize entered text.
+    pub autocapitalize: Autocapitalize,
+    /// Whether software keyboards may offer word suggestions and spellcheck.
+    pub suggestions: bool,
+    /// The action advertised on a software keyboard's confirm ("enter") key.
+    pub input_action: TextInputAction,
+}
+
+/// Automatic capitalization applied by software keyboards.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Autocapitalize {
+    /// No automatic capitalization.
+    #[default]
+    None,
+    /// Capitalize the first letter of each word.
+    Words,
+    /// Capitalize the first letter of each sentence.
+    Sentences,
+    /// Capitalize every letter.
+    Characters,
+}
+
+/// The action a software keyboard advertises on its confirm ("enter") key.
+///
+/// This affects only how the key is presented (icon or label); pressing it is
+/// still delivered as ordinary input.
+///
+/// The variants are the HTML `enterkeyhint` attribute's value set
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#input-modalities:-the-enterkeyhint-attribute>),
+/// which also maps onto Android's `IME_ACTION_*` constants and iOS's
+/// `UIReturnKeyType`; [`TextInputAction::Unspecified`] means "emit no hint".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextInputAction {
+    /// Let the platform choose its default presentation.
+    #[default]
+    Unspecified,
+    /// Inserting a line break.
+    Enter,
+    /// Committing the field's value.
+    Done,
+    /// Navigating to the typed target.
+    Go,
+    /// Moving to the next field.
+    Next,
+    /// Moving to the previous field.
+    Previous,
+    /// Executing a search.
+    Search,
+    /// Sending a message.
+    Send,
+}
+
+/// Options for creating a window, passed to [`App::open_window`].
+///
+/// Start from [`WindowOptions::default`] (or [`WindowOptions::new`], which is the same)
+/// and chain setters for the fields you want to change. Each setter takes the value
+/// itself, or an `Option` to clear the field. The defaults give a focused, shown,
+/// resizable, movable normal window with a titlebar, at the platform's default size
+/// and position.
+///
+/// Not every platform reads every field. The web backend uses [`WindowOptions::kind`],
+/// [`WindowOptions::show`], and `web_window_background`. The page's canvas is
+/// the window, so bounds, the titlebar, the minimum size and the resize options are ignored.
+/// Each field's docs say which
+/// platforms use it. See [platforms](crate::_documentation::platforms).
+///
+/// # Examples
+///
+/// Start from the defaults and change only what you need:
+///
+/// ```
+/// use gpui::{Bounds, WindowBounds, WindowOptions, point, px, size};
+///
+/// let bounds = Bounds::new(point(px(100.), px(100.)), size(px(800.), px(600.)));
+/// let options = WindowOptions::default()
+///     .window_bounds(WindowBounds::Windowed(bounds))
+///     .is_resizable(false)
+///     .titlebar(None);
+///
+/// assert_eq!(options.window_bounds, Some(WindowBounds::Windowed(bounds)));
+/// assert!(!options.is_resizable);
+/// assert!(options.titlebar.is_none());
+/// assert!(options.focus);
+/// ```
+///
+/// Create a window that doesn't take focus and opens hidden, so you can show it later:
+///
+/// ```
+/// use gpui::WindowOptions;
+///
+/// let options = WindowOptions::new().focus(false).show(false);
+///
+/// assert!(!options.focus);
+/// assert!(!options.show);
+/// ```
+#[derive(Debug, derive_setters::Setters)]
+#[setters(into)]
 pub struct WindowOptions {
-    /// Specifies the state and bounds of the window in screen coordinates.
-    /// - `None`: Inherit the bounds.
-    /// - `Some(WindowBounds)`: Open a window with corresponding state and its restore size.
+    /// The window's state and bounds in screen coordinates, in logical pixels.
+    ///
+    /// `None` inherits the bounds from the platform, and `Some` opens the window in the
+    /// given state. A `Windowed` window opens at the rectangle, and `Maximized` and
+    /// `Fullscreen` restore to the rectangle when left. Ignored on the web.
     pub window_bounds: Option<WindowBounds>,
 
-    /// The titlebar configuration of the window
+    /// The titlebar, or `None` for a window without one. Ignored on the web.
+    ///
+    /// The default is [`TitlebarOptions::default`], which shows the platform's titlebar with no title.
     pub titlebar: Option<TitlebarOptions>,
 
-    /// Whether the window should be focused when created
+    /// Whether the window takes keyboard focus when it opens. Defaults to `true`.
     pub focus: bool,
 
-    /// Whether the window should be shown when created
+    /// Whether the window appears when it opens. Set it to `false` to show the window later
+    /// with [`PlatformWindow::set_visible`].
     pub show: bool,
 
-    /// The kind of window to create
+    /// The kind of window to create. Defaults to [`WindowKind::Normal`]. On the web, only `Normal` works.
     pub kind: WindowKind,
 
-    /// Whether the window can be moved by the user. When `false`, the user cannot drag
-    /// the window (on macOS this sets `NSWindow.isMovable`, which also disables the
-    /// Window-menu tiling items); programmatic moves are still allowed.
+    /// Whether the user can drag the window. Defaults to `true`. macOS and Windows use this
+    /// value. Linux and the web ignore it. Programmatic moves still work.
     pub is_movable: bool,
 
     /// Whether the application owns dragging of the (custom) titlebar, rather than
@@ -1910,35 +3710,65 @@ pub struct WindowOptions {
     /// Leave this `false` for windows that rely on AppKit's native titlebar dragging.
     pub app_owns_titlebar_drag: bool,
 
-    /// Whether the window should be resizable by the user
+    /// The minimum time between animation frames while the window is inactive.
+    ///
+    /// Defaults to about 30 frames per second. Set `None` to draw inactive windows at the
+    /// full frame rate.
+    pub inactive_frame_interval: Option<Duration>,
+
+    /// Whether the user can resize the window. Defaults to `true`. Ignored on the web.
     pub is_resizable: bool,
 
-    /// Whether the window should be minimized by the user
+    /// Whether the user can minimize the window. Defaults to `true`. Ignored on the web.
     pub is_minimizable: bool,
 
-    /// The display to create the window on, if this is None,
-    /// the window will be created on the main display
+    /// The display to open the window on, or `None` for the primary display. Ignored on the web.
     pub display_id: Option<DisplayId>,
 
-    /// The appearance of the window background.
-    pub window_background: WindowBackgroundAppearance,
+    /// The background appearance of a macOS window.
+    #[cfg(target_os = "macos")]
+    pub macos_window_background: MacosWindowBackground,
 
-    /// Application identifier of the window. Can by used by desktop environments to group applications together.
+    /// The background appearance of a Windows window.
+    #[cfg(target_os = "windows")]
+    pub windows_window_background: WindowsWindowBackground,
+
+    /// The background appearance of a Linux window.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub linux_window_background: LinuxWindowBackground,
+
+    /// The background appearance of a web window.
+    #[cfg(target_family = "wasm")]
+    pub web_window_background: WebWindowBackground,
+
+    /// The application id that desktop environments use to group windows and find the desktop entry.
+    ///
+    /// Linux only. Other platforms ignore it.
     pub app_id: Option<String>,
 
-    /// Window minimum size
+    /// The smallest size the user can resize the window to, in logical pixels. `None` sets no minimum.
+    /// Ignored on the web.
     pub window_min_size: Option<Size<Pixels>>,
 
-    /// Whether to use client or server-side decorations on X11 and Wayland.
-    /// The platform may ignore requests it cannot satisfy.
+    /// Whether the window draws its own decorations (client-side) or the window server does (server-side).
+    ///
+    /// `None` uses the server's default. Linux's Wayland and X11 backends honor it, and
+    /// the other backends ignore it. The platform may ignore requests it can't satisfy.
     pub window_decorations: Option<WindowDecorations>,
 
-    /// Icon image (X11 only)
+    /// The window's icon, from an RGBA image. Linux only, and Wayland needs the
+    /// `xdg-toplevel-icon` protocol to show it.
     pub icon: Option<Arc<image::RgbaImage>>,
 
-    /// Tab group name, allows opening the window as a native tab on macOS 10.12+. Windows with the same tabbing identifier will be grouped together.
+    /// The name of the native tab group. Windows with the same identifier open as tabs of one window.
+    /// macOS only.
     pub tabbing_identifier: Option<String>,
+
+    /// Whether to render the window using the Display P3 color space on macOS.
+    pub use_display_p3: bool,
 }
+
+impl FluentBuilder for WindowOptions {}
 
 /// The variables that can be configured when creating a new window
 #[derive(Debug)]
@@ -1949,8 +3779,13 @@ pub struct WindowOptions {
     ),
     allow(dead_code)
 )]
+/// The platform-level options for one window, passed to [`Platform::open_window`].
+///
+/// [`WindowOptions`] is the public form. GPUI resolves its fields into these parameters,
+/// with `bounds` already computed.
 #[allow(missing_docs)]
 pub struct WindowParams {
+    /// The window's initial bounds, in logical pixels.
     pub bounds: Bounds<Pixels>,
 
     /// The titlebar configuration of the window
@@ -1970,6 +3805,7 @@ pub struct WindowParams {
         any(target_os = "linux", target_os = "freebsd", target_os = "windows"),
         allow(dead_code)
     )]
+    /// Whether the application owns dragging of the custom titlebar. macOS only. See [`WindowOptions::app_owns_titlebar_drag`].
     pub app_owns_titlebar_drag: bool,
 
     /// Whether the window should be resizable by the user
@@ -1984,28 +3820,40 @@ pub struct WindowParams {
         any(target_os = "linux", target_os = "freebsd", target_os = "windows"),
         allow(dead_code)
     )]
+    /// Whether the window takes keyboard focus when it opens.
     pub focus: bool,
 
+    /// Whether the window appears when it opens.
     #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
     pub show: bool,
 
-    /// An image to set as the window icon (x11 only)
+    /// An image to set as the window icon (X11 and Wayland only)
+    /// Wayland requires the xdg-toplevel-icon protocol to be available
     #[cfg_attr(feature = "wayland", allow(dead_code))]
     pub icon: Option<Arc<image::RgbaImage>>,
 
+    /// The display to open the window on, or `None` for the primary display.
     #[cfg_attr(feature = "wayland", allow(dead_code))]
     pub display_id: Option<DisplayId>,
 
+    /// The application id for desktop environments to group windows. Linux only.
     #[cfg_attr(feature = "wayland", allow(dead_code))]
     pub app_id: Option<String>,
 
+    /// The smallest size the user can resize the window to, in logical pixels.
     pub window_min_size: Option<Size<Pixels>>,
 
+    /// The name of the native tab group. macOS only.
     #[cfg(target_os = "macos")]
     pub tabbing_identifier: Option<String>,
+
+    #[cfg(target_os = "macos")]
+    pub use_display_p3: bool,
 }
 
-/// Represents the status of how a window should be opened.
+/// The state a window opens in, with the bounds it uses for that state.
+///
+/// Set it with [`WindowOptions::window_bounds`]. The bounds are in screen coordinates.
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum WindowBounds {
     /// Indicates that the window should open in a windowed state with the given bounds.
@@ -2025,7 +3873,7 @@ impl Default for WindowBounds {
 }
 
 impl WindowBounds {
-    /// Retrieve the inner bounds
+    /// Returns the bounds, whatever the state. For a maximized or fullscreen window these are the restore bounds.
     pub fn get_bounds(&self) -> Bounds<Pixels> {
         match self {
             WindowBounds::Windowed(bounds) => *bounds,
@@ -2034,7 +3882,9 @@ impl WindowBounds {
         }
     }
 
-    /// Creates a new window bounds that centers the window on the screen.
+    /// Returns `WindowBounds::Windowed` with `size`, centered on the primary display.
+    ///
+    /// Use [`Bounds::centered`] to center on another display.
     pub fn centered(size: Size<Pixels>, cx: &App) -> Self {
         WindowBounds::Windowed(Bounds::centered(None, size, cx))
     }
@@ -2054,41 +3904,109 @@ impl Default for WindowOptions {
             kind: WindowKind::Normal,
             is_movable: true,
             app_owns_titlebar_drag: false,
+            inactive_frame_interval: Some(Duration::from_micros(33_333)),
             is_resizable: true,
             is_minimizable: true,
             display_id: None,
-            window_background: WindowBackgroundAppearance::default(),
+            #[cfg(target_os = "macos")]
+            macos_window_background: MacosWindowBackground::default(),
+            #[cfg(target_os = "windows")]
+            windows_window_background: WindowsWindowBackground::default(),
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            linux_window_background: LinuxWindowBackground::default(),
+            #[cfg(target_family = "wasm")]
+            web_window_background: WebWindowBackground::default(),
             icon: None,
             app_id: None,
             window_min_size: None,
             window_decorations: None,
             tabbing_identifier: None,
+            use_display_p3: false,
         }
     }
 }
 
-/// The options that can be configured for a window's titlebar
-#[derive(Debug, Default)]
+impl WindowOptions {
+    /// Returns window options with the platform's defaults: a focused, shown,
+    /// resizable, minimizable, movable normal window with a titlebar.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the window's background appearance for the current platform,
+    /// erased into the renderer-facing [`WindowBackgroundAppearance`].
+    pub fn background_appearance(&self) -> WindowBackgroundAppearance {
+        #[cfg(target_os = "macos")]
+        {
+            self.macos_window_background.into()
+        }
+        #[cfg(target_os = "windows")]
+        {
+            self.windows_window_background.into()
+        }
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        {
+            self.linux_window_background.into()
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            self.web_window_background.into()
+        }
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "windows",
+            any(target_os = "linux", target_os = "freebsd"),
+            target_family = "wasm",
+        )))]
+        {
+            WindowBackgroundAppearance::default()
+        }
+    }
+}
+
+/// Options for a window's titlebar.
+///
+/// Chain setters on [`TitlebarOptions::default`] and pass the result to
+/// [`WindowOptions::titlebar`]. Pass `None` to clear the title or traffic light position.
+///
+/// ```
+/// use gpui::{SharedString, TitlebarOptions, point, px};
+///
+/// let titlebar = TitlebarOptions::default()
+///     .title(SharedString::from("My app"))
+///     .appears_transparent(true)
+///     .traffic_light_position(point(px(16.0), px(16.0)));
+///
+/// assert_eq!(titlebar.title, Some(SharedString::from("My app")));
+/// assert!(titlebar.appears_transparent);
+/// ```
+#[derive(Debug, Default, derive_setters::Setters)]
+#[setters(into)]
 pub struct TitlebarOptions {
-    /// The initial title of the window
+    /// The window's initial title. The web backend ignores it.
     pub title: Option<SharedString>,
 
-    /// Should the default system titlebar be hidden to allow for a custom-drawn titlebar? (macOS and Windows only)
-    /// Refer to [`WindowOptions::window_decorations`] on Linux
+    /// Whether to hide the system titlebar so you can draw your own. macOS and Windows only.
+    /// On Linux, use [`WindowOptions::window_decorations`] instead.
     pub appears_transparent: bool,
 
-    /// The position of the macOS traffic light buttons
+    /// The position of the macOS traffic-light buttons, in logical pixels. macOS only.
     pub traffic_light_position: Option<Point<Pixels>>,
 }
 
-/// The kind of window to create
+impl FluentBuilder for TitlebarOptions {}
+
+/// The kind of window to create, set with [`WindowOptions::kind`].
+///
+/// On the web, only `Normal` works. The other kinds return an error from
+/// [`App::open_window`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WindowKind {
     /// A normal application window
     Normal,
 
-    /// A window that appears above all other windows, usually used for alerts or popups
-    /// use sparingly!
+    /// A window that appears above all other windows, usually used for alerts or popups.
+    /// Use it sparingly.
     PopUp,
 
     /// A parent-anchored, platform-native popup window for menus, comboboxes, context menus and
@@ -2099,7 +4017,7 @@ pub enum WindowKind {
     /// implementation reject it with [`popup::PopupNotSupportedError`].
     AnchoredPopup(popup::PopupOptions),
 
-    /// A floating window that appears on top of its parent window
+    /// A floating window that appears on top of its parent window.
     Floating,
 
     /// A Wayland LayerShell window, used to draw overlays or backgrounds for applications such as
@@ -2108,14 +4026,13 @@ pub enum WindowKind {
     LayerShell(layer_shell::LayerShellOptions),
 
     /// A window that appears on top of its parent window and blocks interaction with it
-    /// until the modal window is closed
+    /// until the modal window is closed.
     Dialog,
 }
 
-/// The appearance of the window, as defined by the operating system.
+/// The light or dark appearance of a window, as the operating system defines it.
 ///
-/// On macOS, this corresponds to named [`NSAppearance`](https://developer.apple.com/documentation/appkit/nsappearance)
-/// values.
+/// Read it with [`Window::appearance`]. [`Platform::set_window_appearance`] can override the system's setting on macOS.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum WindowAppearance {
     /// A light appearance.
@@ -2140,8 +4057,12 @@ pub enum WindowAppearance {
     VibrantDark,
 }
 
-/// The appearance of the background of the window itself, when there is
-/// no content or the content is transparent.
+/// How a window's background is drawn when there is no content or the content is transparent.
+///
+/// The variants a platform supports depend on the target. The Mica backdrop materials
+/// are supported only on Windows 11, and are ignored elsewhere. Set the appearance
+/// with the `macos_window_background`, `windows_window_background`,
+/// `linux_window_background` or `web_window_background` field of [`WindowOptions`].
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub enum WindowBackgroundAppearance {
     /// Opaque.
@@ -2165,7 +4086,204 @@ pub enum WindowBackgroundAppearance {
     MicaAltBackdrop,
 }
 
-/// The text rendering mode to use for drawing glyphs.
+impl WindowBackgroundAppearance {
+    /// Whether the window's background hides everything behind the window,
+    /// letting the platform skip compositing the content it covers.
+    pub fn is_opaque(&self) -> bool {
+        matches!(self, Self::Opaque)
+    }
+
+    /// Whether the window's background lets content behind the window show
+    /// through, either directly, blurred, or via a system backdrop material.
+    pub fn is_transparent(&self) -> bool {
+        !self.is_opaque()
+    }
+}
+
+#[cfg(test)]
+mod window_background_appearance_tests {
+    use super::WindowBackgroundAppearance;
+
+    #[test]
+    fn only_opaque_hides_the_content_behind_the_window() {
+        assert!(WindowBackgroundAppearance::Opaque.is_opaque());
+        assert!(!WindowBackgroundAppearance::Opaque.is_transparent());
+
+        for appearance in [
+            WindowBackgroundAppearance::Transparent,
+            WindowBackgroundAppearance::Blurred,
+            WindowBackgroundAppearance::MicaBackdrop,
+            WindowBackgroundAppearance::MicaAltBackdrop,
+        ] {
+            assert!(appearance.is_transparent());
+            assert!(!appearance.is_opaque());
+        }
+    }
+}
+
+/// The background appearance of a macOS window, set through
+/// [`WindowOptions::macos_window_background`].
+#[cfg(target_os = "macos")]
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub enum MacosWindowBackground {
+    /// Hides everything behind the window. Themes should define a fully
+    /// opaque background color instead of relying on the system's.
+    #[default]
+    Opaque,
+    /// Plain alpha transparency.
+    Transparent,
+    /// Transparency with the contents behind the window blurred, via the
+    /// system's vibrancy materials.
+    Blurred,
+}
+
+/// The background appearance of a Windows window, set through
+/// [`WindowOptions::windows_window_background`].
+#[cfg(target_os = "windows")]
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub enum WindowsWindowBackground {
+    /// Hides everything behind the window. Themes should define a fully
+    /// opaque background color instead of relying on the system's.
+    #[default]
+    Opaque,
+    /// Plain alpha transparency.
+    Transparent,
+    /// Transparency with the contents behind the window blurred.
+    Blurred,
+    /// The Mica backdrop material, supported on Windows 11.
+    MicaBackdrop,
+    /// The Mica Alt backdrop material, supported on Windows 11.
+    MicaAltBackdrop,
+}
+
+/// The background appearance of a Linux window, set through
+/// [`WindowOptions::linux_window_background`]. Whether blurring is honored
+/// depends on the compositor; X11 treats it as plain transparency.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub enum LinuxWindowBackground {
+    /// Hides everything behind the window. Themes should define a fully
+    /// opaque background color instead of relying on the system's.
+    #[default]
+    Opaque,
+    /// Plain alpha transparency.
+    Transparent,
+    /// Transparency with the contents behind the window blurred, when the
+    /// compositor supports it.
+    Blurred,
+}
+
+/// The background appearance of a web window, set through
+/// `web_window_background`. Web windows are always opaque at
+/// the platform level.
+#[cfg(target_family = "wasm")]
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub enum WebWindowBackground {
+    /// The window background is always opaque.
+    #[default]
+    Opaque,
+}
+
+#[cfg(target_os = "macos")]
+impl From<MacosWindowBackground> for WindowBackgroundAppearance {
+    fn from(background: MacosWindowBackground) -> Self {
+        match background {
+            MacosWindowBackground::Opaque => Self::Opaque,
+            MacosWindowBackground::Transparent => Self::Transparent,
+            MacosWindowBackground::Blurred => Self::Blurred,
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl From<WindowsWindowBackground> for WindowBackgroundAppearance {
+    fn from(background: WindowsWindowBackground) -> Self {
+        match background {
+            WindowsWindowBackground::Opaque => Self::Opaque,
+            WindowsWindowBackground::Transparent => Self::Transparent,
+            WindowsWindowBackground::Blurred => Self::Blurred,
+            WindowsWindowBackground::MicaBackdrop => Self::MicaBackdrop,
+            WindowsWindowBackground::MicaAltBackdrop => Self::MicaAltBackdrop,
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+impl From<LinuxWindowBackground> for WindowBackgroundAppearance {
+    fn from(background: LinuxWindowBackground) -> Self {
+        match background {
+            LinuxWindowBackground::Opaque => Self::Opaque,
+            LinuxWindowBackground::Transparent => Self::Transparent,
+            LinuxWindowBackground::Blurred => Self::Blurred,
+        }
+    }
+}
+
+#[cfg(target_family = "wasm")]
+impl From<WebWindowBackground> for WindowBackgroundAppearance {
+    fn from(background: WebWindowBackground) -> Self {
+        match background {
+            WebWindowBackground::Opaque => Self::Opaque,
+        }
+    }
+}
+
+#[cfg(test)]
+mod platform_window_background_tests {
+    use super::WindowBackgroundAppearance;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_backgrounds_map_to_appearances() {
+        use super::MacosWindowBackground;
+        assert_eq!(
+            WindowBackgroundAppearance::from(MacosWindowBackground::Opaque),
+            WindowBackgroundAppearance::Opaque
+        );
+        assert_eq!(
+            WindowBackgroundAppearance::from(MacosWindowBackground::Blurred),
+            WindowBackgroundAppearance::Blurred
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_backgrounds_map_to_appearances() {
+        use super::WindowsWindowBackground;
+        assert_eq!(
+            WindowBackgroundAppearance::from(WindowsWindowBackground::MicaAltBackdrop),
+            WindowBackgroundAppearance::MicaAltBackdrop
+        );
+        assert_eq!(
+            WindowBackgroundAppearance::from(WindowsWindowBackground::default()),
+            WindowBackgroundAppearance::Opaque
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn linux_backgrounds_map_to_appearances() {
+        use super::LinuxWindowBackground;
+        assert_eq!(
+            WindowBackgroundAppearance::from(LinuxWindowBackground::Transparent),
+            WindowBackgroundAppearance::Transparent
+        );
+    }
+
+    #[cfg(target_family = "wasm")]
+    #[test]
+    fn web_backgrounds_map_to_appearances() {
+        use super::WebWindowBackground;
+        assert_eq!(
+            WindowBackgroundAppearance::from(WebWindowBackground::Opaque),
+            WindowBackgroundAppearance::Opaque
+        );
+    }
+}
+
+/// The text rendering mode for glyphs.
+///
+/// [`PlatformTextSystem::recommended_rendering_mode`] returns the platform's choice.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum TextRenderingMode {
     /// Use the platform's default text rendering mode.
@@ -2177,20 +4295,20 @@ pub enum TextRenderingMode {
     Grayscale,
 }
 
-/// The options that can be configured for a file dialog prompt
+/// Options for [`Platform::prompt_for_paths`], which shows a file or folder picker.
 #[derive(Clone, Debug)]
 pub struct PathPromptOptions {
-    /// Should the prompt allow files to be selected?
+    /// Whether the user can pick files.
     pub files: bool,
-    /// Should the prompt allow directories to be selected?
+    /// Whether the user can pick directories.
     pub directories: bool,
-    /// Should the prompt allow multiple files to be selected?
+    /// Whether the user can pick more than one item.
     pub multiple: bool,
-    /// The prompt to show to a user when selecting a path
+    /// Text that explains the request in the picker, on platforms that display it.
     pub prompt: Option<SharedString>,
 }
 
-/// What kind of prompt styling to show
+/// How serious a prompt is. The platform uses it to choose the alert's icon or style.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum PromptLevel {
     /// A prompt that is shown when the user should be notified of something
@@ -2203,7 +4321,18 @@ pub enum PromptLevel {
     Critical,
 }
 
-/// Prompt Button
+/// A button on a prompt shown with [`PlatformWindow::prompt`].
+///
+/// The variant tells the platform the button's role, such as the default or cancel action.
+/// Use [`PromptButton::from`] to get a role from a label: `"ok"` and `"cancel"`,
+/// in any case, become `Ok` and `Cancel`, and any other text becomes `Other`.
+///
+/// ```
+/// use gpui::PromptButton;
+///
+/// assert_eq!(PromptButton::from("ok"), PromptButton::Ok("OK".into()));
+/// assert_eq!(PromptButton::from("Delete"), PromptButton::Other("Delete".into()));
+/// ```
 #[derive(Clone, Debug, PartialEq)]
 pub enum PromptButton {
     /// Ok button
@@ -2215,28 +4344,28 @@ pub enum PromptButton {
 }
 
 impl PromptButton {
-    /// Create a button with label
+    /// Creates a button with `label` and no special role.
     pub fn new(label: impl Into<SharedString>) -> Self {
         PromptButton::Other(label.into())
     }
 
-    /// Create an Ok button
+    /// Creates a button with the [`PromptButton::Ok`] role.
     pub fn ok(label: impl Into<SharedString>) -> Self {
         PromptButton::Ok(label.into())
     }
 
-    /// Create a Cancel button
+    /// Creates a button with the [`PromptButton::Cancel`] role.
     pub fn cancel(label: impl Into<SharedString>) -> Self {
         PromptButton::Cancel(label.into())
     }
 
-    /// Returns true if this button is a cancel button.
+    /// Returns `true` if this is the cancel button.
     #[allow(dead_code)]
     pub fn is_cancel(&self) -> bool {
         matches!(self, PromptButton::Cancel(_))
     }
 
-    /// Returns the label of the button
+    /// Returns the button's label.
     pub fn label(&self) -> &SharedString {
         match self {
             PromptButton::Ok(label) => label,
@@ -2256,10 +4385,10 @@ impl From<&str> for PromptButton {
     }
 }
 
-/// The style of the cursor (pointer)
+/// The shape of the mouse cursor. Each variant names the CSS cursor it maps to on the web.
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum CursorStyle {
-    /// The default cursor
+    /// The default cursor, corresponds to the CSS cursor value `default`
     #[default]
     Arrow,
 
@@ -2284,11 +4413,11 @@ pub enum CursorStyle {
     PointingHand,
 
     /// A resize left cursor
-    /// corresponds to the CSS cursor value `w-resize`
+    /// corresponds to the CSS cursor value `ew-resize`
     ResizeLeft,
 
     /// A resize right cursor
-    /// corresponds to the CSS cursor value `e-resize`
+    /// corresponds to the CSS cursor value `ew-resize`
     ResizeRight,
 
     /// A resize cursor to the left and right
@@ -2296,23 +4425,35 @@ pub enum CursorStyle {
     ResizeLeftRight,
 
     /// A resize up cursor
-    /// corresponds to the CSS cursor value `n-resize`
+    /// corresponds to the CSS cursor value `ns-resize`
     ResizeUp,
 
     /// A resize down cursor
-    /// corresponds to the CSS cursor value `s-resize`
+    /// corresponds to the CSS cursor value `ns-resize`
     ResizeDown,
 
     /// A resize cursor directing up and down
     /// corresponds to the CSS cursor value `ns-resize`
     ResizeUpDown,
 
+    /// A cursor for the upper-left resize edge (`nw-resize`).
+    ResizeUpLeft,
+
+    /// A cursor for the upper-right resize edge (`ne-resize`).
+    ResizeUpRight,
+
+    /// A cursor for the lower-left resize edge (`sw-resize`).
+    ResizeDownLeft,
+
+    /// A cursor for the lower-right resize edge (`se-resize`).
+    ResizeDownRight,
+
     /// A resize cursor directing up-left and down-right
-    /// corresponds to the CSS cursor value `nesw-resize`
+    /// corresponds to the CSS cursor value `nwse-resize`
     ResizeUpLeftDownRight,
 
     /// A resize cursor directing up-right and down-left
-    /// corresponds to the CSS cursor value `nwse-resize`
+    /// corresponds to the CSS cursor value `nesw-resize`
     ResizeUpRightDownLeft,
 
     /// A cursor indicating that the item/column can be resized horizontally.
@@ -2344,14 +4485,67 @@ pub enum CursorStyle {
     ContextualMenu,
 }
 
-/// A clipboard item that should be copied to the clipboard
+/// Something to put on the clipboard, or something read from it.
+///
+/// An item holds one or more [`ClipboardEntry`] values, such as text, an image or file
+/// paths. Use [`App::write_to_clipboard`] to copy an item, and
+/// [`App::read_from_clipboard`] to read one.
+///
+/// # Examples
+///
+/// ```
+/// use gpui::{ClipboardEntry, ClipboardItem};
+///
+/// let item = ClipboardItem::new_string("hello".to_string());
+/// assert_eq!(item.text().as_deref(), Some("hello"));
+/// assert_eq!(item.metadata(), None);
+///
+/// let item = ClipboardItem::new_string_with_json_metadata("1, 2, 3".to_string(), vec![1, 2, 3]);
+/// assert_eq!(item.metadata().map(String::as_str), Some("[1,2,3]"));
+///
+/// let ClipboardEntry::String(entry) = &item.entries()[0] else {
+///     panic!("expected a string entry");
+/// };
+/// assert_eq!(entry.metadata_json::<Vec<i32>>(), Some(vec![1, 2, 3]));
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClipboardItem {
     /// The entries in this clipboard item.
     pub entries: Vec<ClipboardEntry>,
 }
 
-/// Either a ClipboardString or a ClipboardImage
+/// An error from [`Platform::read_from_clipboard_async`]. Each variant calls for different guidance to the user.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClipboardReadError {
+    /// The platform clipboard is not available in this context, e.g. the
+    /// browser does not expose the async clipboard API or the page is not a
+    /// secure context.
+    Unavailable,
+    /// The platform refused access, e.g. the user declined the browser's
+    /// clipboard permission prompt or paste confirmation.
+    Denied(String),
+    /// The clipboard contents could not be converted into a
+    /// [`ClipboardItem`].
+    UnsupportedContent,
+}
+
+impl std::fmt::Display for ClipboardReadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable => formatter.write_str("the clipboard is unavailable"),
+            Self::Denied(message) => {
+                write!(formatter, "clipboard access was denied: {message}")
+            }
+            Self::UnsupportedContent => {
+                formatter.write_str("the clipboard contents are unsupported")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ClipboardReadError {}
+
+/// One part of a [`ClipboardItem`]: a string, an image or a list of file paths.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClipboardEntry {
     /// A string entry
@@ -2363,14 +4557,16 @@ pub enum ClipboardEntry {
 }
 
 impl ClipboardItem {
-    /// Create a new ClipboardItem::String with no associated metadata
+    /// Creates an item holding `text`, with no metadata.
     pub fn new_string(text: String) -> Self {
         Self {
             entries: vec![ClipboardEntry::String(ClipboardString::new(text))],
         }
     }
 
-    /// Create a new ClipboardItem::String with the given text and associated metadata
+    /// Creates an item holding `text` and a raw `metadata` string.
+    ///
+    /// Use [`ClipboardItem::new_string_with_json_metadata`] to store structured data.
     pub fn new_string_with_metadata(text: String, metadata: String) -> Self {
         Self {
             entries: vec![ClipboardEntry::String(ClipboardString {
@@ -2380,7 +4576,13 @@ impl ClipboardItem {
         }
     }
 
-    /// Create a new ClipboardItem::String with the given text and associated metadata
+    /// Creates an item holding `text` and `metadata`, serialized as JSON.
+    ///
+    /// Read the metadata back with [`ClipboardString::metadata_json`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `metadata` can't be serialized to JSON, such as a map with non-string keys.
     pub fn new_string_with_json_metadata<T: Serialize>(text: String, metadata: T) -> Self {
         Self {
             entries: vec![ClipboardEntry::String(
@@ -2389,15 +4591,17 @@ impl ClipboardItem {
         }
     }
 
-    /// Create a new ClipboardItem::Image with the given image with no associated metadata
+    /// Creates an item holding a copy of `image`.
     pub fn new_image(image: &Image) -> Self {
         Self {
             entries: vec![ClipboardEntry::Image(image.clone())],
         }
     }
 
-    /// Concatenates together all the ClipboardString entries in the item.
-    /// Returns None if there were no ClipboardString entries.
+    /// Returns the text of all string entries joined together, or `None` if the item has no text.
+    ///
+    /// If the string entries contain no text, the file paths of any [`ClipboardEntry::ExternalPaths`]
+    /// entries are joined with no separator instead. The result is `None` if there are no paths either.
     pub fn text(&self) -> Option<String> {
         let mut answer = String::new();
 
@@ -2425,7 +4629,9 @@ impl ClipboardItem {
         }
     }
 
-    /// If this item is one ClipboardEntry::String, returns its metadata.
+    /// Returns the metadata of the item's string entry, or `None`.
+    ///
+    /// Returns `None` unless the item has exactly one entry and that entry is a string.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub fn metadata(&self) -> Option<&String> {
         match self.entries().first() {
@@ -2436,12 +4642,12 @@ impl ClipboardItem {
         }
     }
 
-    /// Get the item's entries
+    /// Returns the item's entries.
     pub fn entries(&self) -> &[ClipboardEntry] {
         &self.entries
     }
 
-    /// Get owned versions of the item's entries
+    /// Consumes the item and returns its entries.
     pub fn into_entries(self) -> impl Iterator<Item = ClipboardEntry> {
         self.entries.into_iter()
     }
@@ -2485,7 +4691,7 @@ impl From<Image> for ClipboardItem {
     }
 }
 
-/// One of the editor's supported image formats (e.g. PNG, JPEG) - used when dealing with images in the clipboard
+/// An image format GPUI recognizes in clipboard data and in [`Image`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq, EnumIter, Hash)]
 pub enum ImageFormat {
     // Sorted from most to least likely to be pasted into an editor,
@@ -2512,7 +4718,7 @@ pub enum ImageFormat {
 }
 
 impl ImageFormat {
-    /// Returns the mime type for the ImageFormat
+    /// Returns the canonical MIME type, such as `image/png`.
     pub const fn mime_type(self) -> &'static str {
         match self {
             ImageFormat::Png => "image/png",
@@ -2542,7 +4748,17 @@ impl ImageFormat {
         }
     }
 
-    /// Returns the ImageFormat for the given mime type, including known aliases.
+    /// Returns the format for `mime_type`, or `None` if the type is unknown.
+    ///
+    /// The aliases `image/jpg` and `image/tif` map to [`ImageFormat::Jpeg`] and [`ImageFormat::Tiff`].
+    ///
+    /// ```
+    /// use gpui::ImageFormat;
+    ///
+    /// assert_eq!(ImageFormat::from_mime_type("image/jpg"), Some(ImageFormat::Jpeg));
+    /// assert_eq!(ImageFormat::Png.extension(), "png");
+    /// assert_eq!(ImageFormat::from_mime_type("text/plain"), None);
+    /// ```
     pub fn from_mime_type(mime_type: &str) -> Option<Self> {
         use strum::IntoEnumIterator;
         Self::iter()
@@ -2562,14 +4778,17 @@ impl ImageFormat {
     }
 }
 
-/// An image, with a format and certain bytes
+/// Encoded image data and the format it is encoded in.
+///
+/// Use [`Image::from_bytes`] to create one. GPUI decodes it for display through
+/// [`Image::to_image_data`] or the asset APIs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Image {
-    /// The image format the bytes represent (e.g. PNG)
+    /// The format the bytes are encoded in, such as PNG.
     pub format: ImageFormat,
-    /// The raw image bytes
+    /// The encoded image bytes.
     pub bytes: Vec<u8>,
-    /// The unique ID for the image
+    /// A key for the image in GPUI's asset cache. [`Image::from_bytes`] sets it to a hash of `bytes`.
     pub id: u64,
 }
 
@@ -2607,12 +4826,14 @@ impl Hash for Image {
 }
 
 impl Image {
-    /// An empty image containing no data
+    /// Returns a PNG image with no bytes. It can't be decoded.
     pub fn empty() -> Self {
         Self::from_bytes(ImageFormat::Png, Vec::new())
     }
 
-    /// Create an image from a format and bytes
+    /// Creates an image from `format` and encoded `bytes`.
+    ///
+    /// The [`Image::id`] is a hash of `bytes` alone, so two images with the same bytes but different formats share an id.
     pub fn from_bytes(format: ImageFormat, bytes: Vec<u8>) -> Self {
         Self {
             id: hash(&bytes),
@@ -2621,12 +4842,14 @@ impl Image {
         }
     }
 
-    /// Get this image's ID
+    /// Returns the image's cache key. [`Image::from_bytes`] sets it from a hash of the bytes.
     pub fn id(&self) -> u64 {
         self.id
     }
 
-    /// Use the GPUI `use_asset` API to make this image renderable
+    /// Returns the decoded image, starting the load if it isn't cached yet.
+    ///
+    /// Returns `None` while the image is loading, or if it can't be decoded. Call it from a render method, so the window redraws when the load finishes.
     pub fn use_render_image(
         self: Arc<Self>,
         window: &mut Window,
@@ -2637,7 +4860,7 @@ impl Image {
             .and_then(|result| result.ok())
     }
 
-    /// Use the GPUI `get_asset` API to make this image renderable
+    /// Returns the decoded image if it's already cached. Doesn't start a load.
     pub fn get_render_image(
         self: Arc<Self>,
         window: &mut Window,
@@ -2648,7 +4871,7 @@ impl Image {
             .and_then(|result| result.ok())
     }
 
-    /// Use the GPUI `remove_asset` API to drop this image, if possible.
+    /// Removes the decoded image from GPUI's asset cache.
     pub fn remove_asset(self: Arc<Self>, cx: &mut App) {
         ImageSource::Image(self).remove_asset(cx);
     }
@@ -2660,7 +4883,14 @@ impl Image {
         ImageSource::Image(self.clone()).is_asset_cached(cx)
     }
 
-    /// Convert the clipboard image to an `ImageData` object.
+    /// Decodes the image into a [`RenderImage`] that you can paint.
+    ///
+    /// SVG images are rendered at scale `1.0`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bytes can't be decoded. For a GIF, frames that fail to
+    /// decode are skipped and logged, and an error is returned only when every frame fails.
     pub fn to_image_data(&self, svg_renderer: SvgRenderer) -> Result<Arc<RenderImage>> {
         let frames = match self.format {
             ImageFormat::Gif => {
@@ -2705,18 +4935,21 @@ impl Image {
         Ok(Arc::new(RenderImage::new(frames)))
     }
 
-    /// Get the format of the clipboard image
+    /// Returns the image's format.
     pub fn format(&self) -> ImageFormat {
         self.format
     }
 
-    /// Get the raw bytes of the clipboard image
+    /// Returns the encoded image bytes.
     pub fn bytes(&self) -> &[u8] {
         self.bytes.as_slice()
     }
 }
 
-/// A clipboard item that should be copied to the clipboard
+/// A string on the clipboard, with optional metadata.
+///
+/// Metadata lets an application record more about copied text, such as where it came
+/// from. The metadata is stored with the text and read back with [`ClipboardString::metadata_json`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClipboardString {
     /// The text content.
@@ -2726,7 +4959,7 @@ pub struct ClipboardString {
 }
 
 impl ClipboardString {
-    /// Create a new clipboard string with the given text
+    /// Creates a clipboard string with `text` and no metadata.
     pub fn new(text: String) -> Self {
         Self {
             text,
@@ -2734,24 +4967,29 @@ impl ClipboardString {
         }
     }
 
-    /// Return a new clipboard item with the metadata replaced by the given metadata,
-    /// after serializing it as JSON.
+    /// Sets the metadata to `metadata`, serialized as JSON. Returns the updated string.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `metadata` can't be serialized to JSON.
     pub fn with_json_metadata<T: Serialize>(mut self, metadata: T) -> Self {
         self.metadata = Some(serde_json::to_string(&metadata).unwrap());
         self
     }
 
-    /// Get the text of the clipboard string
+    /// Returns the text.
     pub fn text(&self) -> &String {
         &self.text
     }
 
-    /// Get the owned text of the clipboard string
+    /// Consumes the string and returns its text.
     pub fn into_text(self) -> String {
         self.text
     }
 
-    /// Get the metadata of the clipboard string, formatted as JSON
+    /// Returns the metadata deserialized as `T`.
+    ///
+    /// Returns `None` if there is no metadata or it doesn't deserialize as `T`.
     pub fn metadata_json<T>(&self) -> Option<T>
     where
         T: for<'a> Deserialize<'a>,
@@ -2761,8 +4999,8 @@ impl ClipboardString {
             .and_then(|m| serde_json::from_str(m).ok())
     }
 
+    /// Returns a hash of `text`. Use it to detect whether the clipboard text has changed.
     #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
-    /// Compute a hash of the given text for clipboard change detection.
     pub fn text_hash(text: &str) -> u64 {
         let mut hasher = SeaHasher::new();
         text.hash(&mut hasher);
@@ -2780,7 +5018,68 @@ impl From<String> for ClipboardString {
 }
 
 #[cfg(test)]
+mod ime_candidate_bounds_tests {
+    use super::*;
+    use crate::size;
+
+    // Offsets 0..3 sit on the first visual line and the rest wrap onto the second.
+    fn bounds_at(offset: usize) -> Bounds<Pixels> {
+        let line = if offset < 3 { 0. } else { 20. };
+        Bounds::new(point(px(offset as f32), px(line)), size(px(1.), px(20.)))
+    }
+
+    fn candidate_bounds(
+        marked_range: Option<Range<usize>>,
+        selection: UTF16Selection,
+    ) -> Option<Bounds<Pixels>> {
+        PlatformInputHandler::compute_ime_candidate_bounds(marked_range, &selection, |range| {
+            Some(bounds_at(range.start))
+        })
+    }
+
+    #[test]
+    fn composition_follows_the_active_end_of_a_reversed_selection() {
+        // The caret is at offset 2 on the first line, so the candidate window
+        // stays at the start of the composition instead of the wrapped line.
+        let bounds = candidate_bounds(
+            Some(0..8),
+            UTF16Selection {
+                range: 2..7,
+                reversed: true,
+            },
+        );
+        assert_eq!(bounds, Some(bounds_at(0)));
+    }
+
+    #[test]
+    fn composition_uses_the_start_of_the_caret_line() {
+        let bounds = candidate_bounds(
+            Some(0..8),
+            UTF16Selection {
+                range: 2..7,
+                reversed: false,
+            },
+        );
+        assert_eq!(bounds, Some(bounds_at(3)));
+    }
+
+    #[test]
+    fn without_composition_uses_the_active_end() {
+        let bounds = candidate_bounds(
+            None,
+            UTF16Selection {
+                range: 2..7,
+                reversed: true,
+            },
+        );
+        assert_eq!(bounds, Some(bounds_at(2)));
+    }
+}
+
+#[cfg(test)]
 mod image_tests {
+    use crate::{AssetRegistry, size};
+
     use super::*;
     use std::sync::Arc;
 
@@ -2788,10 +5087,12 @@ mod image_tests {
     fn test_image_to_image_data_applies_exif_orientation() {
         let image = Image::from_bytes(
             ImageFormat::Jpeg,
-            include_bytes!("../examples/legacy/image/exif-orientation-rotate-180.jpg").to_vec(),
+            include_bytes!("../tests/fixtures/exif-orientation-rotate-180.jpg").to_vec(),
         );
 
-        let render_image = image.to_image_data(SvgRenderer::new(Arc::new(()))).unwrap();
+        let render_image = image
+            .to_image_data(SvgRenderer::new(Arc::new(AssetRegistry::default())))
+            .unwrap();
 
         assert_eq!(render_image.size(0), size(16.into(), 32.into()));
 
@@ -2810,7 +5111,9 @@ mod image_tests {
                 .to_vec(),
         );
 
-        let render_image = image.to_image_data(SvgRenderer::new(Arc::new(()))).unwrap();
+        let render_image = image
+            .to_image_data(SvgRenderer::new(Arc::new(AssetRegistry::default())))
+            .unwrap();
         let bytes = render_image.as_bytes(0).unwrap();
 
         for pixel in bytes.chunks_exact(4) {
@@ -2819,10 +5122,188 @@ mod image_tests {
     }
 }
 
+#[cfg(test)]
+mod atlas_tests {
+    use super::*;
+
+    const TILE_SIZE: Size<DevicePixels> = Size {
+        width: DevicePixels(1),
+        height: DevicePixels(1),
+    };
+
+    #[derive(Default)]
+    struct RecordingAtlasBackend {
+        insert_calls: u32,
+        fail_next_insert: bool,
+        removed_tiles: Vec<AtlasTile>,
+    }
+
+    impl AtlasBackend for RecordingAtlasBackend {
+        fn insert(
+            &mut self,
+            kind: AtlasTextureKind,
+            size: Size<DevicePixels>,
+            _bytes: &[u8],
+        ) -> Result<AtlasTile> {
+            self.insert_calls += 1;
+            if std::mem::take(&mut self.fail_next_insert) {
+                anyhow::bail!("backend failed");
+            }
+            Ok(AtlasTile {
+                texture_id: AtlasTextureId { index: 0, kind },
+                tile_id: TileId(self.insert_calls),
+                padding: 0,
+                bounds: Bounds {
+                    origin: Point::default(),
+                    size,
+                },
+            })
+        }
+
+        fn remove(&mut self, tile: AtlasTile) {
+            self.removed_tiles.push(tile);
+        }
+    }
+
+    fn image_key(image_id: usize) -> AtlasKey {
+        AtlasKey::Image(RenderImageParams {
+            image_id: crate::ImageId(image_id),
+            frame_index: 0,
+        })
+    }
+
+    fn build_tile() -> Result<Option<(Size<DevicePixels>, Cow<'static, [u8]>)>> {
+        Ok(Some((TILE_SIZE, Cow::Borrowed(&[0, 0, 0, 255]))))
+    }
+
+    #[test]
+    fn only_successful_inserts_are_cached() -> Result<()> {
+        let mut state = AtlasState::new(RecordingAtlasBackend::default());
+        let key = image_key(1);
+
+        assert_eq!(
+            state.get_or_insert_with(key.clone(), &mut || Ok(None))?,
+            None
+        );
+        state
+            .get_or_insert_with(key.clone(), &mut || anyhow::bail!("builder failed"))
+            .expect_err("builder error should propagate");
+        assert!(!state.contains(&key));
+        assert_eq!(state.backend.insert_calls, 0);
+
+        state.backend.fail_next_insert = true;
+        state
+            .get_or_insert_with(key.clone(), &mut build_tile)
+            .expect_err("backend error should propagate");
+        assert!(!state.contains(&key));
+        assert_eq!(state.backend.insert_calls, 1);
+
+        let tile = state
+            .get_or_insert_with(key.clone(), &mut build_tile)?
+            .context("builder should produce a tile")?;
+        assert_eq!(tile.texture_id.kind, key.texture_kind());
+        assert_eq!(
+            state.get_or_insert_with(key.clone(), &mut || {
+                anyhow::bail!("cache hit must not call the builder")
+            })?,
+            Some(tile)
+        );
+        assert!(state.contains(&key));
+        assert_eq!(state.backend.insert_calls, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn remove_and_clear_invalidate_keys() -> Result<()> {
+        let mut state = AtlasState::new(RecordingAtlasBackend::default());
+        let key = image_key(1);
+        let other_key = image_key(2);
+        let tile = state
+            .get_or_insert_with(key.clone(), &mut build_tile)?
+            .context("builder should produce a tile")?;
+        state
+            .get_or_insert_with(other_key.clone(), &mut build_tile)?
+            .context("builder should produce another tile")?;
+
+        state.remove(&key);
+        state.remove(&key);
+        assert!(!state.contains(&key));
+        assert!(state.contains(&other_key));
+        assert_eq!(state.backend.removed_tiles, vec![tile]);
+
+        let mut reset_calls = 0;
+        state.clear(|_| reset_calls += 1);
+        assert_eq!(reset_calls, 1);
+        assert!(!state.contains(&other_key));
+        assert_eq!(state.backend.removed_tiles, vec![tile]);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod frame_signal_tests {
+    use super::*;
+
+    #[cfg(feature = "profiler")]
+    #[test]
+    fn coalesced_signals_retain_the_earliest_until_drained() {
+        for (first_source, later_source) in [
+            (
+                FrameRequestSource::NativeCallback,
+                FrameRequestSource::LocalSchedule,
+            ),
+            (
+                FrameRequestSource::LocalSchedule,
+                FrameRequestSource::NativeCallback,
+            ),
+        ] {
+            let signal = PlatformFrameSignal::new();
+            let first =
+                PlatformFrameSignal::capture(Instant::now).expect("profiling captures requests");
+            assert_eq!(signal.take(), None);
+            signal.record(first + Duration::from_millis(16), later_source);
+            signal.record(first, first_source);
+            signal.record(first + Duration::from_millis(32), later_source);
+            assert_eq!(signal.take(), Some((first, first_source)));
+            assert_eq!(signal.take(), None);
+            let next = first + Duration::from_millis(48);
+            signal.record(next, later_source);
+            assert_eq!(signal.take(), Some((next, later_source)));
+        }
+    }
+
+    #[cfg(not(feature = "profiler"))]
+    #[test]
+    fn disabled_profiling_does_not_capture_or_store_timestamps() {
+        let captured = PlatformFrameSignal::capture(|| {
+            panic!("profiler-disabled builds must not evaluate the capture closure");
+        });
+        assert_eq!(captured, None);
+        let signal = PlatformFrameSignal::new();
+        signal.record(Instant::now(), FrameRequestSource::LocalSchedule);
+        assert_eq!(signal.take(), None);
+    }
+}
+
 #[cfg(all(test, any(target_os = "linux", target_os = "freebsd")))]
-mod tests {
+mod window_button_layout_tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn test_refresh_interval_from_hz() {
+        assert_eq!(
+            refresh_interval_from_hz(50.0),
+            Some(Duration::from_millis(20))
+        );
+        assert_eq!(
+            refresh_interval_from_hz(120.0),
+            Some(Duration::from_secs(1) / 120)
+        );
+        for unknown in [0.0, -60.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(refresh_interval_from_hz(unknown), None);
+        }
+    }
 
     #[test]
     fn test_window_button_layout_parse_standard() {

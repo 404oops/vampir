@@ -1,53 +1,15 @@
-//! KeyDispatch is where GPUI deals with binding actions to key events.
+//! Turns keystrokes into actions, and resolves which handlers run for them.
 //!
-//! The key pieces to making a key binding work are to define an action,
-//! implement a method that takes that action as a type parameter,
-//! and then to register the action during render on a focused node
-//! with a keymap context:
+//! Rendering records a dispatch tree for each frame. When a key is pressed,
+//! [`DispatchTree::dispatch_key`] combines the pending sequence with the new
+//! keystroke and asks the [`Keymap`] which bindings match. The result tells the
+//! window which actions to run, whether to wait for another keystroke, and which
+//! earlier input to replay when a sequence stops matching.
 //!
-//! ```ignore
-//! actions!(editor,[Undo, Redo]);
-//!
-//! impl Editor {
-//!   fn undo(&mut self, _: &Undo, _window: &mut Window, _cx: &mut Context<Self>) { ... }
-//!   fn redo(&mut self, _: &Redo, _window: &mut Window, _cx: &mut Context<Self>) { ... }
-//! }
-//!
-//! impl Render for Editor {
-//!   fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-//!     div()
-//!       .track_focus(&self.focus_handle(cx))
-//!       .key_context("Editor")
-//!       .on_action(cx.listener(Editor::undo))
-//!       .on_action(cx.listener(Editor::redo))
-//!     ...
-//!    }
-//! }
-//!```
-//!
-//! The keybindings themselves are managed independently by calling cx.bind_keys().
-//! (Though mostly when developing Zed itself, you just need to add a new line to
-//!  assets/keymaps/default-{platform}.json).
-//!
-//! ```ignore
-//! cx.bind_keys([
-//!   KeyBinding::new("cmd-z", Editor::undo, Some("Editor")),
-//!   KeyBinding::new("cmd-shift-z", Editor::redo, Some("Editor")),
-//! ])
-//! ```
-//!
-//! With all of this in place, GPUI will ensure that if you have an Editor that contains
-//! the focus, hitting cmd-z will Undo.
-//!
-//! In real apps, it is a little more complicated than this, because typically you have
-//! several nested views that each register keyboard handlers. In this case action matching
-//! bubbles up from the bottom. For example in Zed, the Workspace is the top-level view, which contains Pane's, which contain Editors. If there are conflicting keybindings defined
-//! then the Editor's bindings take precedence over the Pane's bindings, which take precedence over the Workspace.
-//!
-//! In GPUI, keybindings are not limited to just single keystrokes, you can define
-//! sequences by separating the keys with a space:
-//!
-//!  KeyBinding::new("cmd-k left", pane::SplitLeft, Some("Pane"))
+//! The public model is described in [keyboard input](crate::_documentation::concepts::input_dispatch):
+//! define an action, register an `on_action` handler on an element with a
+//! `key_context`, and bind keystrokes to the action with `cx.bind_keys`.
+//! A binding in a deeper context wins; ties go to the binding added later.
 
 use crate::{
     Action, ActionRegistry, App, DispatchPhase, EntityId, FocusId, KeyBinding, KeyContext, Keymap,
@@ -63,11 +25,18 @@ use std::{
     rc::Rc,
 };
 
-/// ID of a node within `DispatchTree`. Note that these are **not** stable between frames, and so a
-/// `DispatchNodeId` should only be used with the `DispatchTree` that provided it.
+/// Identifies a node within one [`DispatchTree`].
+///
+/// Node ids are not stable across frames. Use an id only with the tree that
+/// produced it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct DispatchNodeId(usize);
 
+/// The nodes of one window's dispatch tree, built during rendering.
+///
+/// Nodes are added in paint order while `node_stack` tracks the node being built.
+/// The tree also records key contexts, views, and the nodes associated with each
+/// focus handle.
 pub(crate) struct DispatchTree {
     node_stack: Vec<DispatchNodeId>,
     pub(crate) context_stack: Vec<KeyContext>,
@@ -79,6 +48,7 @@ pub(crate) struct DispatchTree {
     action_registry: Rc<ActionRegistry>,
 }
 
+/// One element's entry in the dispatch tree: its key context, focus, and listeners.
 #[derive(Default)]
 pub(crate) struct DispatchNode {
     pub key_listeners: Vec<KeyListener>,
@@ -90,6 +60,9 @@ pub(crate) struct DispatchNode {
     parent: Option<DispatchNodeId>,
 }
 
+/// A run of nodes copied from the previous frame because its element did not re-render.
+///
+/// [`refresh_node_id`](Self::refresh_node_id) maps an old node ID to its position in the new tree.
 pub(crate) struct ReusedSubtree {
     old_range: Range<usize>,
     new_range: Range<usize>,
@@ -112,12 +85,17 @@ impl ReusedSubtree {
     }
 }
 
+/// A pending keystroke that no longer leads to a binding and must be dispatched again.
+///
+/// `bindings` contains bindings completed by this keystroke. They run before the
+/// replay continues with the rest of the input.
 #[derive(Default, Debug)]
 pub(crate) struct Replay {
     pub(crate) keystroke: Keystroke,
     pub(crate) bindings: SmallVec<[KeyBinding; 1]>,
 }
 
+/// The actions and input state produced by one key press.
 #[derive(Default, Debug)]
 pub(crate) struct DispatchResult {
     pub(crate) pending: SmallVec<[Keystroke; 1]>,
@@ -130,6 +108,7 @@ pub(crate) struct DispatchResult {
 type KeyListener = Rc<dyn Fn(&dyn Any, DispatchPhase, &mut Window, &mut App)>;
 type ModifiersChangedListener = Rc<dyn Fn(&ModifiersChangedEvent, &mut Window, &mut App)>;
 
+/// A handler registered with `on_action` for one action type.
 #[derive(Clone)]
 pub(crate) struct DispatchActionListener {
     pub(crate) action_type: TypeId,
@@ -150,6 +129,7 @@ impl DispatchTree {
         }
     }
 
+    /// Empties the tree, ready for the next frame.
     pub fn clear(&mut self) {
         self.node_stack.clear();
         self.context_stack.clear();
@@ -159,10 +139,12 @@ impl DispatchTree {
         self.view_node_ids.clear();
     }
 
+    /// Returns the number of nodes in the tree.
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
 
+    /// Adds a node as a child of the active node, and makes it the active node.
     pub fn push_node(&mut self) -> DispatchNodeId {
         let parent = self.node_stack.last().copied();
         let node_id = DispatchNodeId(self.nodes.len());
@@ -175,6 +157,7 @@ impl DispatchTree {
         node_id
     }
 
+    /// Makes `node_id` the active node, popping nodes until its parent is on top of the stack.
     pub fn set_active_node(&mut self, node_id: DispatchNodeId) {
         let next_node_parent = self.nodes[node_id.0].parent;
         while self.node_stack.last().copied() != next_node_parent && !self.node_stack.is_empty() {
@@ -212,17 +195,20 @@ impl DispatchTree {
         }
     }
 
+    /// Sets the key context of the active node and pushes it onto the context stack.
     pub fn set_key_context(&mut self, context: KeyContext) {
         self.active_node().context = Some(context.clone());
         self.context_stack.push(context);
     }
 
+    /// Marks the active node as tracking `focus_id`, so that the focus can find it.
     pub fn set_focus_id(&mut self, focus_id: FocusId) {
         let node_id = *self.node_stack.last().unwrap();
         self.nodes[node_id.0].focus_id = Some(focus_id);
         self.focusable_node_ids.insert(focus_id, node_id);
     }
 
+    /// Marks the active node as belonging to the view `view_id`, unless it already is the top view.
     pub fn set_view_id(&mut self, view_id: EntityId) {
         if self.view_stack.last().copied() != Some(view_id) {
             let node_id = *self.node_stack.last().unwrap();
@@ -232,6 +218,7 @@ impl DispatchTree {
         }
     }
 
+    /// Closes the active node, popping its context and view from their stacks.
     pub fn pop_node(&mut self) {
         let node = &self.nodes[self.active_node_id().unwrap().0];
         if node.context.is_some() {
@@ -261,6 +248,9 @@ impl DispatchTree {
         target.modifiers_changed_listeners = mem::take(&mut source.modifiers_changed_listeners);
     }
 
+    /// Copies the nodes in `old_range` from `source` into this tree, and returns where they landed.
+    ///
+    /// `contains_focus` on the result is true if the focused handle is among the copied nodes.
     pub fn reuse_subtree(
         &mut self,
         old_range: Range<usize>,
@@ -307,6 +297,7 @@ impl DispatchTree {
         }
     }
 
+    /// Removes the nodes from `index` on, and forgets their focus and view IDs.
     pub fn truncate(&mut self, index: usize) {
         for node in &self.nodes[index..] {
             if let Some(focus_id) = node.focus_id {
@@ -320,16 +311,19 @@ impl DispatchTree {
         self.nodes.truncate(index);
     }
 
+    /// Adds a key listener to the active node.
     pub fn on_key_event(&mut self, listener: KeyListener) {
         self.active_node().key_listeners.push(listener);
     }
 
+    /// Adds a modifiers-changed listener to the active node.
     pub fn on_modifiers_changed(&mut self, listener: ModifiersChangedListener) {
         self.active_node()
             .modifiers_changed_listeners
             .push(listener);
     }
 
+    /// Adds an action listener for `action_type` to the active node.
     pub fn on_action(
         &mut self,
         action_type: TypeId,
@@ -343,6 +337,7 @@ impl DispatchTree {
             });
     }
 
+    /// Returns whether `child` is `parent` or is inside it in the focus tree.
     pub fn focus_contains(&self, parent: FocusId, child: FocusId) -> bool {
         if parent == child {
             return true;
@@ -360,6 +355,8 @@ impl DispatchTree {
         false
     }
 
+    /// Returns one instance of each action that has a listener on the path to `target`, skipping
+    /// any action that can't be built with no input.
     pub fn available_actions(&self, target: DispatchNodeId) -> Vec<Box<dyn Action>> {
         let mut actions = Vec::<Box<dyn Action>>::new();
         for node_id in self.dispatch_path(target) {
@@ -379,6 +376,7 @@ impl DispatchTree {
         actions
     }
 
+    /// Returns whether some node on the path to `target` has a listener for `action`'s type.
     pub fn is_action_available(&self, action: &dyn Action, target: DispatchNodeId) -> bool {
         for node_id in self.dispatch_path(target) {
             let node = &self.nodes[node_id.0];
@@ -393,7 +391,7 @@ impl DispatchTree {
         false
     }
 
-    /// Returns key bindings that invoke an action on the currently focused element. Bindings are
+    /// Returns key bindings that invoke `action` in `context_stack`. Bindings are
     /// returned in the order they were added. For display, the last binding should take precedence.
     ///
     /// Bindings are only included if they are the highest precedence match for their keystrokes, so
@@ -560,6 +558,7 @@ impl DispatchTree {
         (input, to_replay)
     }
 
+    /// Returns the nodes from the root down to `target`, inclusive.
     pub fn dispatch_path(&self, target: DispatchNodeId) -> SmallVec<[DispatchNodeId; 32]> {
         let mut dispatch_path: SmallVec<[DispatchNodeId; 32]> = SmallVec::new();
         let mut current_node_id = Some(target);
@@ -571,6 +570,7 @@ impl DispatchTree {
         dispatch_path
     }
 
+    /// Returns the focus handles from the root down to `focus_id`, inclusive.
     pub fn focus_path(&self, focus_id: FocusId) -> SmallVec<[FocusId; 8]> {
         let mut focus_path: SmallVec<[FocusId; 8]> = SmallVec::new();
         let mut current_node_id = self.focusable_node_ids.get(&focus_id).copied();
@@ -585,6 +585,7 @@ impl DispatchTree {
         focus_path
     }
 
+    /// Returns the views from `view_id` up to the root, nearest first.
     pub fn view_path_reversed(&self, view_id: EntityId) -> impl Iterator<Item = EntityId> {
         let mut current_node_id = self.view_node_ids.get(&view_id).copied();
 
@@ -595,6 +596,7 @@ impl DispatchTree {
         .filter_map(|node| node.view_id)
     }
 
+    /// Returns the node with `node_id`.
     pub fn node(&self, node_id: DispatchNodeId) -> &DispatchNode {
         &self.nodes[node_id.0]
     }
@@ -604,15 +606,18 @@ impl DispatchTree {
         &mut self.nodes[active_node_id.0]
     }
 
+    /// Returns the node that tracks the focus handle `target`, if any.
     pub fn focusable_node_id(&self, target: FocusId) -> Option<DispatchNodeId> {
         self.focusable_node_ids.get(&target).copied()
     }
 
+    /// Returns the ID of the first node, which is the root of the tree. The tree must not be empty.
     pub fn root_node_id(&self) -> DispatchNodeId {
         debug_assert!(!self.nodes.is_empty());
         DispatchNodeId(0)
     }
 
+    /// Returns the node currently being built, or `None` if no node is open.
     pub fn active_node_id(&self) -> Option<DispatchNodeId> {
         self.node_stack.last().copied()
     }
@@ -633,8 +638,9 @@ mod tests {
     };
 
     use crate::{
-        ActionRegistry, App, Bounds, Context, DispatchPhase, DispatchTree, FocusHandle,
-        InputHandler, IntoElement, KeyBinding, KeyContext, Keymap, Pixels, PlatformWindow, Point,
+        Action, ActionRegistry, App, Bounds, Context, DispatchEventResult, DispatchPhase,
+        DispatchTree, Entity, FocusHandle, InputHandler, InputPreference, IntoElement, KeyBinding,
+        KeyContext, KeyDownEvent, Keymap, Modifiers, Pixels, PlatformInput, PlatformWindow, Point,
         Render, Subscription, TestAppContext, UTF16Selection, Unbind, VisualContext,
         VisualTestContext, Window,
     };
@@ -648,6 +654,320 @@ mod tests {
             Rc::new(RefCell::new(Keymap::new(bindings))),
             Rc::new(registry),
         )
+    }
+
+    struct PendingInputTestView {
+        focus_handle: FocusHandle,
+        action_count: Rc<Cell<usize>>,
+        secondary_action_count: Rc<Cell<usize>>,
+    }
+
+    #[derive(Clone)]
+    struct PendingTextInputTestView {
+        focus_handle: FocusHandle,
+        text: Rc<RefCell<String>>,
+        action_count: Rc<Cell<usize>>,
+        accepts_text_input: Rc<Cell<bool>>,
+    }
+
+    impl PendingTextInputTestView {
+        fn new(cx: &mut Context<Self>) -> Self {
+            Self {
+                focus_handle: cx.focus_handle(),
+                text: Rc::default(),
+                action_count: Rc::default(),
+                accepts_text_input: Rc::new(Cell::new(true)),
+            }
+        }
+    }
+
+    impl Element for PendingTextInputTestView {
+        type RequestLayoutState = ();
+        type PrepaintState = ();
+
+        fn id(&self) -> Option<ElementId> {
+            Some("pending-text-input-test".into())
+        }
+
+        fn source_location(&self) -> Option<&'static panic::Location<'static>> {
+            None
+        }
+
+        fn request_layout(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> (LayoutId, Self::RequestLayoutState) {
+            (window.request_layout(Style::default(), [], cx), ())
+        }
+
+        fn prepaint(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            _: Bounds<Pixels>,
+            _: &mut Self::RequestLayoutState,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> Self::PrepaintState {
+            window.set_focus_handle(&self.focus_handle, cx);
+        }
+
+        fn paint(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            _: Bounds<Pixels>,
+            _: &mut Self::RequestLayoutState,
+            _: &mut Self::PrepaintState,
+            window: &mut Window,
+            cx: &mut App,
+        ) {
+            let mut key_context = KeyContext::default();
+            key_context.add("Terminal");
+            window.set_key_context(key_context);
+            window.handle_input(&self.focus_handle, self.clone(), cx);
+            let action_count = self.action_count.clone();
+            window.on_action(
+                std::any::TypeId::of::<TestAction>(),
+                move |_, phase, _, _| {
+                    if phase == DispatchPhase::Bubble {
+                        action_count.set(action_count.get() + 1);
+                    }
+                },
+            );
+        }
+    }
+
+    impl IntoElement for PendingTextInputTestView {
+        type Element = Self;
+
+        fn into_element(self) -> Self::Element {
+            self
+        }
+    }
+
+    impl InputHandler for PendingTextInputTestView {
+        fn accepts_text_input(&mut self, _: &mut Window, _: &mut App) -> bool {
+            self.accepts_text_input.get()
+        }
+
+        fn selected_text_range(
+            &mut self,
+            _: bool,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<UTF16Selection> {
+            None
+        }
+
+        fn marked_text_range(&mut self, _: &mut Window, _: &mut App) -> Option<Range<usize>> {
+            None
+        }
+
+        fn text_for_range(
+            &mut self,
+            _: Range<usize>,
+            _: &mut Option<Range<usize>>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<String> {
+            None
+        }
+
+        fn replace_text_in_range(
+            &mut self,
+            replacement_range: Option<Range<usize>>,
+            text: &str,
+            _: &mut Window,
+            _: &mut App,
+        ) {
+            if replacement_range.is_some() {
+                unimplemented!()
+            }
+            self.text.borrow_mut().push_str(text)
+        }
+
+        fn replace_and_mark_text_in_range(
+            &mut self,
+            replacement_range: Option<Range<usize>>,
+            new_text: &str,
+            _: Option<Range<usize>>,
+            _: &mut Window,
+            _: &mut App,
+        ) {
+            if replacement_range.is_some() {
+                unimplemented!()
+            }
+            self.text.borrow_mut().push_str(new_text)
+        }
+
+        fn unmark_text(&mut self, _: &mut Window, _: &mut App) {}
+
+        fn prefers_ime_for_printable_keys(&mut self, _: &mut Window, _: &mut App) -> bool {
+            true
+        }
+
+        fn bounds_for_range(
+            &mut self,
+            _: Range<usize>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<Bounds<Pixels>> {
+            None
+        }
+
+        fn character_index_for_point(
+            &mut self,
+            _: Point<Pixels>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<usize> {
+            None
+        }
+    }
+
+    impl Render for PendingTextInputTestView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.clone()
+        }
+    }
+
+    struct PendingInputTimeoutPauseOwner;
+
+    impl Render for PendingInputTestView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            use crate::{InteractiveElement as _, Styled as _};
+            let action_count = self.action_count.clone();
+            let secondary_action_count = self.secondary_action_count.clone();
+            crate::div()
+                .key_context("Terminal")
+                .track_focus(&self.focus_handle)
+                .size_full()
+                .on_action(move |_: &TestAction, _, _| {
+                    action_count.set(action_count.get() + 1);
+                })
+                .on_action(move |_: &SecondaryTestAction, _, _| {
+                    secondary_action_count.set(secondary_action_count.get() + 1);
+                })
+        }
+    }
+
+    fn setup_pending_input_test(
+        cx: &mut TestAppContext,
+        bindings: impl IntoIterator<Item = KeyBinding>,
+    ) -> (&mut VisualTestContext, Rc<Cell<usize>>, Rc<Cell<usize>>) {
+        cx.update(|cx| cx.bind_keys(bindings));
+
+        let action_count = Rc::new(Cell::new(0));
+        let secondary_action_count = Rc::new(Cell::new(0));
+        let (view, cx) = cx.add_window_view(|_, cx| PendingInputTestView {
+            focus_handle: cx.focus_handle(),
+            action_count: action_count.clone(),
+            secondary_action_count: secondary_action_count.clone(),
+        });
+        let focus_handle = cx.update(|_, cx| view.read(cx).focus_handle.clone());
+        cx.update(|window, cx| {
+            window.focus(&focus_handle, cx);
+            window.activate();
+        });
+
+        (cx, action_count, secondary_action_count)
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct ObservedKeystroke {
+        keystroke: Keystroke,
+        action_name: Option<&'static str>,
+        context_stack: Vec<KeyContext>,
+    }
+
+    fn capture_observed_keystrokes(
+        cx: &mut VisualTestContext,
+    ) -> (Rc<RefCell<Vec<ObservedKeystroke>>>, Subscription) {
+        let observed_keystrokes = Rc::new(RefCell::new(Vec::new()));
+        let subscription = cx.update(|_, cx| {
+            cx.observe_keystrokes({
+                let observed_keystrokes = observed_keystrokes.clone();
+                move |event, _, _| {
+                    observed_keystrokes.borrow_mut().push(ObservedKeystroke {
+                        keystroke: event.keystroke.clone(),
+                        action_name: event.action.as_ref().map(|action| action.name()),
+                        context_stack: event.context_stack.clone(),
+                    });
+                }
+            })
+        });
+        (observed_keystrokes, subscription)
+    }
+
+    fn simulate_modifier_tap(cx: &mut VisualTestContext, modifiers: Modifiers) {
+        cx.simulate_modifiers_change(modifiers);
+        cx.simulate_modifiers_change(Modifiers::none());
+    }
+
+    fn terminal_context() -> KeyContext {
+        KeyContext::parse("Terminal").expect("valid key context")
+    }
+
+    fn setup_pending_input_timeout_test(
+        cx: &mut TestAppContext,
+    ) -> (&mut VisualTestContext, Rc<Cell<usize>>, Rc<Cell<usize>>) {
+        setup_pending_input_test(
+            cx,
+            [
+                KeyBinding::new("ctrl-b", TestAction, Some("Terminal")),
+                KeyBinding::new("ctrl-b h", SecondaryTestAction, Some("Terminal")),
+                KeyBinding::new("ctrl-b h j", TestAction, Some("Terminal")),
+            ],
+        )
+    }
+
+    fn query_prefers_ime_for_printable_keys(cx: &mut VisualTestContext) -> Option<bool> {
+        let mut platform_window = cx.test_window(cx.window_handle());
+        let mut input_handler = platform_window.take_input_handler()?;
+        let prefers_ime = input_handler.query_prefers_ime_for_printable_keys();
+        platform_window.set_input_handler(input_handler);
+        Some(prefers_ime)
+    }
+
+    fn setup_altgr_test(
+        cx: &mut TestAppContext,
+    ) -> (Entity<PendingTextInputTestView>, &mut VisualTestContext) {
+        let (test, cx) = cx.add_window_view(|_, cx| PendingTextInputTestView::new(cx));
+        test.update_in(cx, |test, window, cx| {
+            window.focus(&test.focus_handle, cx);
+            window.activate();
+            cx.bind_keys([KeyBinding::new("ctrl-alt-a", TestAction, Some("Terminal"))]);
+        });
+        (test, cx)
+    }
+
+    fn dispatch_altgr_key_down(
+        cx: &mut VisualTestContext,
+        prefer_character_input: bool,
+    ) -> DispatchEventResult {
+        cx.update(|window, cx| {
+            window.dispatch_event(
+                PlatformInput::KeyDown(KeyDownEvent {
+                    keystroke: Keystroke {
+                        key_char: Some("ą".into()),
+                        ..Keystroke::parse("ctrl-alt-a").expect("valid keystroke")
+                    },
+                    is_held: false,
+                    prefer_character_input,
+                }),
+                cx,
+            )
+        })
+    }
+
+    fn simulate_pending_binding(cx: &mut VisualTestContext) {
+        cx.simulate_modifiers_change(crate::Modifiers::control());
+        cx.simulate_keystrokes("ctrl-b");
+        cx.simulate_modifiers_change(crate::Modifiers::default());
     }
 
     #[test]
@@ -830,7 +1150,7 @@ mod tests {
     }
 
     #[crate::test]
-    fn test_pending_input_observers_notified_on_focus_change(cx: &mut TestAppContext) {
+    fn test_pending_input_observers_notified_on_focus_change_and_blur(cx: &mut TestAppContext) {
         #[derive(Clone)]
         struct CustomElement {
             focus_handle: FocusHandle,
@@ -988,6 +1308,8 @@ mod tests {
         cx.update(|cx| {
             cx.bind_keys([KeyBinding::new("ctrl-b", TestAction, Some("Terminal"))]);
             cx.bind_keys([KeyBinding::new("ctrl-b h", TestAction, Some("Terminal"))]);
+            cx.bind_keys([KeyBinding::new("ctrl-d", TestAction, None)]);
+            cx.bind_keys([KeyBinding::new("ctrl-d h", TestAction, None)]);
         });
 
         let (test, cx) = cx.add_window_view(|_, cx| CustomElement::new(cx));
@@ -1010,7 +1332,7 @@ mod tests {
 
         cx.update(|window, cx| {
             window.focus(&focus_handle, cx);
-            window.activate_window();
+            window.activate();
         });
 
         cx.simulate_keystrokes("ctrl-b");
@@ -1034,189 +1356,830 @@ mod tests {
             let count_after_focus_change = *pending_input_changed_count.borrow();
             assert!(count_after_focus_change > *count_after_pending_for_assertion.borrow());
         });
+        assert_eq!(
+            cx.test_window(cx.window_handle())
+                .text_input_state_changes(),
+            [
+                crate::TextInputStateChange::FocusGained,
+                crate::TextInputStateChange::FocusLost,
+            ]
+        );
+
+        cx.update(|window, cx| window.focus(&focus_handle, cx));
+        cx.simulate_keystrokes("ctrl-b");
+        let count_before_blur = *pending_input_changed_count.borrow();
+
+        cx.update(|window, cx| {
+            assert!(window.has_pending_keystrokes());
+            window.blur(cx);
+            assert!(!window.has_pending_keystrokes());
+            assert!(window.pending_input_is_none());
+        });
+
+        cx.update(|_, _| {
+            assert!(*pending_input_changed_count.borrow() > count_before_blur);
+        });
+
+        let temporary_focus = cx.update(|window, cx| {
+            let handle = cx.focus_handle();
+            window.focus(&handle, cx);
+            handle
+        });
+        cx.simulate_keystrokes("ctrl-d");
+        cx.update(|window, _| assert!(window.has_pending_keystrokes()));
+        let count_before_drop = *pending_input_changed_count.borrow();
+        cx.update(|_, _| drop(temporary_focus));
+        cx.update(|window, _| assert!(window.pending_input_is_none()));
+        assert_eq!(*pending_input_changed_count.borrow(), count_before_drop + 1);
+
+        cx.update(|window, cx| window.disable_focus(cx));
+        cx.simulate_keystrokes("ctrl-d");
+
+        cx.update(|window, cx| {
+            assert!(window.has_pending_keystrokes());
+            window.blur(cx);
+            assert!(window.pending_input_is_none());
+        });
+    }
+
+    #[crate::test]
+    fn test_standalone_modifier_dispatch(cx: &mut TestAppContext) {
+        let (cx, action_count, _) =
+            setup_pending_input_test(cx, [KeyBinding::new("shift", TestAction, Some("Terminal"))]);
+        let intercepted_keystrokes = Rc::new(RefCell::new(Vec::new()));
+        let should_consume = Rc::new(Cell::new(true));
+        let terminal_context = terminal_context();
+        let (observed_keystrokes, _observer) = capture_observed_keystrokes(cx);
+        let _interceptor = cx.update(|_, cx| {
+            cx.intercept_keystrokes({
+                let intercepted_keystrokes = intercepted_keystrokes.clone();
+                let should_consume = should_consume.clone();
+                let terminal_context = terminal_context.clone();
+                move |event, _, cx| {
+                    assert!(event.action.is_none());
+                    assert_eq!(event.context_stack, vec![terminal_context.clone()]);
+                    intercepted_keystrokes
+                        .borrow_mut()
+                        .push(event.keystroke.clone());
+                    if should_consume.get() {
+                        cx.stop_propagation();
+                    }
+                }
+            })
+        });
+        let shift = Keystroke::parse("shift").expect("valid keystroke");
+
+        // Pressing Shift is not a keystroke. Consuming its recognized release suppresses
+        // the binding.
+        cx.simulate_modifiers_change(Modifiers::shift());
+        assert!(intercepted_keystrokes.borrow().is_empty());
+        cx.simulate_modifiers_change(Modifiers::none());
+        assert_eq!(
+            intercepted_keystrokes.borrow().as_slice(),
+            std::slice::from_ref(&shift)
+        );
+        assert_eq!(action_count.get(), 0);
+        assert!(observed_keystrokes.borrow().is_empty());
+
+        // Without consumption, the same recognized release reaches keymap dispatch.
+        should_consume.set(false);
+        intercepted_keystrokes.borrow_mut().clear();
+        cx.simulate_modifiers_change(Modifiers::shift());
+        assert!(intercepted_keystrokes.borrow().is_empty());
+        cx.simulate_modifiers_change(Modifiers::none());
+        assert_eq!(
+            intercepted_keystrokes.borrow().as_slice(),
+            std::slice::from_ref(&shift)
+        );
+        assert_eq!(action_count.get(), 1);
+        assert_eq!(
+            observed_keystrokes.borrow().as_slice(),
+            &[ObservedKeystroke {
+                keystroke: shift,
+                action_name: Some(TestAction.name()),
+                context_stack: vec![terminal_context],
+            }]
+        );
+    }
+
+    #[crate::test]
+    fn test_unbound_standalone_modifier_observation(cx: &mut TestAppContext) {
+        let (cx, _, _) = setup_pending_input_test(cx, []);
+        let terminal_context = terminal_context();
+        let (observed_keystrokes, _observer) = capture_observed_keystrokes(cx);
+
+        for (modifiers, key) in [
+            (Modifiers::shift(), "shift"),
+            (Modifiers::control(), "ctrl"),
+            (Modifiers::alt(), "alt"),
+            (Modifiers::command(), "cmd"),
+            (Modifiers::function(), "fn"),
+        ] {
+            observed_keystrokes.borrow_mut().clear();
+            cx.simulate_modifiers_change(modifiers);
+            assert!(
+                observed_keystrokes.borrow().is_empty(),
+                "modifier press must not notify observers"
+            );
+            cx.simulate_modifiers_change(Modifiers::none());
+            assert_eq!(
+                observed_keystrokes.borrow().as_slice(),
+                &[ObservedKeystroke {
+                    keystroke: Keystroke::parse(key).expect("valid modifier"),
+                    action_name: None,
+                    context_stack: vec![terminal_context.clone()],
+                }]
+            );
+        }
+    }
+
+    #[crate::test]
+    fn test_raw_modifier_handler_can_suppress_observation(cx: &mut TestAppContext) {
+        struct ModifierListenerTestView {
+            focus_handle: FocusHandle,
+            consume: Rc<Cell<bool>>,
+            releases: Rc<Cell<usize>>,
+        }
+
+        impl Render for ModifierListenerTestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                use crate::{InteractiveElement as _, Styled as _};
+                let consume = self.consume.clone();
+                let releases = self.releases.clone();
+                crate::div()
+                    .key_context("Terminal")
+                    .track_focus(&self.focus_handle)
+                    .size_full()
+                    .on_action(|_: &TestAction, _, cx| cx.propagate())
+                    .on_modifiers_changed(move |event, _, cx| {
+                        if !event.modifiers.modified() {
+                            releases.set(releases.get() + 1);
+                            if consume.get() {
+                                cx.stop_propagation();
+                            }
+                        }
+                    })
+            }
+        }
+
+        cx.update(|cx| {
+            cx.bind_keys([KeyBinding::new("shift", TestAction, Some("Terminal"))]);
+        });
+        let consume = Rc::new(Cell::new(true));
+        let releases = Rc::new(Cell::new(0));
+        let (view, cx) = cx.add_window_view(|_, cx| ModifierListenerTestView {
+            focus_handle: cx.focus_handle(),
+            consume: consume.clone(),
+            releases: releases.clone(),
+        });
+        cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.clone();
+            window.focus(&focus_handle, cx);
+            window.activate();
+        });
+        let (observed_keystrokes, _observer) = capture_observed_keystrokes(cx);
+
+        simulate_modifier_tap(cx, Modifiers::shift());
+        assert_eq!(releases.get(), 1);
+        assert!(observed_keystrokes.borrow().is_empty());
+
+        consume.set(false);
+        simulate_modifier_tap(cx, Modifiers::shift());
+        assert_eq!(releases.get(), 2);
+        assert_eq!(
+            observed_keystrokes.borrow().as_slice(),
+            &[ObservedKeystroke {
+                keystroke: Keystroke::parse("shift").expect("valid modifier"),
+                action_name: None,
+                context_stack: vec![terminal_context()],
+            }]
+        );
+    }
+
+    #[crate::test]
+    fn test_pending_modifier_observed_when_binding_resolves(cx: &mut TestAppContext) {
+        let (cx, action_count, secondary_action_count) = setup_pending_input_test(
+            cx,
+            [
+                KeyBinding::new("shift", TestAction, Some("Terminal")),
+                KeyBinding::new("shift f1", SecondaryTestAction, Some("Terminal")),
+            ],
+        );
+        let (observed_keystrokes, _observer) = capture_observed_keystrokes(cx);
+
+        simulate_modifier_tap(cx, Modifiers::shift());
+        assert!(observed_keystrokes.borrow().is_empty());
+        assert_eq!(action_count.get(), 0);
+
+        cx.executor().advance_clock(crate::PENDING_INPUT_TIMEOUT);
+        cx.run_until_parked();
+        assert_eq!(action_count.get(), 1);
+        assert_eq!(
+            observed_keystrokes.borrow().as_slice(),
+            &[ObservedKeystroke {
+                keystroke: Keystroke::parse("shift").expect("valid modifier"),
+                action_name: Some(TestAction.name()),
+                context_stack: Vec::new(),
+            }]
+        );
+
+        observed_keystrokes.borrow_mut().clear();
+        simulate_modifier_tap(cx, Modifiers::shift());
+        assert!(observed_keystrokes.borrow().is_empty());
+        cx.simulate_keystrokes("f1");
+        assert_eq!(action_count.get(), 1);
+        assert_eq!(secondary_action_count.get(), 1);
+        assert_eq!(
+            observed_keystrokes.borrow().as_slice(),
+            &[ObservedKeystroke {
+                keystroke: Keystroke::parse("f1").expect("valid key"),
+                action_name: Some(SecondaryTestAction.name()),
+                context_stack: vec![terminal_context()],
+            }]
+        );
+    }
+
+    #[crate::test]
+    fn test_combined_shortcut_has_no_standalone_modifier(cx: &mut TestAppContext) {
+        let (cx, action_count, _) = setup_pending_input_test(
+            cx,
+            [
+                KeyBinding::new("shift", TestAction, Some("Terminal")),
+                KeyBinding::new("shift-f1", TestAction, Some("Terminal")),
+            ],
+        );
+        let intercepted_keystrokes = Rc::new(RefCell::new(Vec::new()));
+        let (observed_keystrokes, _observer) = capture_observed_keystrokes(cx);
+        let _interceptor = cx.update(|_, cx| {
+            cx.intercept_keystrokes({
+                let intercepted_keystrokes = intercepted_keystrokes.clone();
+                move |event, _, _| {
+                    intercepted_keystrokes
+                        .borrow_mut()
+                        .push(event.keystroke.clone());
+                }
+            })
+        });
+
+        // Shift-F1 is the only keystroke. Releasing Shift must not emit a second one.
+        cx.simulate_modifiers_change(Modifiers::shift());
+        assert!(intercepted_keystrokes.borrow().is_empty());
+        cx.simulate_keystrokes("shift-f1");
+        cx.simulate_modifiers_change(Modifiers::none());
+
+        let shift_f1 = Keystroke::parse("shift-f1").expect("valid keystroke");
+        assert_eq!(
+            intercepted_keystrokes.borrow().as_slice(),
+            std::slice::from_ref(&shift_f1)
+        );
+        assert_eq!(
+            observed_keystrokes.borrow().as_slice(),
+            &[ObservedKeystroke {
+                keystroke: shift_f1,
+                action_name: Some(TestAction.name()),
+                context_stack: vec![terminal_context()],
+            }]
+        );
+        assert_eq!(action_count.get(), 1);
+    }
+
+    #[crate::test]
+    fn test_keystroke_input_preference(cx: &mut TestAppContext) {
+        let (test, cx) = setup_altgr_test(cx);
+        let intercepted_preferences = Rc::new(RefCell::new(Vec::new()));
+        let observed_preferences = Rc::new(RefCell::new(Vec::new()));
+        let _interceptor = cx.update(|_, cx| {
+            cx.intercept_keystrokes({
+                let intercepted_preferences = intercepted_preferences.clone();
+                move |event, _, _| {
+                    intercepted_preferences
+                        .borrow_mut()
+                        .push(event.input_preference);
+                }
+            })
+        });
+        let _observer = cx.update(|_, cx| {
+            cx.observe_keystrokes({
+                let observed_preferences = observed_preferences.clone();
+                move |event, _, _| {
+                    observed_preferences
+                        .borrow_mut()
+                        .push(event.input_preference);
+                }
+            })
+        });
+
+        for (prefer_character_input, accepts_text_input, input_preference) in [
+            (true, true, InputPreference::CharacterInput),
+            (false, true, InputPreference::KeyBindings),
+            (true, false, InputPreference::KeyBindings),
+            (false, false, InputPreference::KeyBindings),
+        ] {
+            test.update(cx, |test, _| {
+                test.accepts_text_input.set(accepts_text_input);
+                test.action_count.set(0);
+            });
+            intercepted_preferences.borrow_mut().clear();
+            observed_preferences.borrow_mut().clear();
+            let result = dispatch_altgr_key_down(cx, prefer_character_input);
+            assert_eq!(
+                result.propagate,
+                input_preference == InputPreference::CharacterInput
+            );
+            assert_eq!(
+                intercepted_preferences.borrow().as_slice(),
+                &[input_preference]
+            );
+            assert_eq!(
+                observed_preferences.borrow().as_slice(),
+                &[input_preference]
+            );
+            test.read_with(cx, |test, _| {
+                assert_eq!(
+                    test.action_count.get(),
+                    usize::from(input_preference == InputPreference::KeyBindings)
+                );
+            });
+        }
+    }
+
+    #[crate::test]
+    fn test_input_preference_rechecked_after_interception(cx: &mut TestAppContext) {
+        let (test, cx) = setup_altgr_test(cx);
+        let accepts_text_input = test.read_with(cx, |test, _| test.accepts_text_input.clone());
+        let _interceptor = cx.update(|_, cx| {
+            cx.intercept_keystrokes({
+                let accepts_text_input = accepts_text_input.clone();
+                move |event, _, _| {
+                    assert_eq!(
+                        event.input_preference == InputPreference::CharacterInput,
+                        accepts_text_input.get()
+                    );
+                    accepts_text_input.set(!accepts_text_input.get());
+                }
+            })
+        });
+        let observed_preferences = Rc::new(RefCell::new(Vec::new()));
+        let _observer = cx.update(|_, cx| {
+            cx.observe_keystrokes({
+                let observed_preferences = observed_preferences.clone();
+                move |event, _, _| {
+                    observed_preferences
+                        .borrow_mut()
+                        .push(event.input_preference);
+                }
+            })
+        });
+
+        for (initially_accepts_text_input, observed_preference) in [
+            (true, InputPreference::KeyBindings),
+            (false, InputPreference::CharacterInput),
+        ] {
+            accepts_text_input.set(initially_accepts_text_input);
+            test.update(cx, |test, _| test.action_count.set(0));
+            observed_preferences.borrow_mut().clear();
+            let result = dispatch_altgr_key_down(cx, true);
+            assert_eq!(result.propagate, !initially_accepts_text_input);
+            assert_eq!(
+                observed_preferences.borrow().as_slice(),
+                &[observed_preference]
+            );
+            test.read_with(cx, |test, _| {
+                assert_eq!(
+                    test.action_count.get(),
+                    usize::from(initially_accepts_text_input)
+                );
+            });
+        }
+    }
+
+    #[crate::test]
+    fn test_keystroke_interceptors_can_consume_preferred_character_input(cx: &mut TestAppContext) {
+        let (test, cx) = setup_altgr_test(cx);
+        let intercepted = Rc::new(Cell::new(false));
+        let _interceptor = cx.update(|_, cx| {
+            cx.intercept_keystrokes({
+                let intercepted = intercepted.clone();
+                move |event, _, cx| {
+                    assert_eq!(event.input_preference, InputPreference::CharacterInput);
+                    intercepted.set(true);
+                    cx.stop_propagation();
+                }
+            })
+        });
+
+        let result = dispatch_altgr_key_down(cx, true);
+        assert!(intercepted.get());
+        assert!(!result.propagate);
+        test.read_with(cx, |test, _| assert_eq!(test.action_count.get(), 0));
+    }
+
+    #[crate::test]
+    fn test_consumed_modifier_preserves_pending_input(cx: &mut TestAppContext) {
+        let (test, cx) = cx.add_window_view(|_, cx| PendingTextInputTestView::new(cx));
+        test.update_in(cx, |test, window, cx| {
+            window.focus(&test.focus_handle, cx);
+            window.activate();
+        });
+        let _subscription = cx.update(|_, cx| {
+            cx.intercept_keystrokes(|event, _, cx| {
+                if event.keystroke.key == "shift" {
+                    cx.stop_propagation();
+                }
+            })
+        });
+
+        // Exercise both paths that processing Shift would take: completing `j shift`, and
+        // replaying `j` when `j k` no longer matches.
+        for binding in ["j shift", "j k"] {
+            cx.update(|_, cx| {
+                cx.clear_key_bindings();
+                cx.bind_keys([KeyBinding::new(binding, TestAction, Some("Terminal"))]);
+            });
+            test.update(cx, |test, _| test.text.borrow_mut().clear());
+            cx.simulate_keystrokes("j");
+            cx.executor()
+                .advance_clock(crate::PENDING_INPUT_TIMEOUT / 2);
+            cx.run_until_parked();
+            let pending_keystrokes = cx.update(|window, _| {
+                window
+                    .pending_input()
+                    .expect("pending input")
+                    .keystrokes()
+                    .to_vec()
+            });
+
+            // Consuming Shift must not complete or replay the pending `j`.
+            cx.simulate_modifiers_change(Modifiers::shift());
+            cx.simulate_modifiers_change(Modifiers::none());
+            cx.update(|window, _| {
+                let pending_input = window.pending_input().expect("pending input");
+                assert_eq!(pending_input.keystrokes(), pending_keystrokes);
+                assert!(pending_input.timeout().is_some());
+            });
+            test.update(cx, |test, _| {
+                assert_eq!(test.action_count.get(), 0);
+                assert_eq!(test.text.borrow().as_str(), "");
+            });
+
+            // The unchanged timeout should replay `j` after its remaining half.
+            cx.executor()
+                .advance_clock(crate::PENDING_INPUT_TIMEOUT / 2);
+            cx.run_until_parked();
+            cx.update(|window, _| assert!(!window.has_pending_keystrokes()));
+            test.update(cx, |test, _| {
+                assert_eq!(test.action_count.get(), 0);
+                assert_eq!(test.text.borrow().as_str(), "j");
+            });
+        }
+    }
+
+    #[crate::test]
+    fn test_printable_pending_input_replays_on_timeout(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.bind_keys([KeyBinding::new("j k", TestAction, Some("Terminal"))]);
+        });
+        let (test, cx) = cx.add_window_view(|_, cx| PendingTextInputTestView::new(cx));
+        let focus_handle = test.update(cx, |test, _| test.focus_handle.clone());
+        cx.update(|window, cx| {
+            window.focus(&focus_handle, cx);
+            window.activate();
+        });
+
+        cx.simulate_keystrokes("j");
+
+        cx.update(|window, _| {
+            let pending_input = window.pending_input().expect("pending input");
+            assert_eq!(pending_input.keystrokes().len(), 1);
+            assert!(pending_input.timeout().is_some());
+        });
+        test.update(cx, |test, _| {
+            assert_eq!(test.action_count.get(), 0);
+            assert_eq!(test.text.borrow().as_str(), "");
+        });
+
+        cx.executor().advance_clock(crate::PENDING_INPUT_TIMEOUT);
+        cx.run_until_parked();
+
+        cx.update(|window, _| assert!(!window.has_pending_keystrokes()));
+        test.update(cx, |test, _| {
+            assert_eq!(test.action_count.get(), 0);
+            assert_eq!(test.text.borrow().as_str(), "j");
+        });
+    }
+
+    #[crate::test]
+    fn test_pending_input_timeout_dispatches_shorter_binding(cx: &mut TestAppContext) {
+        let (cx, action_count, secondary_action_count) = setup_pending_input_timeout_test(cx);
+        simulate_pending_binding(cx);
+        cx.update(|window, _| {
+            assert_eq!(
+                window
+                    .pending_input()
+                    .map(|pending_input| pending_input.keystrokes().len()),
+                Some(1)
+            );
+            assert_eq!(
+                window
+                    .pending_input()
+                    .and_then(|pending_input| pending_input.timeout())
+                    .map(|timeout| timeout.duration()),
+                Some(crate::PENDING_INPUT_TIMEOUT)
+            );
+        });
+        assert_eq!(action_count.get(), 0);
+
+        // Emulate a countdown indicator re-rendering the window while waiting for the timeout.
+        for _ in 0..10 {
+            cx.executor()
+                .advance_clock(crate::PENDING_INPUT_TIMEOUT / 10);
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+        }
+
+        cx.update(|window, _| assert!(!window.has_pending_keystrokes()));
+        assert_eq!(action_count.get(), 1);
+        assert_eq!(secondary_action_count.get(), 0);
+    }
+
+    #[crate::test]
+    fn test_running_pending_input_timeout_resets_when_binding_advances(cx: &mut TestAppContext) {
+        let (cx, action_count, secondary_action_count) = setup_pending_input_timeout_test(cx);
+        simulate_pending_binding(cx);
+
+        cx.executor()
+            .advance_clock(crate::PENDING_INPUT_TIMEOUT * 4 / 5);
+        cx.run_until_parked();
+        cx.simulate_keystrokes("h");
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            let pending_input = window.pending_input().expect("pending input");
+            let timeout = pending_input.timeout().expect("pending input timeout");
+            assert_eq!(pending_input.keystrokes().len(), 2);
+            assert!(!timeout.is_paused());
+            assert_eq!(timeout.remaining(cx), crate::PENDING_INPUT_TIMEOUT);
+        });
+
+        cx.executor()
+            .advance_clock(crate::PENDING_INPUT_TIMEOUT / 5);
+        cx.run_until_parked();
+        cx.update(|window, _| assert!(window.has_pending_keystrokes()));
+        assert_eq!(action_count.get(), 0);
+        assert_eq!(secondary_action_count.get(), 0);
+
+        cx.executor()
+            .advance_clock(crate::PENDING_INPUT_TIMEOUT * 4 / 5);
+        cx.run_until_parked();
+        cx.update(|window, _| assert!(!window.has_pending_keystrokes()));
+        assert_eq!(action_count.get(), 0);
+        assert_eq!(secondary_action_count.get(), 1);
+    }
+
+    #[crate::test]
+    fn test_pending_input_timeout_starts_when_binding_becomes_ambiguous(cx: &mut TestAppContext) {
+        let (cx, action_count, secondary_action_count) = setup_pending_input_test(
+            cx,
+            [
+                KeyBinding::new("ctrl-b h", SecondaryTestAction, Some("Terminal")),
+                KeyBinding::new("ctrl-b h j", TestAction, Some("Terminal")),
+            ],
+        );
+        simulate_pending_binding(cx);
+
+        cx.update(|window, _| {
+            let pending_input = window.pending_input().expect("pending input");
+            assert_eq!(pending_input.keystrokes().len(), 1);
+            assert!(pending_input.timeout().is_none());
+        });
+
+        cx.simulate_keystrokes("h");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let pending_input = window.pending_input().expect("pending input");
+            let timeout = pending_input.timeout().expect("pending input timeout");
+            assert_eq!(pending_input.keystrokes().len(), 2);
+            assert_eq!(timeout.remaining(cx), crate::PENDING_INPUT_TIMEOUT);
+        });
+
+        cx.executor().advance_clock(crate::PENDING_INPUT_TIMEOUT);
+        cx.run_until_parked();
+        cx.update(|window, _| assert!(!window.has_pending_keystrokes()));
+        assert_eq!(action_count.get(), 0);
+        assert_eq!(secondary_action_count.get(), 1);
+    }
+
+    #[crate::test]
+    fn test_invalid_continuation_while_timeout_paused_replays_pending_input(
+        cx: &mut TestAppContext,
+    ) {
+        let (cx, action_count, secondary_action_count) = setup_pending_input_test(
+            cx,
+            [
+                KeyBinding::new("ctrl-b", TestAction, Some("Terminal")),
+                KeyBinding::new("ctrl-b h", SecondaryTestAction, Some("Terminal")),
+                KeyBinding::new("x", SecondaryTestAction, Some("Terminal")),
+            ],
+        );
+        simulate_pending_binding(cx);
+        let pause_owner = cx.update(|_, cx| cx.new(|_| PendingInputTimeoutPauseOwner));
+        cx.update(|window, cx| {
+            assert!(window.set_pending_input_timeout_paused(&pause_owner, true, cx));
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("x");
+        cx.run_until_parked();
+
+        cx.update(|window, _| assert!(!window.has_pending_keystrokes()));
+        assert_eq!(action_count.get(), 1);
+        assert_eq!(secondary_action_count.get(), 1);
+
+        drop(pause_owner);
+        cx.update(|_, _| {});
+        cx.run_until_parked();
+        cx.executor().advance_clock(crate::PENDING_INPUT_TIMEOUT);
+        cx.run_until_parked();
+
+        cx.update(|window, _| assert!(window.pending_input_is_none()));
+        assert_eq!(action_count.get(), 1);
+        assert_eq!(secondary_action_count.get(), 1);
+    }
+
+    #[crate::test]
+    fn test_pending_input_timeout_pauses_and_resumes(cx: &mut TestAppContext) {
+        let (cx, action_count, secondary_action_count) = setup_pending_input_timeout_test(cx);
+        simulate_pending_binding(cx);
+
+        cx.executor()
+            .advance_clock(crate::PENDING_INPUT_TIMEOUT * 7 / 10);
+        cx.run_until_parked();
+
+        let pause_owner = cx.update(|_, cx| cx.new(|_| PendingInputTimeoutPauseOwner));
+        let other_owner = cx.update(|_, cx| cx.new(|_| PendingInputTimeoutPauseOwner));
+        cx.update(|window, cx| {
+            assert!(window.set_pending_input_timeout_paused(&pause_owner, true, cx));
+            assert!(!window.set_pending_input_timeout_paused(&pause_owner, true, cx));
+            assert!(!window.set_pending_input_timeout_paused(&other_owner, false, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let timeout = window
+                .pending_input()
+                .and_then(|pending_input| pending_input.timeout())
+                .expect("pending input timeout");
+            assert!(timeout.is_paused());
+            assert_eq!(timeout.remaining(cx), crate::PENDING_INPUT_TIMEOUT * 3 / 10);
+        });
+
+        cx.executor()
+            .advance_clock(crate::PENDING_INPUT_TIMEOUT * 2);
+        cx.run_until_parked();
+        cx.update(|window, _| assert!(window.has_pending_keystrokes()));
+        assert_eq!(action_count.get(), 0);
+
+        cx.update(|window, cx| {
+            assert!(window.set_pending_input_timeout_paused(&pause_owner, false, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let timeout = window
+                .pending_input()
+                .and_then(|pending_input| pending_input.timeout())
+                .expect("pending input timeout");
+            assert!(!timeout.is_paused());
+            assert_eq!(timeout.remaining(cx), crate::PENDING_INPUT_TIMEOUT * 3 / 10);
+        });
+
+        cx.executor()
+            .advance_clock(crate::PENDING_INPUT_TIMEOUT * 3 / 10);
+        cx.run_until_parked();
+
+        cx.update(|window, _| assert!(!window.has_pending_keystrokes()));
+        assert_eq!(action_count.get(), 1);
+        assert_eq!(secondary_action_count.get(), 0);
+    }
+
+    #[crate::test]
+    fn test_pending_input_timeout_resumes_when_owner_is_released(cx: &mut TestAppContext) {
+        let (cx, action_count, secondary_action_count) = setup_pending_input_timeout_test(cx);
+        simulate_pending_binding(cx);
+
+        cx.executor()
+            .advance_clock(crate::PENDING_INPUT_TIMEOUT * 7 / 10);
+        cx.run_until_parked();
+
+        let pause_owner = cx.update(|_, cx| cx.new(|_| PendingInputTimeoutPauseOwner));
+        cx.update(|window, cx| {
+            assert!(window.set_pending_input_timeout_paused(&pause_owner, true, cx));
+        });
+        cx.run_until_parked();
+
+        drop(pause_owner);
+        cx.update(|_, _| {});
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let timeout = window
+                .pending_input()
+                .and_then(|pending_input| pending_input.timeout())
+                .expect("pending input timeout");
+            assert!(!timeout.is_paused());
+            assert_eq!(timeout.remaining(cx), crate::PENDING_INPUT_TIMEOUT * 3 / 10);
+        });
+
+        cx.executor()
+            .advance_clock(crate::PENDING_INPUT_TIMEOUT * 3 / 10);
+        cx.run_until_parked();
+
+        cx.update(|window, _| assert!(!window.has_pending_keystrokes()));
+        assert_eq!(action_count.get(), 1);
+        assert_eq!(secondary_action_count.get(), 0);
+    }
+
+    #[crate::test]
+    fn test_pending_input_timeout_resets_when_binding_advances(cx: &mut TestAppContext) {
+        let (cx, action_count, secondary_action_count) = setup_pending_input_timeout_test(cx);
+        simulate_pending_binding(cx);
+        cx.executor()
+            .advance_clock(crate::PENDING_INPUT_TIMEOUT / 2);
+        cx.run_until_parked();
+        let pause_owner = cx.update(|_, cx| cx.new(|_| PendingInputTimeoutPauseOwner));
+        cx.update(|window, cx| {
+            assert!(window.set_pending_input_timeout_paused(&pause_owner, true, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let timeout = window
+                .pending_input()
+                .and_then(|pending_input| pending_input.timeout())
+                .expect("pending input timeout");
+            assert_eq!(timeout.remaining(cx), crate::PENDING_INPUT_TIMEOUT / 2);
+        });
+
+        cx.simulate_keystrokes("h");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let pending_input = window.pending_input().expect("pending input");
+            let timeout = pending_input.timeout().expect("pending input timeout");
+            assert_eq!(pending_input.keystrokes().len(), 2);
+            assert!(timeout.is_paused());
+            assert_eq!(timeout.remaining(cx), crate::PENDING_INPUT_TIMEOUT);
+        });
+
+        cx.executor()
+            .advance_clock(crate::PENDING_INPUT_TIMEOUT * 2);
+        cx.run_until_parked();
+        cx.update(|window, _| assert!(window.has_pending_keystrokes()));
+        assert_eq!(action_count.get(), 0);
+        assert_eq!(secondary_action_count.get(), 0);
+
+        cx.update(|window, cx| {
+            assert!(window.set_pending_input_timeout_paused(&pause_owner, false, cx));
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(crate::PENDING_INPUT_TIMEOUT);
+        cx.run_until_parked();
+
+        cx.update(|window, _| assert!(!window.has_pending_keystrokes()));
+        assert_eq!(action_count.get(), 0);
+        assert_eq!(secondary_action_count.get(), 1);
+    }
+
+    #[crate::test]
+    fn test_clearing_pending_input_invalidates_timeout_pause(cx: &mut TestAppContext) {
+        let (cx, action_count, secondary_action_count) = setup_pending_input_timeout_test(cx);
+        simulate_pending_binding(cx);
+        let pause_owner = cx.update(|_, cx| cx.new(|_| PendingInputTimeoutPauseOwner));
+        cx.update(|window, cx| {
+            assert!(window.set_pending_input_timeout_paused(&pause_owner, true, cx));
+            window.focus(&cx.focus_handle(), cx);
+            assert!(!window.has_pending_keystrokes());
+        });
+
+        drop(pause_owner);
+        cx.update(|_, _| {});
+        cx.run_until_parked();
+        cx.executor().advance_clock(crate::PENDING_INPUT_TIMEOUT);
+        cx.run_until_parked();
+
+        cx.update(|window, _| assert!(window.pending_input_is_none()));
+        assert_eq!(action_count.get(), 0);
+        assert_eq!(secondary_action_count.get(), 0);
     }
 
     #[crate::test]
     fn test_input_handler_pending(cx: &mut TestAppContext) {
-        #[derive(Clone)]
-        struct CustomElement {
-            focus_handle: FocusHandle,
-            text: Rc<RefCell<String>>,
-            action_count: Rc<Cell<usize>>,
-        }
-        impl CustomElement {
-            fn new(cx: &mut Context<Self>) -> Self {
-                Self {
-                    focus_handle: cx.focus_handle(),
-                    text: Rc::default(),
-                    action_count: Rc::default(),
-                }
-            }
-        }
-        impl Element for CustomElement {
-            type RequestLayoutState = ();
-
-            type PrepaintState = ();
-
-            fn id(&self) -> Option<ElementId> {
-                Some("custom".into())
-            }
-            fn source_location(&self) -> Option<&'static panic::Location<'static>> {
-                None
-            }
-            fn request_layout(
-                &mut self,
-                _: Option<&GlobalElementId>,
-                _: Option<&InspectorElementId>,
-                window: &mut Window,
-                cx: &mut App,
-            ) -> (LayoutId, Self::RequestLayoutState) {
-                (window.request_layout(Style::default(), [], cx), ())
-            }
-            fn prepaint(
-                &mut self,
-                _: Option<&GlobalElementId>,
-                _: Option<&InspectorElementId>,
-                _: Bounds<Pixels>,
-                _: &mut Self::RequestLayoutState,
-                window: &mut Window,
-                cx: &mut App,
-            ) -> Self::PrepaintState {
-                window.set_focus_handle(&self.focus_handle, cx);
-            }
-            fn paint(
-                &mut self,
-                _: Option<&GlobalElementId>,
-                _: Option<&InspectorElementId>,
-                _: Bounds<Pixels>,
-                _: &mut Self::RequestLayoutState,
-                _: &mut Self::PrepaintState,
-                window: &mut Window,
-                cx: &mut App,
-            ) {
-                let mut key_context = KeyContext::default();
-                key_context.add("Terminal");
-                window.set_key_context(key_context);
-                window.handle_input(&self.focus_handle, self.clone(), cx);
-                let action_count = self.action_count.clone();
-                window.on_action(
-                    std::any::TypeId::of::<TestAction>(),
-                    move |_, phase, _, _| {
-                        if phase == DispatchPhase::Bubble {
-                            action_count.set(action_count.get() + 1);
-                        }
-                    },
-                );
-            }
-        }
-        impl IntoElement for CustomElement {
-            type Element = Self;
-
-            fn into_element(self) -> Self::Element {
-                self
-            }
-        }
-
-        impl InputHandler for CustomElement {
-            fn selected_text_range(
-                &mut self,
-                _: bool,
-                _: &mut Window,
-                _: &mut App,
-            ) -> Option<UTF16Selection> {
-                None
-            }
-
-            fn marked_text_range(&mut self, _: &mut Window, _: &mut App) -> Option<Range<usize>> {
-                None
-            }
-
-            fn text_for_range(
-                &mut self,
-                _: Range<usize>,
-                _: &mut Option<Range<usize>>,
-                _: &mut Window,
-                _: &mut App,
-            ) -> Option<String> {
-                None
-            }
-
-            fn replace_text_in_range(
-                &mut self,
-                replacement_range: Option<Range<usize>>,
-                text: &str,
-                _: &mut Window,
-                _: &mut App,
-            ) {
-                if replacement_range.is_some() {
-                    unimplemented!()
-                }
-                self.text.borrow_mut().push_str(text)
-            }
-
-            fn replace_and_mark_text_in_range(
-                &mut self,
-                replacement_range: Option<Range<usize>>,
-                new_text: &str,
-                _: Option<Range<usize>>,
-                _: &mut Window,
-                _: &mut App,
-            ) {
-                if replacement_range.is_some() {
-                    unimplemented!()
-                }
-                self.text.borrow_mut().push_str(new_text)
-            }
-
-            fn unmark_text(&mut self, _: &mut Window, _: &mut App) {}
-
-            fn prefers_ime_for_printable_keys(&mut self, _: &mut Window, _: &mut App) -> bool {
-                true
-            }
-
-            fn bounds_for_range(
-                &mut self,
-                _: Range<usize>,
-                _: &mut Window,
-                _: &mut App,
-            ) -> Option<Bounds<Pixels>> {
-                None
-            }
-
-            fn character_index_for_point(
-                &mut self,
-                _: Point<Pixels>,
-                _: &mut Window,
-                _: &mut App,
-            ) -> Option<usize> {
-                None
-            }
-        }
-        impl Render for CustomElement {
-            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                self.clone()
-            }
-        }
-
         cx.update(|cx| {
             cx.bind_keys([KeyBinding::new("ctrl-b", TestAction, Some("Terminal"))]);
             cx.bind_keys([KeyBinding::new("ctrl-b h", TestAction, Some("Terminal"))]);
             cx.bind_keys([KeyBinding::new("ctrl-x k", TestAction, Some("Terminal"))]);
         });
-        let (test, cx) = cx.add_window_view(|_, cx| CustomElement::new(cx));
+        let (test, cx) = cx.add_window_view(|_, cx| PendingTextInputTestView::new(cx));
         let focus_handle = test.update(cx, |test, _| test.focus_handle.clone());
         cx.update(|window, cx| {
             window.focus(&focus_handle, cx);
-            window.activate_window();
+            window.activate();
         });
-
-        let query_prefers_ime_for_printable_keys = |cx: &mut VisualTestContext| {
-            let mut platform_window = cx.test_window(cx.window_handle());
-            let mut input_handler = platform_window.take_input_handler()?;
-            let prefers_ime = input_handler.query_prefers_ime_for_printable_keys();
-            platform_window.set_input_handler(input_handler);
-            Some(prefers_ime)
-        };
 
         assert_eq!(query_prefers_ime_for_printable_keys(cx), Some(true));
         cx.simulate_keystrokes("ctrl-x");
@@ -1226,10 +2189,10 @@ mod tests {
         let prefers_ime_after_blur = {
             let mut platform_window = cx.test_window(cx.window_handle());
             let mut input_handler = platform_window.take_input_handler();
-            cx.update(|window, _| {
-                window.blur();
+            cx.update(|window, cx| {
+                window.blur(cx);
                 assert!(!window.has_pending_keystrokes());
-                assert!(window.pending_input_keystrokes().is_none());
+                assert!(window.pending_input_is_none());
             });
             let prefers_ime = input_handler
                 .as_mut()

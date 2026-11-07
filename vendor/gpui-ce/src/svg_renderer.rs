@@ -1,5 +1,5 @@
 use crate::{
-    AssetSource, DevicePixels, IsZero, RenderImage, Result, SharedString, Size,
+    AssetRegistry, DevicePixels, IsZero, RenderImage, Result, SharedString, Size,
     swap_rgba_pa_to_bgra,
 };
 use image::Frame;
@@ -78,7 +78,10 @@ fn select_emoji_font(
     None
 }
 
-/// When rendering SVGs, we render them at twice the size to get a higher-quality result.
+/// The multiplier used when [`SvgRenderer::render_parsed`] rasterizes a scale-factor request.
+///
+/// The SVG is drawn at this multiple of the requested size and tagged with the same factor. It is
+/// then displayed at the requested logical size, with smoother edges.
 pub const SMOOTH_SVG_SCALE_FACTOR: f32 = 2.;
 
 #[derive(Clone, PartialEq, Hash, Eq)]
@@ -88,24 +91,49 @@ pub struct RenderSvgParams {
     pub size: Size<DevicePixels>,
 }
 
+/// Parses and rasterizes SVG documents, resolving their fonts from the app's [`crate::AssetRegistry`].
+///
+/// The app holds one, and [`crate::App::svg_renderer`] returns it. The renderer looks for
+/// `fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf` and `fonts/lilex/Lilex-Regular.ttf` in the registry
+/// and loads each as a font. It logs a warning when one is missing, and falls back to system emoji
+/// fonts for emoji.
 #[derive(Clone)]
-/// A struct holding everything necessary to render SVGs.
 pub struct SvgRenderer {
-    asset_source: Arc<dyn AssetSource>,
+    asset_registry: Arc<AssetRegistry>,
     usvg_options: Arc<usvg::Options<'static>>,
 }
 
-/// The size in which to render the SVG.
+/// A parsed SVG document that can be rasterized at any scale.
+///
+/// Produced by [`SvgRenderer::parse_svg`] and rasterized by
+/// [`SvgRenderer::render_parsed`]. Parsing resolves fonts and converts text to paths. Retain this
+/// value when the same SVG will be rasterized at several scales so that the parse cost is paid
+/// only once.
+pub struct ParsedSvg(usvg::Tree);
+
+/// The size at which [`SvgRenderer::render_parsed`] rasterizes an SVG.
+#[derive(Clone, Copy)]
 pub enum SvgSize {
-    /// An absolute size in device pixels.
+    /// A width in device pixels. The height follows the SVG's aspect ratio.
     Size(Size<DevicePixels>),
-    /// A scaling factor to apply to the size provided by the SVG.
+    /// An exact width and height in device pixels. The SVG is stretched if the ratio differs.
+    ExactSize(Size<DevicePixels>),
+    /// A multiple of the SVG's own size, in logical pixels. `1.0` is the natural size.
     ScaleFactor(f32),
 }
 
+impl From<f32> for SvgSize {
+    fn from(scale_factor: f32) -> Self {
+        Self::ScaleFactor(scale_factor)
+    }
+}
+
 impl SvgRenderer {
-    /// Creates a new SVG renderer with the provided asset source.
-    pub fn new(asset_source: Arc<dyn AssetSource>) -> Self {
+    /// Creates a renderer that loads fonts and files from `asset_registry`.
+    ///
+    /// [`crate::Application::with_assets`] creates one for you. System fonts are scanned once per process,
+    /// the first time a font is needed.
+    pub fn new(asset_registry: Arc<AssetRegistry>) -> Self {
         static SYSTEM_FONT_DB: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
             let mut db = usvg::fontdb::Database::new();
             db.load_system_fonts();
@@ -120,12 +148,12 @@ impl SvgRenderer {
 
         let default_font_resolver = usvg::FontResolver::default_font_selector();
         let font_resolver = Box::new({
-            let asset_source = asset_source.clone();
+            let asset_database = asset_registry.clone();
             move |font: &usvg::Font, db: &mut Arc<usvg::fontdb::Database>| {
                 if db.is_empty() {
                     let fontdb = enriched_fontdb.get_or_init(|| {
                         let mut db = (**SYSTEM_FONT_DB).clone();
-                        load_bundled_fonts(&*asset_source, &mut db);
+                        load_bundled_fonts(&asset_database, &mut db);
                         fix_generic_font_families(&mut db);
                         Arc::new(db)
                     });
@@ -165,34 +193,86 @@ impl SvgRenderer {
             ..Default::default()
         };
         Self {
-            asset_source,
+            asset_registry,
             usvg_options: Arc::new(options),
         }
     }
 
-    /// Renders the given bytes into an image buffer.
+    /// Parses SVG bytes into a [`ParsedSvg`], which can then be rasterized at any size.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `usvg::Error` if `bytes` is not a valid SVG document.
+    #[tracing::instrument(skip_all)]
+    pub fn parse_svg(&self, bytes: &[u8]) -> Result<ParsedSvg, usvg::Error> {
+        usvg::Tree::from_data(bytes, &self.usvg_options).map(ParsedSvg)
+    }
+
+    /// Rasterizes a parsed SVG at `size` into a [`RenderImage`].
+    ///
+    /// A scale-factor size is drawn at [`SMOOTH_SVG_SCALE_FACTOR`] times the requested size, and the
+    /// image is marked so that it displays at the logical size. `Size` and `ExactSize` use device
+    /// pixels and are not scaled further. A result larger than 8192 pixels on either side is scaled
+    /// down to fit.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `usvg::Error` if the rasterized size is zero, such as for a zero requested size.
+    #[tracing::instrument(skip_all)]
+    pub fn render_parsed(
+        &self,
+        svg: &ParsedSvg,
+        size: impl Into<SvgSize>,
+    ) -> Result<Arc<RenderImage>, usvg::Error> {
+        let (size, image_scale_factor) = match size.into() {
+            SvgSize::Size(size) => (SvgSize::Size(size), 1.0),
+            SvgSize::ExactSize(size) => (SvgSize::ExactSize(size), 1.0),
+            SvgSize::ScaleFactor(scale_factor) => (
+                SvgSize::ScaleFactor(scale_factor * SMOOTH_SVG_SCALE_FACTOR),
+                SMOOTH_SVG_SCALE_FACTOR,
+            ),
+        };
+        let pixmap = rasterize_tree(&svg.0, size)?;
+        let mut buffer =
+            image::ImageBuffer::from_raw(pixmap.width(), pixmap.height(), pixmap.take()).unwrap();
+
+        for pixel in buffer.chunks_exact_mut(4) {
+            swap_rgba_pa_to_bgra(pixel);
+        }
+
+        let mut image = RenderImage::new(SmallVec::from_const([Frame::new(buffer)]));
+        image.scale_factor = image_scale_factor;
+        Ok(Arc::new(image))
+    }
+
+    /// Parses and rasterizes `bytes` at a logical `scale_factor`, in one call.
+    ///
+    /// This is [`SvgRenderer::parse_svg`] followed by [`SvgRenderer::render_parsed`] with
+    /// [`SvgSize::ScaleFactor`]. If you need the same SVG at several sizes, parse it once and call
+    /// `render_parsed` for each size.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `usvg::Error` if `bytes` is not a valid SVG, or if the rasterized size is zero.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use gpui::*;
+    /// # use std::sync::Arc;
+    /// let renderer = SvgRenderer::new(Arc::new(AssetRegistry::default()));
+    /// let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="12"></svg>"#;
+    /// let image = renderer.render_single_frame(svg, 1.0).unwrap();
+    ///
+    /// assert_eq!(image.frame_count(), 1);
+    /// ```
     pub fn render_single_frame(
         &self,
         bytes: &[u8],
         scale_factor: f32,
     ) -> Result<Arc<RenderImage>, usvg::Error> {
-        self.render_pixmap(
-            bytes,
-            SvgSize::ScaleFactor(scale_factor * SMOOTH_SVG_SCALE_FACTOR),
-        )
-        .map(|pixmap| {
-            let mut buffer =
-                image::ImageBuffer::from_raw(pixmap.width(), pixmap.height(), pixmap.take())
-                    .unwrap();
-
-            for pixel in buffer.chunks_exact_mut(4) {
-                swap_rgba_pa_to_bgra(pixel);
-            }
-
-            let mut image = RenderImage::new(SmallVec::from_const([Frame::new(buffer)]));
-            image.scale_factor = SMOOTH_SVG_SCALE_FACTOR;
-            Arc::new(image)
-        })
+        let svg = self.parse_svg(bytes)?;
+        self.render_parsed(&svg, scale_factor)
     }
 
     pub(crate) fn render_alpha_mask(
@@ -221,7 +301,7 @@ impl SvgRenderer {
 
         if let Some(bytes) = bytes {
             render_pixmap(bytes)
-        } else if let Some(bytes) = self.asset_source.load(&params.path)? {
+        } else if let Some(bytes) = self.asset_registry.load(&params.path) {
             render_pixmap(&bytes)
         } else {
             Ok(None)
@@ -229,55 +309,59 @@ impl SvgRenderer {
     }
 
     fn render_pixmap(&self, bytes: &[u8], size: SvgSize) -> Result<Pixmap, usvg::Error> {
-        // Cap the size of the rendered pixmap to avoid texture allocation panics
-        // Related issue: #56466
-        const MAX_SIZE: f32 = 8192.0;
-
         let tree = usvg::Tree::from_data(bytes, &self.usvg_options)?;
-        let svg_size = tree.size();
-        let mut scale = match size {
-            SvgSize::Size(size) => size.width.0 as f32 / svg_size.width(),
-            SvgSize::ScaleFactor(scale) => scale,
-        };
-
-        let width = svg_size.width() * scale;
-        if width > MAX_SIZE {
-            log::warn!("Attempted to render pixmap where width ({width}) > MAX_SIZE ({MAX_SIZE})");
-            scale *= MAX_SIZE / width;
-        }
-        let height = svg_size.height() * scale;
-        if height > MAX_SIZE {
-            log::warn!(
-                "Attempted to render pixmap where height ({height}) > MAX_SIZE ({MAX_SIZE})"
-            );
-            scale *= MAX_SIZE / height;
-        }
-
-        // Render the SVG to a pixmap with the specified width and height.
-        let mut pixmap = resvg::tiny_skia::Pixmap::new(
-            (svg_size.width() * scale) as u32,
-            (svg_size.height() * scale) as u32,
-        )
-        .ok_or(usvg::Error::InvalidSize)?;
-
-        let transform = resvg::tiny_skia::Transform::from_scale(scale, scale);
-
-        resvg::render(&tree, transform, &mut pixmap.as_mut());
-
-        Ok(pixmap)
+        rasterize_tree(&tree, size)
     }
 }
 
-fn load_bundled_fonts(asset_source: &dyn AssetSource, db: &mut usvg::fontdb::Database) {
+fn rasterize_tree(tree: &usvg::Tree, size: SvgSize) -> Result<Pixmap, usvg::Error> {
+    // Cap the size of the rendered pixmap to avoid texture allocation panics
+    // Related issue: #56466
+    const MAX_SIZE: f32 = 8192.0;
+
+    let svg_size = tree.size();
+    let (mut width, mut height) = match size {
+        SvgSize::Size(size) => {
+            let scale = i32::from(size.width) as f32 / svg_size.width();
+            (svg_size.width() * scale, svg_size.height() * scale)
+        }
+        SvgSize::ExactSize(size) => (i32::from(size.width) as f32, i32::from(size.height) as f32),
+        SvgSize::ScaleFactor(scale) => (svg_size.width() * scale, svg_size.height() * scale),
+    };
+
+    if width > MAX_SIZE {
+        log::warn!("Attempted to render pixmap where width ({width}) > MAX_SIZE ({MAX_SIZE})");
+    }
+    if height > MAX_SIZE {
+        log::warn!("Attempted to render pixmap where height ({height}) > MAX_SIZE ({MAX_SIZE})");
+    }
+    let scale = (MAX_SIZE / width).min(MAX_SIZE / height).min(1.0);
+    width *= scale;
+    height *= scale;
+
+    // Render the SVG to a pixmap with the specified width and height.
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width as u32, height as u32)
+        .ok_or(usvg::Error::InvalidSize)?;
+
+    let transform = resvg::tiny_skia::Transform::from_scale(
+        width / svg_size.width(),
+        height / svg_size.height(),
+    );
+
+    resvg::render(tree, transform, &mut pixmap.as_mut());
+
+    Ok(pixmap)
+}
+
+fn load_bundled_fonts(asset_database: &AssetRegistry, db: &mut usvg::fontdb::Database) {
     let font_paths = [
         "fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf",
         "fonts/lilex/Lilex-Regular.ttf",
     ];
     for path in font_paths {
-        match asset_source.load(path) {
-            Ok(Some(data)) => db.load_font_data(data.into_owned()),
-            Ok(None) => log::warn!("Bundled font not found: {path}"),
-            Err(error) => log::warn!("Failed to load bundled font {path}: {error}"),
+        match asset_database.load(path) {
+            Some(data) => db.load_font_data(data.into_owned()),
+            None => log::warn!("Bundled font not found: {path}"),
         }
     }
 }
@@ -320,22 +404,46 @@ mod tests {
     use super::*;
     use usvg::fontdb::{Database, Family, Query};
 
-    const IBM_PLEX_REGULAR: &[u8] =
-        include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
-    const LILEX_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf");
+    #[test]
+    fn renders_parsed_svg_at_requested_size() -> Result<()> {
+        let renderer = SvgRenderer::new(Arc::new(AssetRegistry::default()));
+        let svg = renderer.parse_svg(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="24pt" height="12pt"></svg>"#,
+        )?;
+        let requested_size = Size::new(DevicePixels(24), DevicePixels(12));
+        let image = renderer.render_parsed(&svg, SvgSize::ExactSize(requested_size))?;
+
+        assert_eq!(image.size(0), requested_size);
+        Ok(())
+    }
+
+    #[test]
+    fn preserves_aspect_ratio_for_width_constrained_size() -> Result<()> {
+        let renderer = SvgRenderer::new(Arc::new(AssetRegistry::default()));
+        let svg = renderer.parse_svg(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="24pt" height="12pt"></svg>"#,
+        )?;
+        let image = renderer.render_parsed(
+            &svg,
+            SvgSize::Size(Size::new(DevicePixels(24), DevicePixels(24))),
+        )?;
+
+        assert_eq!(image.size(0), Size::new(DevicePixels(24), DevicePixels(12)));
+        Ok(())
+    }
 
     fn db_with_bundled_fonts() -> Database {
         let mut db = Database::new();
-        db.load_font_data(IBM_PLEX_REGULAR.to_vec());
-        db.load_font_data(LILEX_REGULAR.to_vec());
+        db.load_font_data(gpui_fonts::IBM_PLEX.to_vec());
+        db.load_font_data(gpui_fonts::LILEX.to_vec());
         db
     }
 
     #[test]
     fn text_with_split_glyph_clusters_in_mixed_fonts_does_not_panic() {
         let mut db = Database::new();
-        db.load_font_data(IBM_PLEX_REGULAR.to_vec());
-        db.load_font_data(LILEX_REGULAR.to_vec());
+        db.load_font_data(gpui_fonts::IBM_PLEX.to_vec());
+        db.load_font_data(gpui_fonts::LILEX.to_vec());
         let options = usvg::Options {
             fontdb: std::sync::Arc::new(db),
             ..Default::default()

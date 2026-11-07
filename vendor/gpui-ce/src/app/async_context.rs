@@ -12,12 +12,48 @@ use std::{future::Future, rc::Weak};
 
 use super::{Context, WeakEntity};
 
-/// An async-friendly version of [App] with a static lifetime so it can be held across `await` points in async code.
-/// You're provided with an instance when calling [App::spawn], and you can also create one with [App::to_async].
+/// A handle to the app that you can hold across `.await` points.
 ///
-/// Internally, this holds a weak reference to an `App`. Methods will panic if the app has been dropped,
-/// but this should not happen in practice when using foreground tasks spawned via `cx.spawn()`,
-/// as the executor checks if the app is alive before running each task.
+/// [`App`] can't be borrowed across an `.await`, because the rest of the application
+/// needs it while your future waits. `AsyncApp` is the alternative: you get one as
+/// the argument of a future started with [`App::spawn`], or from [`App::to_async`].
+/// Each method borrows the app for the length of one call, runs a complete update,
+/// and releases the borrow. Entity methods are on the [`AppContext`] trait, which
+/// `AsyncApp` implements, so helpers written against that trait work here too.
+///
+/// `AsyncApp` holds a weak reference to the app, so it doesn't keep the app alive.
+/// Most methods panic if the app has been released. The `AppContext` methods that return a
+/// `Result` or `Option`, such as `update_window` and `with_window`, report it as an error or
+/// `None` instead. Keep an `AsyncApp` only inside the futures that use it. One stored
+/// somewhere else can outlive the app.
+///
+/// See [contexts](crate::_documentation::concepts::contexts#async-contexts) for how
+/// async contexts fit with the other contexts.
+///
+/// # Examples
+///
+/// ```
+/// use gpui::{AppContext, TestApp};
+///
+/// let mut app = TestApp::new();
+/// let count = app.update(|cx| cx.new(|_| 0_usize));
+///
+/// let task = app.to_async().spawn({
+///     let count = count.clone();
+///     async move |cx| {
+///         cx.update(|cx| {
+///             count.update(cx, |count, cx| {
+///                 *count += 1;
+///                 cx.notify();
+///             })
+///         });
+///     }
+/// });
+/// task.detach();
+///
+/// app.run_until_parked();
+/// app.read(|cx| assert_eq!(*count.read(cx), 1));
+/// ```
 #[derive(Clone)]
 pub struct AsyncApp {
     pub(crate) app: Weak<AppCell>,
@@ -56,6 +92,7 @@ impl AppContext for AsyncApp {
         app.insert_entity(reservation, build_entity)
     }
 
+    #[inline(always)]
     fn update_entity<T: 'static, R>(
         &mut self,
         handle: &Entity<T>,
@@ -73,6 +110,7 @@ impl AppContext for AsyncApp {
         panic!("Cannot as_mut with an async context. Try calling update() first")
     }
 
+    #[inline(always)]
     fn read_entity<T, R>(&self, handle: &Entity<T>, callback: impl FnOnce(&T, &App) -> R) -> R
     where
         T: 'static,
@@ -82,6 +120,23 @@ impl AppContext for AsyncApp {
         lock.read_entity(handle, callback)
     }
 
+    fn notify(&mut self, entity_id: EntityId) {
+        let app = self.app();
+        let mut lock = app.borrow_mut();
+        lock.notify(entity_id);
+    }
+
+    fn emit<EntityType, EventType>(&mut self, entity: &Entity<EntityType>, event: EventType)
+    where
+        EntityType: EventEmitter<EventType>,
+        EventType: 'static,
+    {
+        let app = self.app();
+        let mut lock = app.borrow_mut();
+        lock.emit(entity, event)
+    }
+
+    #[inline(always)]
     fn update_window<T, F>(&mut self, window: AnyWindowHandle, f: F) -> Result<T>
     where
         F: FnOnce(AnyView, &mut Window, &mut App) -> T,
@@ -94,6 +149,7 @@ impl AppContext for AsyncApp {
         lock.update_window(window, f)
     }
 
+    #[inline(always)]
     fn with_window<R>(
         &mut self,
         entity_id: EntityId,
@@ -139,35 +195,77 @@ impl AppContext for AsyncApp {
         let mut lock = app.borrow_mut();
         lock.update(|this| this.read_global(callback))
     }
+
+    fn insert_global_entity<T: 'static>(&mut self, entity: Entity<T>) {
+        let app = self.app();
+        let mut lock = app.borrow_mut();
+        lock.insert_global_entity(entity)
+    }
+
+    fn remove_global_entity<T: 'static>(&mut self, entity: &Entity<T>) {
+        let app = self.app();
+        let mut lock = app.borrow_mut();
+        lock.remove_global_entity(entity)
+    }
+
+    fn global_entities<T: 'static>(&self) -> impl Iterator<Item = Entity<T>> {
+        let app = self.app();
+        let mut lock = app.borrow_mut();
+        let iter = lock.global_entities();
+        // Cloning the iterator here so that lock can be released when function is going out of scope
+        iter.collect::<Vec<_>>().into_iter()
+    }
 }
 
 impl AsyncApp {
-    /// Schedules all windows in the application to be redrawn.
+    /// Schedules a redraw of every window.
+    ///
+    /// The windows draw on the next frame. This doesn't draw anything itself.
     pub fn refresh(&self) {
         let app = self.app();
         let mut lock = app.borrow_mut();
-        lock.refresh_windows();
+        // A direct call would leave the refresh effect queued, which cannot wake
+        // a platform render loop that has already parked.
+        lock.update(|cx| cx.refresh_windows());
     }
 
-    /// Get an executor which can be used to spawn futures in the background.
+    /// Returns the [`BackgroundExecutor`], for running work on other threads.
     pub fn background_executor(&self) -> &BackgroundExecutor {
         &self.background_executor
     }
 
-    /// Get an executor which can be used to spawn futures in the foreground.
+    /// Whether this app runs on the deterministic test scheduler. See
+    /// [`BackgroundExecutor::is_test`].
+    pub fn is_test(&self) -> bool {
+        self.background_executor.is_test()
+    }
+
+    /// Returns the [`ForegroundExecutor`], for running futures on the main thread.
     pub fn foreground_executor(&self) -> &ForegroundExecutor {
         &self.foreground_executor
     }
 
-    /// Invoke the given function in the context of the app, then flush any effects produced during its invocation.
+    /// Runs `f` with the app and returns its result.
+    ///
+    /// Effects queued by `f`, such as notifications, are flushed before this returns.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the app has been released, or if it is already borrowed, such as when
+    /// called from inside another update.
+    #[inline(always)]
     pub fn update<R>(&self, f: impl FnOnce(&mut App) -> R) -> R {
         let app = self.app();
         let mut lock = app.borrow_mut();
         lock.update(f)
     }
 
-    /// Arrange for the given callback to be invoked whenever the given entity emits an event of a given type.
-    /// The callback is provided a handle to the emitting entity and a reference to the emitted event.
+    /// Calls `on_event` each time `entity` emits an `Event`.
+    ///
+    /// The callback receives the emitting entity, the event and the app. The
+    /// subscription stays active while you hold it. Dropping it unsubscribes, and
+    /// [`Subscription::detach`] keeps the subscription for as long as the entity lives.
+    /// Inside an entity's own context, [`Context::subscribe`] is the usual choice.
     pub fn subscribe<T, Event>(
         &mut self,
         entity: &Entity<T>,
@@ -182,7 +280,14 @@ impl AsyncApp {
         lock.subscribe(entity, on_event)
     }
 
-    /// Open a window with the given options based on the root view returned by the given function.
+    /// Opens a window with `options` and returns a handle to it.
+    ///
+    /// `build_root_view` creates the window's root view. The method returns an error if the app is
+    /// quitting.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the app has been released, or if it is already borrowed.
     pub fn open_window<V>(
         &self,
         options: crate::WindowOptions,
@@ -199,8 +304,13 @@ impl AsyncApp {
         lock.open_window(options, build_root_view)
     }
 
-    /// Schedule a future to be polled in the foreground.
+    /// Runs the future returned by `f` on the main thread, and returns a task for its
+    /// result.
+    ///
+    /// `f` receives an `&mut AsyncApp`. Dropping the returned [`Task`] cancels the
+    /// future, so store it, await it or call [`Task::detach`].
     #[track_caller]
+    #[inline(always)]
     pub fn spawn<AsyncFn, R>(&self, f: AsyncFn) -> Task<R>
     where
         AsyncFn: AsyncFnOnce(&mut AsyncApp) -> R + 'static,
@@ -211,25 +321,29 @@ impl AsyncApp {
             .spawn(async move { f(&mut cx).await }.boxed_local())
     }
 
-    /// Determine whether global state of the specified type has been assigned.
+    /// Returns whether a global of type `G` has been set.
     pub fn has_global<G: Global>(&self) -> bool {
         let app = self.app();
         let app = app.borrow_mut();
         app.has_global::<G>()
     }
 
-    /// Reads the global state of the specified type, passing it to the given callback.
+    /// Calls `read` with the global of type `G` and the app, and returns its result.
     ///
-    /// Panics if no global state of the specified type has been assigned.
+    /// Use [`AsyncApp::try_read_global`] if the global may not be set.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no global of type `G` has been set, or if the app has been released.
+    #[inline(always)]
     pub fn read_global<G: Global, R>(&self, read: impl FnOnce(&G, &App) -> R) -> R {
         let app = self.app();
         let app = app.borrow_mut();
         read(app.global(), &app)
     }
 
-    /// Reads the global state of the specified type, passing it to the given callback.
-    ///
-    /// Similar to [`AsyncApp::read_global`], but returns an error instead of panicking
+    /// Like [`AsyncApp::read_global`], but returns `None` instead of panicking when no
+    /// global of type `G` is set, or when the app is quitting.
     pub fn try_read_global<G: Global, R>(&self, read: impl FnOnce(&G, &App) -> R) -> Option<R> {
         let app = self.app();
         let app = app.borrow_mut();
@@ -239,8 +353,8 @@ impl AsyncApp {
         Some(read(app.try_global()?, &app))
     }
 
-    /// Reads the global state of the specified type, passing it to the given callback.
-    /// A default value is assigned if a global of this type has not yet been assigned.
+    /// Like [`AsyncApp::read_global`], but first sets a `G::default()` if no global of
+    /// type `G` has been set.
     pub fn read_default_global<G: Global + Default, R>(
         &self,
         read: impl FnOnce(&G, &App) -> R,
@@ -253,15 +367,42 @@ impl AsyncApp {
         read(app.global(), &app)
     }
 
-    /// A convenience method for [`App::update_global`](BorrowAppContext::update_global)
-    /// for updating the global state of the specified type.
+    /// Updates the global of type `G` with `update`, and returns its result.
+    ///
+    /// While `update` runs, the global is taken out of the app. Reading it through the
+    /// app from inside `update` panics, so change the global through the `&mut G` that
+    /// `update` receives.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no global of type `G` has been set, or if the app has been released.
     pub fn update_global<G: Global, R>(&self, update: impl FnOnce(&mut G, &mut App) -> R) -> R {
         let app = self.app();
         let mut app = app.borrow_mut();
         app.update(|cx| cx.update_global(update))
     }
 
-    /// Run something using this entity and cx, when the returned struct is dropped
+    /// Returns a guard that calls `f` with `entity` when the guard is dropped.
+    ///
+    /// `f` doesn't run if the entity has been released by then. Hold the guard in a
+    /// variable. A guard that is dropped at once runs `f` immediately.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gpui::{AppContext, TestApp};
+    ///
+    /// let mut app = TestApp::new();
+    /// let log = app.update(|cx| cx.new(|_| Vec::<&'static str>::new()));
+    /// let guard = app.update(|cx| {
+    ///     cx.to_async().on_drop(&log.downgrade(), |log, cx| {
+    ///         log.push("finished");
+    ///         cx.notify();
+    ///     })
+    /// });
+    /// drop(guard);
+    /// app.read(|cx| assert_eq!(*log.read(cx), vec!["finished"]));
+    /// ```
     pub fn on_drop<T: 'static, Callback: FnOnce(&mut T, &mut Context<T>) + 'static>(
         &self,
         entity: &WeakEntity<T>,
@@ -275,8 +416,48 @@ impl AsyncApp {
     }
 }
 
-/// A cloneable, owned handle to the application context,
-/// composed with the window associated with the current task.
+/// A handle to the app and one window, for use across `.await` points.
+///
+/// Get one from [`Context::spawn_in`] or [`Window::spawn`]. It derefs to
+/// [`AsyncApp`], so the methods of `AsyncApp` are available on it too. The window
+/// methods on this type return an error once the window has closed.
+///
+/// Use it inside a future when you need the window and not only the app. See
+/// [contexts](crate::_documentation::concepts::contexts#async-contexts).
+///
+/// # Examples
+///
+/// ```
+/// use gpui::{Context, Render, TestApp, Window, div, prelude::*};
+///
+/// struct Panel {
+///     updates: usize,
+/// }
+///
+/// impl Render for Panel {
+///     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+///         div()
+///     }
+/// }
+///
+/// let mut app = TestApp::new();
+/// let mut window = app.open_window(|_window, _cx| Panel { updates: 0 });
+///
+/// window.update(|panel, window, cx| {
+///     cx.spawn_in(window, async move |panel, cx| {
+///         panel
+///             .update(cx, |panel, cx| {
+///                 panel.updates += 1;
+///                 cx.notify();
+///             })
+///             .ok();
+///     })
+///     .detach();
+/// });
+///
+/// app.run_until_parked();
+/// window.read(|panel, _cx| assert_eq!(panel.updates, 1));
+/// ```
 #[derive(Clone, Deref, DerefMut)]
 pub struct AsyncWindowContext {
     #[deref]
@@ -290,18 +471,31 @@ impl AsyncWindowContext {
         Self { app, window }
     }
 
-    /// Get the handle of the window this context is associated with.
+    /// Returns the handle of the window this context is for.
     pub fn window_handle(&self) -> AnyWindowHandle {
         self.window
     }
 
-    /// A convenience method for [`App::update_window`].
+    /// Runs `update` with the window and the app, and returns its result.
+    ///
+    /// Effects queued by `update` are flushed before this returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the window has closed, or if the app is quitting or already
+    /// borrowed.
+    #[inline(always)]
     pub fn update<R>(&mut self, update: impl FnOnce(&mut Window, &mut App) -> R) -> Result<R> {
         self.app
             .update_window(self.window, |_, window, cx| update(window, cx))
     }
 
-    /// A convenience method for [`App::update_window`].
+    /// Like [`AsyncWindowContext::update`], but also passes the window's root view.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as [`AsyncWindowContext::update`].
+    #[inline(always)]
     pub fn update_root<R>(
         &mut self,
         update: impl FnOnce(AnyView, &mut Window, &mut App) -> R,
@@ -309,14 +503,27 @@ impl AsyncWindowContext {
         self.app.update_window(self.window, update)
     }
 
-    /// A convenience method for [`Window::on_next_frame`].
+    /// Runs `f` before the window draws its next frame. Does nothing if the window has
+    /// closed.
+    ///
+    /// Schedules the callback like [`Window::on_next_frame`], but tolerates a window that has
+    /// already been closed.
     pub fn on_next_frame(&mut self, f: impl FnOnce(&mut Window, &mut App) + 'static) {
         self.app
             .update_window(self.window, |_, window, _| window.on_next_frame(f))
             .ok();
     }
 
-    /// A convenience method for [`App::global`].
+    /// Calls `read` with the global of type `G`, the window and the app, and returns its
+    /// result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the window has closed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no global of type `G` has been set.
     pub fn read_global<G: Global, R>(
         &mut self,
         read: impl FnOnce(&G, &Window, &App) -> R,
@@ -325,8 +532,18 @@ impl AsyncWindowContext {
             .update_window(self.window, |_, window, cx| read(cx.global(), window, cx))
     }
 
-    /// A convenience method for [`App::update_global`](BorrowAppContext::update_global).
-    /// for updating the global state of the specified type.
+    /// Updates the global of type `G` with `update`, and returns its result.
+    ///
+    /// The global is taken out of the app while `update` runs, as with
+    /// [`AsyncApp::update_global`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the window has closed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no global of type `G` has been set.
     pub fn update_global<G, R>(
         &mut self,
         update: impl FnOnce(&mut G, &mut Window, &mut App) -> R,
@@ -339,9 +556,13 @@ impl AsyncWindowContext {
         })
     }
 
-    /// Schedule a future to be executed on the main thread. This is used for collecting
-    /// the results of background tasks and updating the UI.
+    /// Runs the future returned by `f` on the main thread, with an
+    /// `AsyncWindowContext` for this window, and returns a task for its result.
+    ///
+    /// Dropping the returned [`Task`] cancels the future. Store it, await it or call
+    /// [`Task::detach`].
     #[track_caller]
+    #[inline(always)]
     pub fn spawn<AsyncFn, R>(&self, f: AsyncFn) -> Task<R>
     where
         AsyncFn: AsyncFnOnce(&mut AsyncWindowContext) -> R + 'static,
@@ -352,9 +573,11 @@ impl AsyncWindowContext {
             .spawn(async move { f(&mut cx).await }.boxed_local())
     }
 
-    /// Present a platform dialog.
-    /// The provided message will be presented, along with buttons for each answer.
-    /// When a button is clicked, the returned Receiver will receive the index of the clicked button.
+    /// Shows a platform alert with one button for each entry in `answers`.
+    ///
+    /// The receiver resolves to the index of the button the user clicked. If the window
+    /// has closed, the receiver is canceled, so awaiting it returns an error. See
+    /// [`Window::prompt`] for `level` and `detail`.
     pub fn prompt<T>(
         &mut self,
         level: PromptLevel,
@@ -419,6 +642,7 @@ impl AppContext for AsyncWindowContext {
         }
     }
 
+    #[inline(always)]
     fn update_entity<T: 'static, R>(
         &mut self,
         handle: &Entity<T>,
@@ -434,6 +658,7 @@ impl AppContext for AsyncWindowContext {
         panic!("Cannot use as_mut() from an async context, call `update`")
     }
 
+    #[inline(always)]
     fn read_entity<T, R>(&self, handle: &Entity<T>, read: impl FnOnce(&T, &App) -> R) -> R
     where
         T: 'static,
@@ -441,6 +666,19 @@ impl AppContext for AsyncWindowContext {
         self.app.read_entity(handle, read)
     }
 
+    fn notify(&mut self, entity_id: EntityId) {
+        self.app.notify(entity_id);
+    }
+
+    fn emit<EntityType, EventType>(&mut self, entity: &Entity<EntityType>, event: EventType)
+    where
+        EntityType: EventEmitter<EventType>,
+        EventType: 'static,
+    {
+        self.app.emit(entity, event)
+    }
+
+    #[inline(always)]
     fn update_window<T, F>(&mut self, window: AnyWindowHandle, update: F) -> Result<T>
     where
         F: FnOnce(AnyView, &mut Window, &mut App) -> T,
@@ -448,6 +686,7 @@ impl AppContext for AsyncWindowContext {
         self.app.update_window(window, update)
     }
 
+    #[inline(always)]
     fn with_window<R>(
         &mut self,
         entity_id: EntityId,
@@ -480,6 +719,18 @@ impl AppContext for AsyncWindowContext {
         G: Global,
     {
         self.app.read_global(callback)
+    }
+
+    fn insert_global_entity<T: 'static>(&mut self, entity: Entity<T>) {
+        self.app.insert_global_entity(entity)
+    }
+
+    fn remove_global_entity<T: 'static>(&mut self, entity: &Entity<T>) {
+        self.app.remove_global_entity(entity)
+    }
+
+    fn global_entities<T: 'static>(&self) -> impl Iterator<Item = Entity<T>> {
+        self.app.global_entities()
     }
 }
 

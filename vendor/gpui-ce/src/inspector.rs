@@ -1,10 +1,21 @@
-/// A unique identifier for an element that can be inspected.
+//! Pick an element in a window, then inspect its details and state.
+//!
+//! The inspector is available with the `inspector` feature and in debug builds
+//! (`debug_assertions`). In other builds, [`InspectorElementId`] remains available without
+//! fields, but `Inspector`, its renderer and reflection types are omitted.
+//! [`Window::is_inspector_picking`] always returns `false` in those builds.
+
+/// Identifies one element so the inspector can select it and describe its state.
+///
+/// The `path` and `instance_id` fields exist only in builds with the `inspector` feature or with
+/// `debug_assertions`. In other builds the type has no identifying data, so every two IDs compare
+/// equal; do not use it there as a stable key.
 #[derive(Debug, Eq, PartialEq, Hash, Clone)]
 pub struct InspectorElementId {
-    /// Stable part of the ID.
+    /// The element's stable path. It is reference counted, so cloning the ID does not copy it.
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub path: std::rc::Rc<InspectorElementPath>,
-    /// Disambiguates elements that have the same path.
+    /// Distinguishes elements that share a `path`, such as two rows built at the same call site.
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub instance_id: usize,
 }
@@ -22,16 +33,20 @@ pub use conditional::*;
 mod conditional {
     use super::*;
     use crate::{AnyElement, App, Context, Empty, IntoElement, Render, Window};
-    use collections::{FxHashMap, TypeIdHashMap};
+    use collections::{FxHashMap, TypeIdHashMap, hash_map::Entry};
     use std::any::{Any, TypeId};
 
-    /// `GlobalElementId` qualified by source location of element construction.
+    /// A [`GlobalElementId`](crate::GlobalElementId) plus the source location where the element was built.
+    ///
+    /// Two elements built at different call sites get different paths even when they
+    /// have the same ID, so the inspector can tell them apart.
     #[derive(Debug, Eq, PartialEq, Hash)]
     pub struct InspectorElementPath {
-        /// The path to the nearest ancestor element that has an `ElementId`.
+        /// The global ID of this element: the chain of `ElementId`s from the root down to it,
+        /// including the element itself when it has an `ElementId`.
         #[cfg(any(feature = "inspector", debug_assertions))]
         pub global_id: crate::GlobalElementId,
-        /// Source location where this element was constructed.
+        /// Where the element was constructed in source code.
         #[cfg(any(feature = "inspector", debug_assertions))]
         pub source_location: &'static std::panic::Location<'static>,
     }
@@ -51,15 +66,22 @@ mod conditional {
         }
     }
 
-    /// Function set on `App` to render the inspector UI.
+    /// The function that builds the inspector panel. Install it with
+    /// [`App::set_inspector_renderer`].
+    ///
+    /// GPUI passes the [`Inspector`], window and inspector context to the renderer. It returns
+    /// the panel's element, and GPUI calls it on each draw of the inspector view.
     pub type InspectorRenderer =
         Box<dyn Fn(&mut Inspector, &mut Window, &mut Context<Inspector>) -> AnyElement>;
 
-    /// Manages inspector state - which element is currently selected and whether the inspector is
-    /// in picking mode.
+    /// Tracks the element selected or hovered in the inspector, and whether picking is active.
+    ///
+    /// Each window owns one while its inspector is open. Use [`Window::toggle_inspector`] to open
+    /// or close it, and [`Inspector::is_picking`] to query the mode.
     pub struct Inspector {
         active_element: Option<InspectedElement>,
         pub(crate) pick_depth: Option<f32>,
+        renderers: TypeIdHashMap<InspectorElementRenderer>,
     }
 
     struct InspectedElement {
@@ -81,6 +103,7 @@ mod conditional {
             Self {
                 active_element: None,
                 pick_depth: Some(0.0),
+                renderers: TypeIdHashMap::default(),
             }
         }
 
@@ -111,7 +134,8 @@ mod conditional {
             changed
         }
 
-        /// ID of the currently hovered or selected element.
+        /// Returns the ID of the element that is hovered while picking, or the element
+        /// that was selected, or `None` if no element is active.
         pub fn active_element_id(&self) -> Option<&InspectorElementId> {
             self.active_element.as_ref().map(|e| &e.id)
         }
@@ -142,17 +166,22 @@ mod conditional {
             result
         }
 
-        /// Starts element picking mode, allowing the user to select elements by clicking.
+        /// Enters picking mode. While picking, moving the pointer over an element makes it
+        /// the active element, and a click selects it and leaves picking mode.
         pub fn start_picking(&mut self) {
             self.pick_depth = Some(0.0);
         }
 
-        /// Returns whether the inspector is currently in picking mode.
+        /// Returns `true` while the inspector is in picking mode.
         pub fn is_picking(&self) -> bool {
             self.pick_depth.is_some()
         }
 
-        /// Renders elements for all registered inspector states of the active inspector element.
+        /// Returns one element for each state type held by the active element when that type has
+        /// a renderer registered with [`App::register_inspector_element`]. Returns an empty list
+        /// when no element is active.
+        ///
+        /// Call this from your inspector renderer to show per-element details.
         pub fn render_inspector_states(
             &mut self,
             window: &mut Window,
@@ -161,22 +190,29 @@ mod conditional {
             let mut elements = Vec::new();
             if let Some(active_element) = self.active_element.take() {
                 for (type_id, state) in &active_element.states {
-                    if let Some(render_inspector) = cx
-                        .inspector_element_registry
-                        .renderers_by_type_id
-                        .remove(type_id)
-                    {
-                        let mut element = (render_inspector)(
-                            active_element.id.clone(),
-                            state.as_ref(),
-                            window,
-                            cx,
-                        );
-                        elements.push(element);
-                        cx.inspector_element_registry
-                            .renderers_by_type_id
-                            .insert(*type_id, render_inspector);
-                    }
+                    let renderer = match self.renderers.entry(*type_id) {
+                        Entry::Occupied(entry) => entry.into_mut(),
+                        Entry::Vacant(entry) => {
+                            let Some(factory) = cx
+                                .inspector_element_registry
+                                .factories_by_type_id
+                                .remove(type_id)
+                            else {
+                                continue;
+                            };
+                            let renderer = factory(window, cx);
+                            cx.inspector_element_registry
+                                .factories_by_type_id
+                                .insert(*type_id, factory);
+                            entry.insert(renderer)
+                        }
+                    };
+                    elements.push(renderer(
+                        active_element.id.clone(),
+                        state.as_ref(),
+                        window,
+                        cx,
+                    ));
                 }
 
                 self.active_element = Some(active_element);
@@ -200,49 +236,69 @@ mod conditional {
 
     #[derive(Default)]
     pub(crate) struct InspectorElementRegistry {
-        renderers_by_type_id: FxHashMap<
-            TypeId,
-            Box<dyn Fn(InspectorElementId, &dyn Any, &mut Window, &mut App) -> AnyElement>,
-        >,
+        factories_by_type_id:
+            FxHashMap<TypeId, Box<dyn Fn(&mut Window, &mut App) -> InspectorElementRenderer>>,
     }
 
     impl InspectorElementRegistry {
-        pub fn register<T: 'static, R: IntoElement>(
+        /// Stores the renderer for state type `T`, replacing any earlier one.
+        pub fn register<T: 'static, R: IntoElement, F>(
             &mut self,
-            f: impl 'static + Fn(InspectorElementId, &T, &mut Window, &mut App) -> R,
-        ) {
-            self.renderers_by_type_id.insert(
+            factory: impl 'static + Fn(&mut Window, &mut App) -> F,
+        ) where
+            F: 'static + FnMut(InspectorElementId, &T, &mut Window, &mut App) -> R,
+        {
+            self.factories_by_type_id.insert(
                 TypeId::of::<T>(),
-                Box::new(move |id, value, window, cx| {
-                    let value = value.downcast_ref().unwrap();
-                    f(id, value, window, cx).into_any_element()
+                Box::new(move |window, cx| {
+                    let mut renderer = factory(window, cx);
+                    Box::new(move |id, value, window, cx| {
+                        let value = value
+                            .downcast_ref()
+                            .expect("registered inspector state type");
+                        renderer(id, value, window, cx).into_any_element()
+                    })
                 }),
             );
         }
     }
+
+    type InspectorElementRenderer =
+        Box<dyn FnMut(InspectorElementId, &dyn Any, &mut Window, &mut App) -> AnyElement>;
 }
 
-/// Provides definitions used by `#[derive_inspector_reflection]`.
+/// Runtime descriptions of trait methods, generated by `#[derive_inspector_reflection]`.
+///
+/// Available only with the `inspector` feature or in debug builds.
 #[cfg(any(feature = "inspector", debug_assertions))]
 pub mod inspector_reflection {
     use std::any::Any;
 
-    /// Reification of a function that has the signature `fn some_fn(T) -> T`. Provides the name,
-    /// documentation, and ability to invoke the function.
+    /// A method with the signature `fn some_fn(T) -> T`, described at runtime.
+    ///
+    /// Gives you the method's name and doc comment, and a way to call it. The
+    /// `derive_inspector_reflection` attribute on a trait generates one for each method
+    /// of the form `fn method(self) -> Self`, so tools can list and call those methods by
+    /// name.
     #[derive(Clone, Copy)]
     pub struct FunctionReflection<T> {
-        /// The name of the function
+        /// The method's name.
         pub name: &'static str,
-        /// The method
+        /// Calls the method. Takes and returns a boxed `T`.
         pub function: fn(Box<dyn Any>) -> Box<dyn Any>,
-        /// Documentation for the function
+        /// The method's doc comment, if it has one.
         pub documentation: Option<&'static str>,
-        /// `PhantomData` for the type of the argument and result
+        /// Ties the reflection to `T`. Not used at runtime.
         pub _type: std::marker::PhantomData<T>,
     }
 
     impl<T: 'static> FunctionReflection<T> {
-        /// Invoke this method on a value and return the result.
+        /// Calls the method on `value` and returns its result.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the method returns a value that isn't a `T`. Generated reflections
+        /// always return `T`, so this indicates a bug in the generated code.
         pub fn invoke(&self, value: T) -> T {
             let boxed = Box::new(value) as Box<dyn Any>;
             let result = (self.function)(boxed);

@@ -1,7 +1,13 @@
+#![cfg_attr(target_family = "wasm", no_main)]
+
+#[path = "fonts.rs"]
+mod example_support;
+
 use gpui::{
     App, Bounds, BoxShadow, Context, Div, SharedString, Window, WindowBounds, WindowOptions, div,
-    hsla, prelude::*, px, relative, rgb, size,
+    hsla, linear_color_stop, linear_gradient, prelude::*, px, relative, rgb, size,
 };
+use gpui_platform::application;
 
 struct Shadow {}
 
@@ -564,38 +570,70 @@ impl Render for Shadow {
                                 ]),
                             ),
                         ]),
-                    // Combined: drop + inset shadows on the same element.
+                    // Gradient drop and inset shadows on the same element.
                     div()
                         .border_b_1()
                         .border_color(hsla(0.0, 0.0, 0.0, 1.0))
                         .flex()
                         .w_full()
                         .children(vec![example(
-                            "Drop + Inset",
+                            "Gradient Drop + Inset",
                             Shadow::rounded_medium().shadow(vec![
-                                BoxShadow::new(px(0.), px(8.), hsla(0.0, 0.0, 0.0, 0.25))
-                                    .blur_radius(px(12.)),
-                                BoxShadow::new(px(0.), px(2.), hsla(0.0, 0.0, 0.0, 0.4))
-                                    .blur_radius(px(4.))
-                                    .inset(),
+                                BoxShadow::new(
+                                    px(0.),
+                                    px(8.),
+                                    linear_gradient(
+                                        90.,
+                                        linear_color_stop(hsla(0., 0.85, 0.55, 0.4), 0.),
+                                        linear_color_stop(
+                                            hsla(2. / 3., 0.85, 0.55, 0.4),
+                                            1.,
+                                        ),
+                                    ),
+                                )
+                                .blur_radius(px(12.)),
+                                BoxShadow::new(
+                                    px(0.),
+                                    px(2.),
+                                    linear_gradient(
+                                        90.,
+                                        linear_color_stop(hsla(1. / 3., 0.8, 0.4, 0.6), 0.),
+                                        linear_color_stop(hsla(1. / 6., 0.9, 0.5, 0.6), 1.),
+                                    ),
+                                )
+                                .blur_radius(px(4.))
+                                .inset(),
                             ]),
                         )]),
                 ]))
     }
 }
 
-fn main() {
-    gpui_platform::application().run(|cx: &mut App| {
+fn run_example() {
+    application().run(|cx: &mut App| {
+        if !example_support::load_fonts(cx) {
+            return;
+        }
         let bounds = Bounds::centered(None, size(px(1000.0), px(800.0)), cx);
         cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
+            WindowOptions::new().window_bounds(Some(WindowBounds::Windowed(bounds))),
             |_, cx| cx.new(|_| Shadow {}),
         )
         .unwrap();
 
         cx.activate(true);
     });
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn main() {
+    env_logger::init();
+    run_example();
+}
+
+#[cfg(target_family = "wasm")]
+#[wasm_bindgen::prelude::wasm_bindgen(start)]
+pub fn start() {
+    gpui_platform::web_init();
+    run_example();
 }

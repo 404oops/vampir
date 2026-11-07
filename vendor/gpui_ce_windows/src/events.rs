@@ -1,5 +1,3 @@
-#[cfg(feature = "wgpu")]
-use crate::window::RawWindow;
 use std::{cell::Cell, rc::Rc, sync::atomic::Ordering};
 
 use anyhow::Context as _;
@@ -29,7 +27,7 @@ pub(crate) const WM_GPUI_DOCK_MENU_ACTION: u32 = WM_USER + 4;
 pub(crate) const WM_GPUI_FORCE_UPDATE_WINDOW: u32 = WM_USER + 5;
 pub(crate) const WM_GPUI_KEYBOARD_LAYOUT_CHANGED: u32 = WM_USER + 6;
 pub(crate) const WM_GPUI_GPU_DEVICE_LOST: u32 = WM_USER + 7;
-pub(crate) const WM_GPUI_KEYDOWN: u32 = WM_USER + 8;
+pub(crate) const WM_GPUI_DISPLAYS_CHANGED: u32 = WM_USER + 10;
 
 const SIZE_MOVE_LOOP_TIMER_ID: usize = 1;
 
@@ -94,18 +92,8 @@ impl WindowsWindowInner {
             // whichever window was active before the click. If that handler consumes the
             // press, `DefWindowProc` never sees it, so the window is never activated at all.
             // So, let's eagerly activate the window.
-            //
-            // An anchored popup opened without focus — a scrim — must not take activation from
-            // the popup that has it, but still gets the click.
-            WM_MOUSEACTIVATE => Some(
-                if self.popup.as_ref().is_some_and(|popup| !popup.takes_focus) {
-                    MA_NOACTIVATE
-                } else {
-                    MA_ACTIVATE
-                } as isize,
-            ),
-            WM_ACTIVATE => self.handle_activate_msg(wparam, lparam),
-            WM_NCACTIVATE => self.handle_nc_activate_msg(handle, wparam, lparam),
+            WM_MOUSEACTIVATE => Some(MA_ACTIVATE as isize),
+            WM_ACTIVATE => self.handle_activate_msg(wparam),
             WM_CREATE => self.handle_create_msg(handle),
             WM_MOVE => self.handle_move_msg(handle, lparam),
             WM_SIZE => self.handle_size_msg(wparam, lparam),
@@ -160,7 +148,6 @@ impl WindowsWindowInner {
             WM_MOUSEHWHEEL => self.handle_mouse_horizontal_wheel_msg(handle, wparam, lparam),
             WM_SYSKEYUP => self.handle_syskeyup_msg(wparam, lparam),
             WM_KEYUP => self.handle_keyup_msg(wparam, lparam),
-            WM_GPUI_KEYDOWN => self.handle_keydown_msg(wparam, lparam),
             WM_CHAR => self.handle_char_msg(wparam),
             WM_IME_STARTCOMPOSITION => self.handle_ime_position(handle),
             WM_IME_COMPOSITION => self.handle_ime_composition(handle, lparam),
@@ -168,11 +155,11 @@ impl WindowsWindowInner {
             WM_SETTINGCHANGE => self.handle_system_settings_changed(handle, wparam, lparam),
             WM_INPUTLANGCHANGE => self.handle_input_language_changed(),
             WM_SHOWWINDOW => self.handle_window_visibility_changed(handle, wparam),
-            WM_GPUI_CURSOR_STYLE_CHANGED => self.handle_cursor_changed(lparam),
-            WM_GPUI_FORCE_UPDATE_WINDOW => self.draw_window(handle, true),
-            WM_GPUI_GPU_DEVICE_LOST => self.handle_device_lost(lparam),
             DM_POINTERHITTEST => self.handle_dm_pointer_hit_test(wparam),
             WM_GETOBJECT => self.handle_wm_getobject(wparam, lparam),
+            WM_GPUI_CURSOR_STYLE_CHANGED
+            | WM_GPUI_FORCE_UPDATE_WINDOW
+            | WM_GPUI_GPU_DEVICE_LOST => self.handle_gpui_events(handle, msg, wparam, lparam),
             _ => None,
         };
         if let Some(n) = handled {
@@ -189,7 +176,6 @@ impl WindowsWindowInner {
             self.state.scale_factor.get(),
         );
         self.state.origin.set(origin);
-        self.move_owned_popups();
         let size = self.state.logical_size.get();
         let center_x = origin.x.as_f32() + size.width.as_f32() / 2.;
         let center_y = origin.y.as_f32() + size.height.as_f32() / 2.;
@@ -205,7 +191,7 @@ impl WindowsWindowInner {
             // monitor is invalid, we do nothing.
             if !monitor.is_invalid() && self.state.display.get().handle != monitor {
                 // we will get the same monitor if we only have one
-                self.state.display.set(WindowsDisplay::new(
+                self.set_display(WindowsDisplay::new(
                     WindowsDisplay::display_id_for_monitor(monitor),
                 )?);
             }
@@ -232,7 +218,11 @@ impl WindowsWindowInner {
         Some(0)
     }
 
-    fn handle_size_msg(&self, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
+    fn handle_size_msg(self: &Rc<Self>, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
+        // Minimizing and restoring both arrive as `WM_SIZE`; the deferred report
+        // reads `IsIconic` at delivery, so one call covers both directions.
+        self.report_visibility();
+
         // Don't resize the renderer when the window is minimized, but record that it was minimized so
         // that on restore the swap chain can be recreated via `update_drawable_size_even_if_unchanged`.
         if wparam.0 == SIZE_MINIMIZED as usize {
@@ -270,25 +260,13 @@ impl WindowsWindowInner {
         let new_logical_size = device_size.to_pixels(scale_factor);
 
         self.state.logical_size.set(new_logical_size);
-        #[cfg(not(feature = "wgpu"))]
+        if should_resize_renderer
+            && let Err(e) = self.state.renderer.borrow_mut().resize(device_size)
         {
-            if should_resize_renderer
-                && let Err(e) = self.state.renderer.borrow_mut().resize(device_size)
-            {
-                log::error!("Failed to resize renderer, invalidating devices: {}", e);
-                self.state
-                    .invalidate_devices
-                    .store(true, std::sync::atomic::Ordering::Release);
-            }
-        }
-        #[cfg(feature = "wgpu")]
-        {
-            if should_resize_renderer {
-                self.state
-                    .renderer
-                    .borrow_mut()
-                    .update_drawable_size(device_size)
-            }
+            log::error!("Failed to resize renderer, invalidating devices: {}", e);
+            self.state
+                .invalidate_devices
+                .store(true, std::sync::atomic::Ordering::Release);
         }
         if let Some(mut callback) = self.state.callbacks.resize.take() {
             callback(new_logical_size, scale_factor);
@@ -353,7 +331,6 @@ impl WindowsWindowInner {
 
     fn handle_destroy_msg(&self, handle: HWND) -> Option<isize> {
         let callback = { self.state.callbacks.close.take() };
-        self.detach_from_owner();
         // Re-enable parent window if this was a modal dialog
         if let Some(parent_hwnd) = self.parent_hwnd {
             unsafe {
@@ -442,7 +419,7 @@ impl WindowsWindowInner {
 
     // It's a known bug that you can't trigger `ctrl-shift-0`. See:
     // https://superuser.com/questions/1455762/ctrl-shift-number-key-combination-has-stopped-working-for-a-few-numbers
-    fn handle_keydown_msg(&self, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
+    pub(crate) fn handle_keydown_msg(&self, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
         let Some(input) = handle_key_event(
             wparam,
             lparam,
@@ -812,39 +789,8 @@ impl WindowsWindowInner {
         }
     }
 
-    /// A window keeps its active caption while one of its own popups has the keyboard, the way
-    /// it does under a menu.
-    fn handle_nc_activate_msg(
-        &self,
-        handle: HWND,
-        wparam: WPARAM,
-        lparam: LPARAM,
-    ) -> Option<isize> {
-        let deactivating = wparam.0 == 0;
-        let to = HWND(lparam.0 as *mut _);
-        if deactivating && !to.is_invalid() && self.owns_popup(to) {
-            let result = unsafe { DefWindowProcW(handle, WM_NCACTIVATE, WPARAM(1), lparam) };
-            return Some(result.0);
-        }
-        None
-    }
-
-    fn handle_activate_msg(self: &Rc<Self>, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
+    fn handle_activate_msg(self: &Rc<Self>, wparam: WPARAM) -> Option<isize> {
         let activated = wparam.loword() > 0;
-
-        // A popup giving up the keyboard to anything but its owner or the owner's other popups
-        // — another application, another window — takes the owner's active caption with it,
-        // since the owner was never told it lost activation.
-        if !activated && let Some(owner) = self.popup_owner() {
-            let to = HWND(lparam.0 as *mut _);
-            let staying =
-                to == owner || window_from_hwnd(owner).is_some_and(|owner| owner.owns_popup(to));
-            if !staying {
-                unsafe {
-                    SendMessageW(owner, WM_NCACTIVATE, Some(WPARAM(0)), Some(LPARAM(0)));
-                }
-            }
-        }
 
         let events = self
             .state
@@ -880,14 +826,11 @@ impl WindowsWindowInner {
             }
         }
 
-        // Evaluated once Windows has finished moving activation, from where it ended up, so
-        // the keyboard passing between a window and its own popups is no change at all. A
-        // popup's change is its owner's too.
         self.executor
             .spawn(async move {
-                this.report_activation();
-                if let Some(owner) = this.popup_owner().and_then(|owner| window_from_hwnd(owner)) {
-                    owner.report_activation();
+                if let Some(mut func) = this.state.callbacks.active_status_change.take() {
+                    func(activated);
+                    this.state.callbacks.active_status_change.set(Some(func));
                 }
             })
             .detach();
@@ -991,10 +934,6 @@ impl WindowsWindowInner {
                 .log_err();
             }
         }
-        // The suggested rect keeps a window's place in proportion, not a popup's anchor, and
-        // the owner may not have moved, so nothing else would place them again.
-        self.follow_anchor();
-        self.move_owned_popups();
 
         Some(0)
     }
@@ -1006,8 +945,16 @@ impl WindowsWindowInner {
             return None;
         }
         let new_display = WindowsDisplay::new(WindowsDisplay::display_id_for_monitor(new_monitor))?;
-        self.state.display.set(new_display);
+        self.set_display(new_display);
         Some(0)
+    }
+
+    fn set_display(&self, display: WindowsDisplay) {
+        self.state.display.set(display);
+        if let Some(mut callback) = self.state.callbacks.display_changed.take() {
+            callback();
+            self.state.callbacks.display_changed.set(Some(callback));
+        }
     }
 
     fn handle_hit_test_msg(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
@@ -1315,35 +1262,73 @@ impl WindowsWindowInner {
         Some(0)
     }
 
-    fn handle_window_visibility_changed(&self, handle: HWND, wparam: WPARAM) -> Option<isize> {
+    fn handle_window_visibility_changed(
+        self: &Rc<Self>,
+        handle: HWND,
+        wparam: WPARAM,
+    ) -> Option<isize> {
+        self.report_visibility();
         if wparam.0 == 1 {
             self.draw_window(handle, false);
         }
         None
     }
 
-    fn handle_device_lost(&self, lparam: LPARAM) -> Option<isize> {
-        #[cfg(not(feature = "wgpu"))]
-        {
-            let devices = lparam.0 as *const DirectXDevices;
-            let devices = unsafe { &*devices };
-            if let Err(err) = self
-                .state
-                .renderer
-                .borrow_mut()
-                .handle_device_lost(&devices)
-            {
-                panic!("Device lost: {err}");
-            }
+    // The window procedure can run while GPUI is updating this window (e.g.
+    // `ShowWindow` from an action handler), so deliver observers after that
+    // update completes, as activation does. The state is read at delivery so
+    // a burst of messages collapses to the final value.
+    fn report_visibility(self: &Rc<Self>) {
+        if self.state.last_visibility.get().is_none() {
+            return;
         }
-        #[cfg(feature = "wgpu")]
+        let this = self.clone();
+        self.executor
+            .spawn(async move {
+                let visibility = this.visibility();
+                if this.state.last_visibility.get() == Some(visibility) {
+                    return;
+                }
+                this.state.last_visibility.set(Some(visibility));
+                if let Some(mut callback) = this.state.callbacks.visibility_change.take() {
+                    callback(visibility);
+                    this.state.callbacks.visibility_change.set(Some(callback));
+                }
+            })
+            .detach();
+    }
+
+    fn handle_gpui_events(
+        &self,
+        handle: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Option<isize> {
+        if wparam.0 != self.validation_number {
+            return None;
+        }
+        match message {
+            WM_GPUI_CURSOR_STYLE_CHANGED => self.handle_cursor_changed(lparam),
+            WM_GPUI_FORCE_UPDATE_WINDOW => self.draw_window(handle, true),
+            WM_GPUI_GPU_DEVICE_LOST => self.handle_device_lost(lparam),
+            _ => unreachable!(),
+        }
+    }
+
+    fn handle_device_lost(&self, lparam: LPARAM) -> Option<isize> {
+        if lparam.0 == 0 {
+            return None;
+        }
+        let devices = lparam.0 as *const DirectXDevices;
+        let devices = unsafe { &*devices };
+        if let Err(err) = self
+            .state
+            .renderer
+            .borrow_mut()
+            .handle_device_lost(&devices)
         {
-            _ = lparam;
-            if let Err(err) = self.state.renderer.borrow_mut().recover(&RawWindow {
-                hwnd: self.platform_window_handle,
-            }) {
-                panic!("Device lost: {err}");
-            }
+            panic!("Device lost: {err}");
         }
         // Make sure the first `draw_window` after recovery (whether it comes
         // from the forced WM_GPUI_FORCE_UPDATE_WINDOW or a stray WM_PAINT in
@@ -1388,17 +1373,19 @@ impl WindowsWindowInner {
         }
 
         let force_render = force_render || self.state.force_render_pending.take();
-        #[cfg(not(feature = "wgpu"))]
-        {
-            if force_render {
-                // Re-enable drawing after a device loss recovery. The forced render
-                // will rebuild the scene with fresh atlas textures.
-                self.state.renderer.borrow_mut().mark_drawable();
-            }
+        if force_render {
+            // After device-loss recovery, force a render that rebuilds atlas textures.
+            self.state.renderer.borrow_mut().mark_drawable();
         }
+        let (signal_at, signal_source) = self.state.frame_signal.take().map_or(
+            (None, FrameRequestSource::NativeCallback),
+            |(at, source)| (Some(at), source),
+        );
         request_frame(RequestFrameOptions {
             require_presentation: false,
             force_render,
+            signal_at,
+            signal_source,
         });
 
         self.state.callbacks.request_frame.set(Some(request_frame));

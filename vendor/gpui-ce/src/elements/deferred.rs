@@ -1,31 +1,73 @@
 use crate::{
-    AnyElement, App, Bounds, Element, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
-    Pixels, Window,
+    AnyElement, App, Bounds, ContentMask, Element, GlobalElementId, InspectorElementId,
+    IntoElement, LayoutId, Pixels, Window,
 };
 
-/// Builds a `Deferred` element, which delays the layout and paint of its child.
+/// Creates a [`Deferred`] element that draws `child` after the rest of the tree.
+///
+/// Use it for content that must appear on top of its surroundings, such as a popover, a menu or a
+/// drag preview. The child takes part in layout where it is, so its size and position follow the
+/// normal rules. Its prepaint and paint are postponed until the rest of the tree has been drawn.
+/// The priority defaults to `0`. See [`Deferred::priority`].
+///
+/// # Example
+///
+/// ```
+/// use gpui::{
+///     Context, IntoElement, Render, TestApp, Window, anchored, deferred, div, point, prelude::*,
+///     px,
+/// };
+///
+/// struct Overlay;
+///
+/// impl Render for Overlay {
+///     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+///         div().size_full().child(
+///             deferred(
+///                 anchored()
+///                     .position(point(px(10.), px(10.)))
+///                     .child(div().w(px(40.)).h(px(40.))),
+///             )
+///             .priority(1),
+///         )
+///     }
+/// }
+///
+/// let mut app = TestApp::new();
+/// let mut window = app.open_window(|_window, _cx| Overlay);
+/// window.draw();
+/// ```
 pub fn deferred(child: impl IntoElement) -> Deferred {
     Deferred {
         child: Some(child.into_any_element()),
-        priority: 0,
+        priority: DeferredPriority::from(0),
+        content_mask: None,
     }
 }
 
-/// An element which delays the painting of its child until after all of
-/// its ancestors, while keeping its layout as part of the current element tree.
+/// An element that draws its child after the rest of the tree, in priority order.
+///
+/// The child is laid out in place, so it is part of the element tree. Its prepaint and paint run
+/// later, in a separate pass. Each deferred child is drawn after the elements around it, and
+/// deferred children are drawn in ascending priority, so a higher priority draws on top. Create
+/// one with [`deferred`].
+///
+/// A deferred child may create more deferred children. GPUI processes these in rounds, and the
+/// frame panics if they nest more than ten rounds deep. Keep such nesting shallow.
+#[derive(derive_setters::Setters)]
+#[setters(generate = false)]
 pub struct Deferred {
     child: Option<AnyElement>,
-    priority: usize,
-}
-
-impl Deferred {
-    /// Sets the `priority` value of the `deferred` element, which
-    /// determines the drawing order relative to other deferred elements,
-    /// with higher values being drawn on top.
-    pub fn with_priority(mut self, priority: usize) -> Self {
-        self.priority = priority;
-        self
-    }
+    /// Sets the draw priority. Deferred elements draw in ascending priority, so a higher value
+    /// draws on top of the ones below it. Accepts a number, or a [`DeferredPriority`].
+    #[setters(generate, into)]
+    priority: DeferredPriority,
+    /// Clips the deferred element to `mask` while it is prepainted and painted, so the clipped
+    /// area also doesn't receive mouse input.
+    ///
+    /// Without a mask, no extra clipping is applied.
+    #[setters(generate, strip_option)]
+    content_mask: Option<ContentMask<Pixels>>,
 }
 
 impl Element for Deferred {
@@ -62,7 +104,8 @@ impl Element for Deferred {
     ) {
         let child = self.child.take().unwrap();
         let element_offset = window.element_offset();
-        window.defer_draw(child, element_offset, self.priority, None)
+        let priority = self.priority.evaluate(window);
+        window.defer_draw(child, element_offset, priority, self.content_mask);
     }
 
     fn paint(
@@ -87,20 +130,130 @@ impl IntoElement for Deferred {
 }
 
 impl Deferred {
-    /// Sets a priority for the element. A higher priority conceptually means painting the element
-    /// on top of deferred draws with a lower priority (i.e. closer to the viewer).
-    pub fn priority(mut self, priority: usize) -> Self {
-        self.priority = priority;
+    /// Sets the priority to one more than the enclosing deferred element's, or to 1 when no deferred
+    /// element encloses this one.
+    ///
+    /// A deferred element is enclosing when it is being prepainted and creates this one, directly or
+    /// through other elements. Use it for nested popups, so that each level draws above the last.
+    pub fn priority_auto(mut self) -> Self {
+        self.priority = DeferredPriority::Auto;
         self
+    }
+}
+
+/// How the draw priority of a [`Deferred`] element is chosen.
+///
+/// A number converts into `Value`, so `.priority(2)` works.
+pub enum DeferredPriority {
+    /// One more than the priority of the deferred element that created this one, or 1 when no
+    /// deferred element did. Use it for nested popups.
+    Auto,
+    /// An explicit priority. Higher values draw on top.
+    Value(usize),
+}
+impl From<usize> for DeferredPriority {
+    fn from(value: usize) -> Self {
+        Self::Value(value)
+    }
+}
+impl DeferredPriority {
+    /// Calculates the new priority based on the current deferred nesting depth.
+    /// Should only be called during prepaint of a [`Deferred`] element.
+    fn evaluate(&self, window: &Window) -> usize {
+        match self {
+            DeferredPriority::Value(value) => *value,
+            DeferredPriority::Auto => match window.deferred_priority() {
+                None => 1, // NOTE: functionality change. If using auto, we start at a priority of 1 instead of 0.
+                Some(prev_deferred_priority) => prev_deferred_priority.saturating_add(1),
+            },
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{
-        Context, Entity, StyleRefinement, TestAppContext, Window, anchored, deferred, div, point,
+        Bounds, ContentMask, Context, Entity, Modifiers, MouseButton, MouseDownEvent,
+        PlatformInput, StyleRefinement, TestAppContext, Window, anchored, deferred, div, point,
         prelude::*, px, size,
     };
+    use std::{cell::Cell, rc::Rc};
+
+    struct MaskedOverlay {
+        presses: Rc<Cell<usize>>,
+    }
+
+    impl Render for MaskedOverlay {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let presses = self.presses.clone();
+            deferred(div().id("masked-overlay").size(px(100.)).on_mouse_down(
+                MouseButton::Left,
+                move |_, _, _| {
+                    presses.set(presses.get() + 1);
+                },
+            ))
+            .content_mask(ContentMask {
+                bounds: Bounds::new(point(px(0.), px(0.)), size(px(40.), px(40.))),
+                fade_out: Default::default(),
+            })
+        }
+    }
+
+    struct MaskedOverlayRoot {
+        overlay: Entity<MaskedOverlay>,
+    }
+
+    impl Render for MaskedOverlayRoot {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                self.overlay
+                    .clone()
+                    .cached(StyleRefinement::default().size_full()),
+            )
+        }
+    }
+
+    /// A deferred element's content mask must clip its hitboxes, which are
+    /// inserted during prepaint, and not only its painting.
+    #[gpui::test]
+    fn test_deferred_mask_clips_input(cx: &mut TestAppContext) {
+        let presses = Rc::new(Cell::new(0));
+        let window = cx.open_window(size(px(200.), px(200.)), |_, cx| {
+            let overlay = cx.new(|_| MaskedOverlay {
+                presses: presses.clone(),
+            });
+            MaskedOverlayRoot { overlay }
+        });
+        cx.run_until_parked();
+
+        // The second pass reuses the cached overlay's prepaint from the first.
+        for pass in 0..2 {
+            window
+                .update(cx, |_, window, cx| {
+                    for position in [point(px(60.), px(60.)), point(px(20.), px(20.))] {
+                        window.dispatch_event(
+                            PlatformInput::MouseDown(MouseDownEvent {
+                                button: MouseButton::Left,
+                                position,
+                                modifiers: Modifiers::default(),
+                                click_count: 1,
+                                first_mouse: false,
+                            }),
+                            cx,
+                        );
+                    }
+                })
+                .unwrap();
+            assert_eq!(
+                presses.get(),
+                pass + 1,
+                "only the visible region accepts input"
+            );
+
+            window.update(cx, |_, _, cx| cx.notify()).unwrap();
+            cx.run_until_parked();
+        }
+    }
 
     /// A stand-in for a dock panel hosting a popover (deferred draw) whose
     /// content opens another popover (a deferred draw created while
@@ -122,11 +275,11 @@ mod tests {
                                         .h(px(50.)),
                                 ),
                             )
-                            .with_priority(2),
+                            .priority(2),
                         ),
                     ),
                 )
-                .with_priority(1),
+                .priority(1),
             )
         }
     }

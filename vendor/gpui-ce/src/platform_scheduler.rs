@@ -1,3 +1,6 @@
+//! Builds the `scheduler` crate's executors on the platform's [`PlatformDispatcher`].
+//! Crate-internal; the executors are used through GPUI's public executor types.
+
 use crate::{PlatformDispatcher, RunnableMeta};
 use async_task::Runnable;
 use chrono::{DateTime, Utc};
@@ -22,89 +25,118 @@ use std::{
 
 /// A production implementation of [`Scheduler`] that wraps a [`PlatformDispatcher`].
 ///
-/// This allows GPUI to use the scheduler crate's executor types with the platform's
-/// native dispatch mechanisms (e.g., Grand Central Dispatch on macOS).
+/// It adapts the scheduler crate's executor types to the platform's native dispatch mechanism,
+/// such as Grand Central Dispatch on macOS.
 pub struct PlatformScheduler {
     dispatcher: Arc<dyn PlatformDispatcher>,
     clock: Arc<PlatformClock>,
     next_session_id: AtomicU16,
+    #[cfg(feature = "profiler")]
+    foreground_runnables: crate::profiler::journal::ForegroundRunnableCounter,
 }
 
 impl PlatformScheduler {
+    /// Creates a scheduler that dispatches work through `dispatcher`.
     pub fn new(dispatcher: Arc<dyn PlatformDispatcher>) -> Self {
         Self {
             dispatcher: dispatcher.clone(),
             clock: Arc::new(PlatformClock { dispatcher }),
             next_session_id: AtomicU16::new(0),
+            #[cfg(feature = "profiler")]
+            foreground_runnables: crate::profiler::journal::foreground_runnable_counter(),
         }
     }
 
+    /// Returns a new foreground executor whose tasks run on the platform's main thread.
     pub fn foreground_executor(self: &Arc<Self>) -> LocalExecutor {
         let session_id = self.next_session_id();
-        let scheduler = Arc::downgrade(self);
-        LocalExecutor::new(session_id, self.clone(), move |runnable| {
-            if let Some(scheduler) = scheduler.upgrade() {
-                scheduler.schedule_local(session_id, runnable);
-            }
-        })
+        if let Some(scope) = self.dispatcher.create_local_task_scope() {
+            let dispatch_scope = scope.clone();
+            let dispatch_dispatcher = self.dispatcher.clone();
+            let cancellation_scope = scope.clone();
+            let cancellation_dispatcher = self.dispatcher.clone();
+            #[cfg(feature = "profiler")]
+            let foreground_runnables = self.foreground_runnables.clone();
+            LocalExecutor::new_with_scope(
+                session_id,
+                self.clone(),
+                scope,
+                move |runnable| {
+                    #[cfg(feature = "profiler")]
+                    foreground_runnables.queued();
+                    dispatch_dispatcher.dispatch_local_task(dispatch_scope.clone(), runnable);
+                },
+                move |runnable| {
+                    cancellation_dispatcher
+                        .dispatch_local_task_cancellation(cancellation_scope.clone(), runnable);
+                },
+            )
+        } else {
+            let scheduler = Arc::downgrade(self);
+            LocalExecutor::new(session_id, self.clone(), move |runnable| {
+                if let Some(scheduler) = scheduler.upgrade() {
+                    scheduler.schedule_local(session_id, runnable);
+                }
+            })
+        }
     }
 
     fn next_session_id(&self) -> SessionId {
         SessionId::new(self.next_session_id.fetch_add(1, Ordering::SeqCst))
     }
+
+    #[cfg(feature = "profiler")]
+    pub(crate) fn foreground_runnable_counter(
+        &self,
+    ) -> crate::profiler::journal::ForegroundRunnableCounter {
+        self.foreground_runnables.clone()
+    }
 }
 
 impl Scheduler for PlatformScheduler {
+    #[cfg(not(target_family = "wasm"))]
     fn block(
         &self,
         _session_id: Option<SessionId>,
-        #[cfg_attr(target_family = "wasm", allow(unused_mut))] mut future: Pin<
-            &mut dyn Future<Output = ()>,
-        >,
-        #[cfg_attr(target_family = "wasm", allow(unused_variables))] timeout: Option<Duration>,
+        mut future: Pin<&mut dyn Future<Output = ()>>,
+        timeout: Option<Duration>,
     ) -> bool {
-        #[cfg(target_family = "wasm")]
-        {
-            let _ = (&future, &timeout);
-            panic!("Cannot block on wasm")
+        use waker_fn::waker_fn;
+        let deadline = timeout.map(|t| Instant::now() + t);
+        let parker = parking::Parker::new();
+        let unparker = parker.unparker();
+        let waker = waker_fn(move || {
+            unparker.unpark();
+        });
+        let mut cx = Context::from_waker(&waker);
+        if let Poll::Ready(()) = future.as_mut().poll(&mut cx) {
+            return true;
         }
-        #[cfg(not(target_family = "wasm"))]
-        {
-            use waker_fn::waker_fn;
-            let deadline = timeout.map(|t| Instant::now() + t);
-            let parker = parking::Parker::new();
-            let unparker = parker.unparker();
-            let waker = waker_fn(move || {
-                unparker.unpark();
-            });
-            let mut cx = Context::from_waker(&waker);
-            if let Poll::Ready(()) = future.as_mut().poll(&mut cx) {
-                return true;
+
+        let park_deadline = |deadline: Instant| {
+            // Timer expirations are only delivered every ~15.6 milliseconds by default on Windows.
+            // We increase the resolution during this wait so that short timeouts stay reasonably short.
+            let _timer_guard = self.dispatcher.increase_timer_resolution();
+            parker.park_deadline(deadline)
+        };
+
+        loop {
+            match deadline {
+                Some(deadline) if !park_deadline(deadline) && deadline <= Instant::now() => {
+                    return false;
+                }
+                Some(_) => (),
+                None => parker.park(),
             }
-
-            let park_deadline = |deadline: Instant| {
-                // Timer expirations are only delivered every ~15.6 milliseconds by default on Windows.
-                // We increase the resolution during this wait so that short timeouts stay reasonably short.
-                let _timer_guard = self.dispatcher.increase_timer_resolution();
-                parker.park_deadline(deadline)
-            };
-
-            loop {
-                match deadline {
-                    Some(deadline) if !park_deadline(deadline) && deadline <= Instant::now() => {
-                        return false;
-                    }
-                    Some(_) => (),
-                    None => parker.park(),
-                }
-                if let Poll::Ready(()) = future.as_mut().poll(&mut cx) {
-                    break true;
-                }
+            if let Poll::Ready(()) = future.as_mut().poll(&mut cx) {
+                break true;
             }
         }
     }
 
     fn schedule_local(&self, _session_id: SessionId, runnable: Runnable<RunnableMeta>) {
+        #[cfg(feature = "profiler")]
+        self.foreground_runnables.queued();
         self.dispatcher
             .dispatch_on_main_thread(runnable, Priority::default());
     }
@@ -212,6 +244,26 @@ mod tests {
         fn spawn_realtime(&self, _f: Box<dyn FnOnce() + Send>) {
             panic!("SmokeDispatcher does not implement realtime");
         }
+    }
+
+    #[test]
+    fn dedicated_executor_tasks_share_one_thread() {
+        let background =
+            BackgroundExecutor::new(Arc::new(PlatformScheduler::new(Arc::new(SmokeDispatcher))));
+        let dedicated = scheduler::DedicatedExecutor::new(&background);
+
+        let first = dedicated.spawn(async { std::thread::current().id() });
+        let second = dedicated.spawn(async { std::thread::current().id() });
+
+        let first = futures::executor::block_on(first);
+        let second = futures::executor::block_on(second);
+
+        assert_eq!(first, second, "tasks must share the dedicated thread");
+        assert_ne!(
+            first,
+            std::thread::current().id(),
+            "dedicated tasks must not run on the spawning thread"
+        );
     }
 
     #[test]

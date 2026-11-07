@@ -1,6 +1,6 @@
 //! Accessibility support, provided by [AccessKit][accesskit].
 //!
-//! There are user-facing guide-level docs [here](crate::_accessibility).
+//! There are user-facing guide-level docs [here](crate::_documentation::guides::accessibility).
 //!
 //! ## Architecture
 //!
@@ -18,32 +18,22 @@
 //!                              └────────────────────────────────┘   └─────────────────────┘
 //! ```
 //!
-//! In order for GPUI apps to be usable for people using assistive technology,
-//! we must do a few things:
-//! - Inform the system when the UI changes meaningfully. This includes:
-//!   - Reporting new/removed/changed UI elements
-//!   - *Not* reporting irrelevant UI changes, e.g. an invisible `div()` being
-//!     added.
-//!   - Reporting the appearance and capabilities of each UI element. For example:
-//!     - What does this piece of text say?
-//!     - How far along is this progress bar?
-//!     - Can this node be focused?
-//!     - Can this node have a value directly assigned? (e.g. a slider)
-//! - Allowing the system to interact with the UI by dispatching actions to
-//!   nodes. Note that AccessKit has its own [`Action`] type, which is not the
-//!   [`crate::Action`] trait.
-//! - Activate and deactivate accessibility features when requested by the
-//!   system.
+//! To work with assistive technology, a GPUI app must:
+//! - report meaningful UI changes, including new, removed and changed nodes;
+//! - describe each node's role, value and capabilities;
+//! - dispatch actions from assistive technology to nodes; and
+//! - activate or deactivate accessibility when the system requests it.
 //!
-//! Activating and deactivating at the right time is trivial, so I won't go into
-//! detail here. The other two are almost orthogonal in implementation.
+//! AccessKit has its own [`Action`] type, separate from GPUI's [`crate::Action`]
+//! trait.
 //!
 //! The state for both lives in the [`A11y`] struct in this module.
 //!
 //! ### Reporting UI changes
 //!
-//! Every frame, we build a [`TreeUpdate`] and send it to the platform-specific
-//! adapter. A [`TreeUpdate`] is a representation of a subset of the UI tree.
+//! While assistive technology is active, we build a [`TreeUpdate`] every frame
+//! and send it to the platform-specific adapter. A [`TreeUpdate`] represents a
+//! subset of the UI tree.
 //! When the adapter receives the update, it diffs it against the previous
 //! update, and calls platform-specific APIs to inform screen readers about the
 //! changes. Nodes may have been created, destroyed, or updated.
@@ -55,8 +45,8 @@
 //! We derive the node ID from the [`GlobalElementId`] in
 //! [`GlobalElementId::accesskit_node_id`]. Nodes without [`GlobalElementId`]s
 //! cannot produce an AccessKit [`NodeId`], and so are not included in the
-//! accessibility tree. We try to warn when using accessibility APIs on
-//! [`div()`] without setting an ID.
+//! accessibility tree. When a focused element has no node, we log that once per
+//! focus change (see [`A11y::note_focus_without_node`]).
 //!
 //! This all happens in [`Drawable::prepaint`]. The [`A11y`] struct maintains a
 //! stack of nodes during prepainting, which we can use to calculate the
@@ -73,9 +63,8 @@
 //! referred to as "synthetic children" of the element providing a non-default
 //! [`Element::a11y_synthetic_children`] implementation.
 //!
-//! The user is provided a builder-style API using [`A11ySubtreeBuilder`], which
-//! allows them to create push nodes that are children of the current node, as
-//! well as modify the current node itself.
+//! [`A11ySubtreeBuilder`] lets an element add children to its current node and
+//! modify that node.
 //!
 //! GPUI calls this callback *after* prepainting (and just before popping the
 //! corresponding element), since this step may need prepaint information to be
@@ -84,10 +73,9 @@
 //!
 //! ### Responding to actions
 //!
-//! On adapter creation, we provide a callback to the adapter, which can be used
-//! to dispatch actions. This callback forwards to [`A11y::action_listeners`], a
-//! mapping from [`NodeId`]s to action handlers (basically just `Box<dyn
-//! Fn()>`).
+//! When the adapter is created, GPUI gives it a callback for dispatching actions.
+//! The callback looks up handlers in [`A11y::action_listeners`], which maps
+//! [`NodeId`]s to boxed callbacks.
 //!
 //! This is populated in:
 //! - [`Window::on_a11y_action`], which is called by:
@@ -128,6 +116,11 @@ pub(crate) struct A11y {
     ///
     /// [forcibly disabled]: crate::Application::new_inaccessible
     force_disabled: bool,
+    /// Whether the tree is built every frame even with no assistive
+    /// technology connected. Set through [`crate::Application::with_accessibility_forced`]
+    /// or [`crate::Window::set_a11y_forced`]; for automation and tree inspection.
+    /// [`Self::force_disabled`] still wins.
+    forced: bool,
     /// Whether a11y features have been requested by the system.
     ///
     /// Updated by AccessKit using callbacks provided to the adapter. Can change
@@ -149,6 +142,8 @@ pub(crate) struct A11y {
     pub(crate) focus_ids: FxHashMap<NodeId, FocusId>,
     pub(crate) node_bounds: FxHashMap<NodeId, Bounds<Pixels>>,
     pub(crate) action_listeners: FxHashMap<NodeId, Vec<(Action, A11yActionListener)>>,
+    /// Last frame's action listeners, which reused views carry into this frame.
+    previous_action_listeners: FxHashMap<NodeId, Vec<(Action, A11yActionListener)>>,
     /// The window's title, used to label the root node so assistive
     /// technology can tell windows apart.
     window_title: Option<SharedString>,
@@ -167,16 +162,19 @@ impl A11y {
     pub(crate) fn new(
         active_flag: Arc<AtomicBool>,
         force_disabled: bool,
+        forced: bool,
         window_title: Option<SharedString>,
     ) -> Self {
         Self {
             force_disabled,
+            forced,
             active_flag,
             active_this_frame: false,
             nodes: A11yNodeBuilder::new(),
             focus_ids: FxHashMap::default(),
             node_bounds: FxHashMap::default(),
             action_listeners: FxHashMap::default(),
+            previous_action_listeners: FxHashMap::default(),
             window_title,
             last_focus_without_node: None,
             debug: debug::A11yDebug::default(),
@@ -210,7 +208,18 @@ impl A11y {
     /// See the docs for [`Self::active_flag`] and [`Self::active_this_frame`]
     /// for more commentary.
     pub(crate) fn sync_active_flag(&mut self) {
-        self.active_this_frame = !self.force_disabled && self.active_flag.load(Ordering::SeqCst);
+        self.active_this_frame =
+            !self.force_disabled && (self.forced || self.active_flag.load(Ordering::SeqCst));
+    }
+
+    /// Build the tree every frame regardless of whether assistive technology
+    /// is connected. Takes effect on the next frame.
+    pub(crate) fn set_forced(&mut self, forced: bool) {
+        self.forced = forced;
+    }
+
+    pub(crate) fn is_enabled(&self) -> bool {
+        !self.force_disabled
     }
 
     pub(crate) fn is_active(&self) -> bool {
@@ -271,8 +280,87 @@ impl A11y {
     pub(crate) fn begin_frame(&mut self) {
         self.focus_ids.clear();
         self.node_bounds.clear();
-        self.action_listeners.clear();
+        self.previous_action_listeners = std::mem::take(&mut self.action_listeners);
         self.nodes.begin_frame(self.window_title.as_ref());
+    }
+
+    /// Marks where a view starts adding nodes, for [`Self::record`].
+    pub(crate) fn mark(&self) -> A11yMark {
+        A11yMark {
+            nodes: self.nodes.all_nodes.len(),
+            children: self
+                .nodes
+                .nodes_stack
+                .last()
+                .map_or(0, |node| node.children().len()),
+            focus: self.nodes.focus,
+            active_descendant: self.nodes.active_descendant,
+        }
+    }
+
+    /// Copies what was added to the tree since `mark`, so a reused view can [replay](Self::replay)
+    /// it without running its prepaint again.
+    pub(crate) fn record(&self, mark: A11yMark) -> A11yRecording {
+        let nodes = self.nodes.all_nodes[mark.nodes..].to_vec();
+        let children = self
+            .nodes
+            .nodes_stack
+            .last()
+            .map_or(&[][..], |node| &node.children()[mark.children..])
+            .to_vec();
+        fn lookup<T: Copy>(
+            nodes: &[(NodeId, accesskit::Node)],
+            map: &FxHashMap<NodeId, T>,
+        ) -> Vec<(NodeId, T)> {
+            nodes
+                .iter()
+                .filter_map(|(id, _)| Some((*id, *map.get(id)?)))
+                .collect()
+        }
+        A11yRecording {
+            bounds: lookup(&nodes, &self.node_bounds),
+            focusable: lookup(&nodes, &self.focus_ids),
+            focus: self.nodes.focus.filter(|_| mark.focus.is_none()),
+            active_descendant: self
+                .nodes
+                .active_descendant
+                .filter(|_| mark.active_descendant.is_none()),
+            #[cfg(debug_assertions)]
+            info: nodes
+                .iter()
+                .filter_map(|(id, _)| Some((*id, self.nodes.node_info.get(id)?.clone())))
+                .collect(),
+            nodes,
+            children,
+        }
+    }
+
+    /// Adds a recorded view's nodes back under the open node, with their bounds, focus and action
+    /// listeners.
+    pub(crate) fn replay(&mut self, recording: &A11yRecording) {
+        for (id, node) in &recording.nodes {
+            if self.nodes.can_push(*id) {
+                self.nodes.all_nodes.push((*id, node.clone()));
+            }
+            if let Some(listeners) = self.previous_action_listeners.remove(id) {
+                self.action_listeners.insert(*id, listeners);
+            }
+        }
+        if let Some(parent) = self.nodes.nodes_stack.last_mut() {
+            for id in &recording.children {
+                parent.push_child(*id);
+            }
+        }
+        self.node_bounds.extend(recording.bounds.iter().copied());
+        self.focus_ids.extend(recording.focusable.iter().copied());
+        if let Some(id) = recording.focus {
+            self.nodes.set_focus(id);
+        }
+        if let Some(id) = recording.active_descendant {
+            self.nodes.set_active_descendant(id);
+        }
+        #[cfg(debug_assertions)]
+        self.nodes.node_info.extend(recording.info.iter().cloned());
     }
 
     /// Finalize the tree and produce a [`TreeUpdate`] for the platform adapter.
@@ -284,6 +372,7 @@ impl A11y {
             self.nodes.active_descendant,
             self.window_title.as_ref(),
             frame,
+            &self.node_bounds,
         );
         #[cfg(debug_assertions)]
         self.debug.capture_node_info(&self.nodes.node_info);
@@ -293,10 +382,28 @@ impl A11y {
     pub(crate) fn debug_tree_json(&self) -> Option<String> {
         self.debug.to_json()
     }
+
+    pub(crate) fn last_tree_update(&self) -> Option<&TreeUpdate> {
+        self.debug.last_tree_update()
+    }
+
+    pub(crate) fn last_node_bounds(&self, id: NodeId) -> Option<Bounds<Pixels>> {
+        self.debug.node_bounds(id)
+    }
+
+    pub(crate) fn frame_number(&self) -> u64 {
+        self.debug.frame_number()
+    }
 }
 
-/// Builder API for synthetic children. See the docs for
-/// [`Element::a11y_synthetic_children`].
+/// Adds accessibility nodes for things an element draws but doesn't model as elements.
+///
+/// GPUI passes a builder to [`Element::a11y_synthetic_children`] (or to the closure given to
+/// [`StatefulInteractiveElement::a11y_synthetic_children`]) after the element is prepainted. The
+/// builder exists only for that call. Nodes you add become children of the element's node. Use
+/// it for things like the lines of a text editor, which users can read and select but which
+/// aren't separate elements. See the
+/// [accessibility guide](crate::_documentation::guides::accessibility#expose-elements-that-gpui-doesnt-draw-as-nodes).
 pub struct A11ySubtreeBuilder<'a> {
     parent_id: NodeId,
     nodes: &'a mut A11yNodeBuilder,
@@ -322,12 +429,30 @@ impl<'a> A11ySubtreeBuilder<'a> {
         self
     }
 
-    /// Derive a [`NodeId`] for a synthetic child.
+    /// Returns a stable node id for a synthetic child, derived from `key`.
     ///
-    /// The generated ID is based on the hash of `key`, as well as the parent's
-    /// ID. This means that `key`s must be unique within the same
-    /// [`Element::a11y_synthetic_children`] call, but may be duplicated across
-    /// different calls.
+    /// The id is a hash of `key` and the parent node's id. Keys must be unique within one
+    /// [`Element::a11y_synthetic_children`] call. The same key in a later frame gives the same id,
+    /// so assistive technology sees the same node. Use [`Self::push_child`] with the returned id.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gpui::{Role, accesskit, div, prelude::*};
+    ///
+    /// // Two runs of text in one text field, each with its own stable node id.
+    /// let field = div()
+    ///     .id("field")
+    ///     .role(Role::TextInput)
+    ///     .a11y_synthetic_children(|builder| {
+    ///         for (index, text) in ["Hello", "world"].into_iter().enumerate() {
+    ///             let mut run = accesskit::Node::new(Role::TextRun);
+    ///             run.set_value(text);
+    ///             builder.push_child(builder.synthetic_node_id(index), run);
+    ///         }
+    ///     });
+    /// # let _ = field;
+    /// ```
     pub fn synthetic_node_id(&self, key: impl Hash) -> NodeId {
         let mut hasher = std::hash::DefaultHasher::default();
         self.parent_id.0.hash(&mut hasher);
@@ -335,10 +460,12 @@ impl<'a> A11ySubtreeBuilder<'a> {
         NodeId(hasher.finish())
     }
 
-    /// Append a synthetic leaf node as a child of this element's node.
+    /// Adds `node` with the given `id` as a leaf child of this element's node.
     ///
-    /// Returns `false` if a node with this id is already present in the tree,
-    /// in which case the node is discarded.
+    /// Returns `true` if the node was added. A node id can appear only once in a frame's tree.
+    /// If `id` is already used, the new node is dropped and this returns `false`. In debug builds,
+    /// a duplicate id panics instead. Use [`Self::synthetic_node_id`] to get an id that stays the
+    /// same between frames.
     pub fn push_child(&mut self, id: NodeId, node: accesskit::Node) -> bool {
         let pushed = self.nodes.push_leaf(id, node);
         #[cfg(debug_assertions)]
@@ -356,12 +483,36 @@ impl<'a> A11ySubtreeBuilder<'a> {
         pushed
     }
 
-    /// A mutable reference to the parent node.
+    /// Returns a mutable reference to this element's own node, so you can set its properties.
+    ///
+    /// Use it to set properties such as the value or the label of the element from inside
+    /// [`Element::a11y_synthetic_children`]. The reference is valid only for that call.
     pub fn parent_node(&mut self) -> &mut accesskit::Node {
         self.nodes
             .current_node_mut()
             .expect("A11ySubtreeBuilder exists only while its element's node is on the stack")
     }
+}
+
+/// Where the tree stood when a view started drawing. See [`A11y::mark`].
+pub(crate) struct A11yMark {
+    nodes: usize,
+    children: usize,
+    focus: Option<NodeId>,
+    active_descendant: Option<NodeId>,
+}
+
+/// The nodes one view added to the tree in a frame. See [`A11y::record`].
+pub(crate) struct A11yRecording {
+    nodes: Vec<(NodeId, accesskit::Node)>,
+    /// The nodes added directly under the node that was open when the view drew.
+    children: Vec<NodeId>,
+    bounds: Vec<(NodeId, Bounds<Pixels>)>,
+    focusable: Vec<(NodeId, FocusId)>,
+    focus: Option<NodeId>,
+    active_descendant: Option<NodeId>,
+    #[cfg(debug_assertions)]
+    info: Vec<(NodeId, debug::NodeDebugInfo)>,
 }
 
 pub(crate) struct A11yNodeBuilder {
@@ -635,7 +786,7 @@ mod tests {
     // in gpui's own `test` attribute macro and shadow the standard one.
     use super::{A11y, A11yNodeBuilder, ROOT_NODE_ID};
     use crate::FocusId;
-    use accesskit::{NodeId, Role};
+    use accesskit::{NodeId, Role, TreeUpdate};
     use std::sync::{Arc, atomic::AtomicBool};
 
     fn test_node() -> accesskit::Node {
@@ -649,9 +800,46 @@ mod tests {
     }
 
     fn new_a11y() -> A11y {
-        let mut a11y = A11y::new(Arc::new(AtomicBool::new(true)), false, None);
+        let mut a11y = A11y::new(Arc::new(AtomicBool::new(true)), false, false, None);
         a11y.begin_frame();
         a11y
+    }
+
+    #[test]
+    fn forced_builds_the_tree_without_an_assistive_client() {
+        // No assistive technology has activated the platform adapter.
+        let mut a11y = A11y::new(Arc::new(AtomicBool::new(false)), false, true, None);
+        a11y.sync_active_flag();
+        assert!(a11y.is_active());
+
+        a11y.set_forced(false);
+        a11y.sync_active_flag();
+        assert!(!a11y.is_active());
+    }
+
+    #[test]
+    fn force_disabled_wins_over_forced() {
+        let mut a11y = A11y::new(Arc::new(AtomicBool::new(true)), true, true, None);
+        a11y.sync_active_flag();
+        assert!(!a11y.is_active());
+    }
+
+    #[test]
+    fn accessibility_enabled_is_independent_of_activation() {
+        for force_disabled in [false, true] {
+            for active in [false, true] {
+                let mut a11y = A11y::new(
+                    Arc::new(AtomicBool::new(active)),
+                    force_disabled,
+                    false,
+                    None,
+                );
+                a11y.sync_active_flag();
+
+                assert_eq!(a11y.is_enabled(), !force_disabled);
+                assert_eq!(a11y.is_active(), !force_disabled && active);
+            }
+        }
     }
 
     #[test]
@@ -884,5 +1072,126 @@ mod tests {
 
         let update = a11y.end_frame(Default::default());
         assert_eq!(update.focus, a);
+    }
+
+    #[gpui::test]
+    fn reused_views_keep_their_nodes_focus_and_listeners(cx: &mut crate::TestAppContext) {
+        use crate::{
+            AnyWindowHandle, AppContext, Context, Entity, FocusHandle, InteractiveElement,
+            IntoElement, ParentElement, Render, StatefulInteractiveElement, Styled, Window, div,
+            px,
+        };
+        use std::{cell::Cell, rc::Rc};
+
+        struct Button {
+            label: &'static str,
+            focus: FocusHandle,
+            renders: Rc<Cell<usize>>,
+            presses: Rc<Cell<usize>>,
+        }
+
+        impl Render for Button {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.renders.set(self.renders.get() + 1);
+                let presses = self.presses.clone();
+                div()
+                    .id("button")
+                    .role(Role::Button)
+                    .aria_label(self.label)
+                    .track_focus(&self.focus)
+                    .size(px(10.))
+                    .on_a11y_action(accesskit::Action::Click, move |_, _, _| {
+                        presses.set(presses.get() + 1)
+                    })
+            }
+        }
+
+        struct Host(Entity<Button>, Entity<Button>);
+
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .id("host")
+                    .role(Role::Group)
+                    .child(self.0.clone())
+                    .child(self.1.clone())
+            }
+        }
+
+        let renders = Rc::new(Cell::new(0));
+        let presses = Rc::new(Cell::new(0));
+        let button = |label, cx: &mut crate::TestAppContext| {
+            let (renders, presses) = (renders.clone(), presses.clone());
+            cx.new(|cx| Button {
+                label,
+                focus: cx.focus_handle(),
+                renders,
+                presses,
+            })
+        };
+        let (first, second) = (button("first", cx), button("second", cx));
+        let window = cx.add_window({
+            let (first, second) = (first.clone(), second.clone());
+            move |_, _| Host(first, second)
+        });
+        let window = AnyWindowHandle::from(window);
+        let draw = |cx: &mut crate::TestAppContext| {
+            cx.update_window(window, |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.a11y_tree().unwrap().clone()
+            })
+            .unwrap()
+        };
+        let find = |tree: &TreeUpdate, label: &str| {
+            tree.nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some(label))
+                .map(|(id, _)| *id)
+                .unwrap()
+        };
+
+        cx.update_window(window, |_, window, cx| {
+            window.set_a11y_forced(true);
+            let focus = second.read(cx).focus.clone();
+            focus.focus(window, cx);
+        })
+        .unwrap();
+        let before = draw(cx);
+        let second_id = find(&before, "second");
+        assert_eq!(before.focus, second_id);
+
+        let renders_before = renders.get();
+        first.update(cx, |button, cx| {
+            button.label = "changed";
+            cx.notify();
+        });
+        let after = draw(cx);
+        assert_eq!(
+            renders.get(),
+            renders_before + 1,
+            "only the changed view renders"
+        );
+
+        let mut expected = before.clone();
+        let first_id = find(&before, "first");
+        for (id, node) in &mut expected.nodes {
+            if *id == first_id {
+                node.set_label("changed");
+            }
+        }
+        assert_eq!(
+            after, expected,
+            "the reused view's nodes and focus are unchanged"
+        );
+
+        cx.update_window(window, |_, window, cx| {
+            window.perform_a11y_action(second_id, accesskit::Action::Click, None, cx)
+        })
+        .unwrap();
+        assert_eq!(
+            presses.get(),
+            1,
+            "the reused view's action listener survives"
+        );
     }
 }

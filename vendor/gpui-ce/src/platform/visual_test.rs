@@ -1,16 +1,14 @@
-//! Visual test platform that combines real rendering (macOs-only for now) with controllable TestDispatcher.
+//! A visual-test platform that keeps real macOS rendering while making scheduling deterministic.
 //!
-//! This platform is used for visual tests that need:
-//! - Real rendering (e.g. Metal/compositor) for accurate screenshots
-//! - Deterministic task scheduling via TestDispatcher
-//! - Controllable time via `advance_clock`
+//! Use it when a screenshot must cover the renderer and compositor, but the test also needs to
+//! advance virtual time and run tasks on demand through [`TestDispatcher`].
 
 use crate::ScreenCaptureSource;
 use crate::{
-    AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, ForegroundExecutor, Keymap,
-    Menu, MenuItem, OwnedMenu, PathPromptOptions, Platform, PlatformDisplay,
-    PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, Task,
-    TestDispatcher, WindowAppearance, WindowParams,
+    ActivityGuard, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle,
+    ForegroundExecutor, Keymap, Menu, MenuItem, OwnedMenu, PathPromptOptions, Platform,
+    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
+    PlatformWindow, Task, TestDispatcher, WindowAppearance, WindowParams,
 };
 use anyhow::Result;
 use futures::channel::oneshot;
@@ -22,12 +20,21 @@ use std::{
     sync::Arc,
 };
 
-/// A platform that combines real Mac rendering with controllable TestDispatcher.
+/// A macOS platform that delegates windows and drawing to a real platform while
+/// [`TestDispatcher`] controls task scheduling and virtual time.
 ///
-/// This allows visual tests to:
-/// - Render real UI via Metal for accurate screenshots
-/// - Control task scheduling deterministically via TestDispatcher
-/// - Advance simulated time for testing time-based behaviors (tooltips, animations, etc.)
+/// Windows, text, and rendering come from the wrapped platform, so screenshots exercise the
+/// application's graphics path. Tasks use the test dispatcher. Call [`Self::dispatcher`] to
+/// advance virtual time or run ready work; tooltips and animations then progress without a real
+/// sleep.
+///
+/// Services that would otherwise depend on the host are deliberately stubbed:
+/// - The clipboard is kept in memory, and nothing reaches the system clipboard.
+/// - [`Platform::run`] panics; use the test harness instead of starting an event loop.
+/// - File dialogs resolve immediately with no selection.
+/// - Menus are not stored, and quit, restart and activation do nothing.
+///
+/// This type exists only on macOS, in test builds and with the `test-support` feature.
 pub struct VisualTestPlatform {
     dispatcher: TestDispatcher,
     background_executor: BackgroundExecutor,
@@ -38,9 +45,10 @@ pub struct VisualTestPlatform {
 }
 
 impl VisualTestPlatform {
-    /// Creates a new VisualTestPlatform with the given random seed.
+    /// Creates a visual test platform that renders through `platform`.
     ///
-    /// The seed is used for deterministic random number generation in the TestDispatcher.
+    /// `seed` initializes the [`TestDispatcher`]'s random number generator. Reusing the seed
+    /// makes scheduling decisions reproducible, which makes a visual failure easier to replay.
     pub fn new(platform: Rc<dyn Platform>, seed: u64) -> Self {
         let dispatcher = TestDispatcher::new(seed);
         let arc_dispatcher = Arc::new(dispatcher.clone());
@@ -58,7 +66,10 @@ impl VisualTestPlatform {
         }
     }
 
-    /// Returns a reference to the TestDispatcher for controlling task scheduling and time.
+    /// Returns the [`TestDispatcher`] that runs this platform's tasks.
+    ///
+    /// Call `advance_clock` to move virtual time forward, or `run_until_parked` to run work that
+    /// is ready without advancing time.
     pub fn dispatcher(&self) -> &TestDispatcher {
         &self.dispatcher
     }
@@ -83,7 +94,7 @@ impl Platform for VisualTestPlatform {
 
     fn quit(&self) {}
 
-    fn restart(&self, _binary_path: Option<PathBuf>) {}
+    fn restart(&self, _binary_path: Option<PathBuf>, _arguments: Vec<std::ffi::OsString>) {}
 
     fn activate(&self, _ignoring_other_apps: bool) {}
 
@@ -99,6 +110,10 @@ impl Platform for VisualTestPlatform {
 
     fn primary_display(&self) -> Option<Rc<dyn PlatformDisplay>> {
         self.platform.primary_display()
+    }
+
+    fn on_displays_changed(&self, callback: Box<dyn FnMut()>) {
+        self.platform.on_displays_changed(callback)
     }
 
     fn active_window(&self) -> Option<AnyWindowHandle> {
@@ -172,9 +187,11 @@ impl Platform for VisualTestPlatform {
         self.platform.open_with_system(path)
     }
 
-    fn on_quit(&self, _callback: Box<dyn FnMut()>) {}
+    fn on_quit(&self, _callback: Box<dyn FnMut() -> bool>) {}
 
     fn on_reopen(&self, _callback: Box<dyn FnMut()>) {}
+
+    fn on_system_sleep(&self, _callback: Box<dyn FnMut()>) {}
 
     fn on_system_wake(&self, _callback: Box<dyn FnMut()>) {}
 
@@ -261,4 +278,10 @@ impl Platform for VisualTestPlatform {
     }
 
     fn on_thermal_state_change(&self, _callback: Box<dyn FnMut()>) {}
+
+    fn prevent_idle_sleep(&self, reason: &str) -> Task<Result<ActivityGuard>> {
+        Task::ready(Err(anyhow::anyhow!(
+            "Idle sleep prevention for {reason:?} is not supported in visual tests"
+        )))
+    }
 }

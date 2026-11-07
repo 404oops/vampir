@@ -1,67 +1,56 @@
+use crate::{
+    Action, ActionBuildError, ActionRegistry, ActivationPolicy, ActivityGuard, Any, AnyView,
+    AnyWindowHandle, AppContext, AppLifecyclePhase, Arena, ArenaBox, Asset, AssetRegistry,
+    BackgroundExecutor, Bounds, ClipboardItem, ClipboardReadError, CursorStyle, DispatchPhase,
+    DisplayChanges, DisplayEvent, DisplayId, EventEmitter, ExternalDragPayload, FocusHandle,
+    FocusMap, ForegroundExecutor, Global, HapticFeedbackStyle, KeyBinding, KeyContext, Keymap,
+    Keystroke, LayoutId, Menu, MenuItem, OwnedMenu, PathPromptOptions, Pixels, Platform,
+    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, Point, Priority,
+    PromptBuilder, PromptButton, PromptHandle, PromptLevel, Render, RenderImage,
+    RenderablePromptHandle, Reservation, ScreenCaptureSource, SharedString, SubscriberSet,
+    Subscription, SvgRenderer, SystemNotification, SystemNotificationResponse, Task,
+    TextRenderingMode, TextSystem, ThermalState, Window, WindowAppearance, WindowButtonLayout,
+    WindowHandle, WindowId, WindowInvalidator, WindowingRequest,
+    colors::{Colors, GlobalColors},
+    hash,
+    http_client::{HttpClient, NullHttpClient},
+    init_app_menus,
+};
+use anyhow::{Context as _, Result, anyhow};
+use collections::{FxHashMap, FxHashSet, HashMap, TypeIdHashMap, TypeIdHashSet, VecDeque};
+use derive_more::{Deref, DerefMut};
+use futures::{Future, FutureExt, channel::oneshot, future::LocalBoxFuture};
+use gpui_util::{ResultExt, debug_panic};
+use itertools::Itertools;
+use parking_lot::RwLock;
 use scheduler::Instant;
+use slotmap::SlotMap;
+use smallvec::SmallVec;
 use std::{
     any::{TypeId, type_name},
     cell::{BorrowMutError, Cell, Ref, RefCell, RefMut},
+    ffi::OsString,
     marker::PhantomData,
     mem,
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     rc::{Rc, Weak},
-    sync::{Arc, atomic::Ordering::SeqCst},
+    sync::Arc,
     time::Duration,
 };
 
-use anyhow::{Context as _, Result, anyhow};
-use derive_more::{Deref, DerefMut};
-use futures::{
-    Future, FutureExt,
-    channel::oneshot,
-    future::{LocalBoxFuture, Shared},
-};
-use itertools::Itertools;
-use parking_lot::RwLock;
-use slotmap::SlotMap;
-
-use crate::http_client::{HttpClient, NullHttpClient};
-pub use async_context::*;
-#[cfg(feature = "bench")]
-pub use bench_context::{BenchAppContext, BenchReport, BenchWindowContext, bench_platform};
-use collections::{FxHashMap, FxHashSet, HashMap, TypeIdHashMap, TypeIdHashSet, VecDeque};
-pub use context::*;
-pub use entity_map::*;
-use gpui_util::{ResultExt, debug_panic};
-#[cfg(any(test, feature = "test-support"))]
-pub use headless_app_context::*;
-use smallvec::SmallVec;
-#[cfg(any(test, feature = "test-support"))]
-pub use test_app::*;
-#[cfg(any(test, feature = "test-support"))]
-pub use test_context::*;
-#[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
-pub use visual_test_context::*;
-
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::InspectorElementRegistry;
-#[cfg(target_os = "macos")]
-use crate::MacActivationPolicy;
-use crate::{
-    Action, ActionBuildError, ActionRegistry, Any, AnyView, AnyWindowHandle, AppContext, Arena,
-    ArenaBox, Asset, AssetSource, BackgroundExecutor, Bounds, ClipboardItem, CursorStyle,
-    DispatchPhase, DisplayId, EventEmitter, ExternalDragPayload, FocusHandle, FocusMap,
-    ForegroundExecutor, Global, HapticFeedbackStyle, KeyBinding, KeyContext, Keymap, Keystroke,
-    LayoutId, Menu, MenuItem, OwnedMenu, PathPromptOptions, Pixels, Platform, PlatformDisplay,
-    PlatformKeyboardLayout, PlatformKeyboardMapper, Point, Priority, PromptBuilder, PromptButton,
-    PromptHandle, PromptLevel, Render, RenderImage, RenderablePromptHandle, Reservation,
-    ScreenCaptureSource, SharedString, SubscriberSet, Subscription, SvgRenderer,
-    SystemNotification, SystemNotificationResponse, Task, TextRenderingMode, TextSystem,
-    ThermalState, Window, WindowAppearance, WindowButtonLayout, WindowHandle, WindowId,
-    WindowInvalidator,
-    colors::{Colors, GlobalColors},
-    hash, init_app_menus,
+use crate::asset_cache::CachedLoad;
+pub use async_context::*;
+#[cfg(feature = "bench-support")]
+pub use bench_context::{
+    BenchAppContext, BenchMeasurement, BenchReport, BenchWindowContext, CountingAllocator,
+    MetricReport, bench_platform,
 };
 
 mod async_context;
-#[cfg(feature = "bench")]
+#[cfg(feature = "bench-support")]
 mod bench_context;
 mod context;
 mod entity_map;
@@ -74,7 +63,19 @@ mod test_context;
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
 mod visual_test_context;
 
-/// The duration for which futures returned from [Context::on_app_quit] can run before the application fully quits.
+pub use context::*;
+pub use entity_map::*;
+#[cfg(any(test, feature = "test-support"))]
+pub use headless_app_context::*;
+#[cfg(any(test, feature = "test-support"))]
+pub use test_app::*;
+#[cfg(any(test, feature = "test-support"))]
+pub use test_context::*;
+#[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
+pub use visual_test_context::*;
+
+/// The duration for which native applications wait for futures returned from
+/// [Context::on_app_quit] before fully quitting.
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Temporary(?) wrapper around [`RefCell<App>`] to help us debug any double borrows.
@@ -142,8 +143,45 @@ impl Drop for AppRefMut<'_> {
     }
 }
 
-/// A reference to a GPUI application, typically constructed in the `main` function of your app.
-/// You won't interact with this type much outside of initial configuration and startup.
+/// The entry point for a GPUI application. Configure it, then call [`Application::run`].
+///
+/// Get one from `gpui_platform::application()`, which picks the platform for the
+/// current target. Configure it with the `with_*` and `on_*` builder methods, then call
+/// [`Application::run`] from `main`. The callback you pass to `run` receives the
+/// [`App`] once the platform has finished launching. That is where you open windows,
+/// bind keys and set globals.
+///
+/// The `with_*` methods take the application by value and return it, so you can chain
+/// them. Call them before [`Application::run`].
+///
+/// `run` blocks until the app quits on native platforms, so anything after it in
+/// `main` runs only after the app exits. Once the app is running, you use [`App`]
+/// instead of `Application`.
+///
+/// # Examples
+///
+/// ```no_run
+/// use gpui::{App, Window, WindowOptions, div, prelude::*};
+///
+/// struct HelloWorld;
+///
+/// impl Render for HelloWorld {
+///     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+///         div().child("Hello, world!")
+///     }
+/// }
+///
+/// fn main() {
+///     gpui_platform::application().run(|cx: &mut App| {
+///         cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| HelloWorld))
+///             .unwrap();
+///     });
+/// }
+/// ```
+///
+/// See [the start a project guide](crate::_documentation::guides::start_a_project) for a
+/// complete app. `TestApp` runs app code without a display, and is available with the
+/// `test-support` feature.
 pub struct Application(Rc<AppCell>);
 
 /// A strong handle to an [`Application`] started with [`Application::run_embedded`].
@@ -156,29 +194,41 @@ pub struct ApplicationHandle {
 }
 
 impl ApplicationHandle {
-    /// Invoke `f` with the app context. Must not be called re-entrantly from code that
-    /// is already inside an update; the app state is a `RefCell` and will panic on a
-    /// double borrow.
+    /// Runs `f` with the app context, from outside the platform's run loop.
+    ///
+    /// Call this each time the external run loop gives GPUI control. Effects queued by `f`,
+    /// such as deferred callbacks, run before this returns. Don't call it from
+    /// inside an update on the same app: the app state is a `RefCell`, so a re-entrant
+    /// call panics with a double borrow.
     pub fn update<R>(&self, f: impl FnOnce(&mut App) -> R) -> R {
         let cx = &mut *self.app.borrow_mut();
-        f(cx)
+        cx.update(f)
     }
 
-    /// An [`AsyncApp`] for use across await points. It holds the app weakly; keeping the
-    /// app alive remains this handle's job.
+    /// Returns an [`AsyncApp`] for use across await points.
+    ///
+    /// The [`AsyncApp`] holds the app weakly. This handle must stay alive for the
+    /// [`AsyncApp`] to do anything useful.
     pub fn to_async(&self) -> AsyncApp {
         self.update(|cx| cx.to_async())
     }
 }
 
-/// Represents an application before it is fully launched. Once your app is
-/// configured, you'll start the app with `App::run`.
 impl Application {
-    /// Builds an app with a caller-provided platform implementation.
+    /// Creates an application that uses a platform implementation you provide.
+    ///
+    /// Most apps should use `gpui_platform::application()`, which chooses the platform
+    /// for you. Use this when you want a custom or test platform. The app starts with
+    /// an empty [`AssetRegistry`], an HTTP client that fails every request, and
+    /// [`QuitMode::Default`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if called from a thread other than the main thread.
     pub fn with_platform(platform: Rc<dyn Platform>) -> Self {
         Self(App::new_app(
             platform,
-            Arc::new(()),
+            AssetRegistry::default().into(),
             Arc::new(NullHttpClient),
         ))
     }
@@ -190,25 +240,48 @@ impl Application {
     /// [`div().role()`][crate::StatefulInteractiveElement::role]) silently
     /// no-op.
     ///
-    /// See the [accessibility guide](crate::_accessibility) for an overview of
-    /// the features this disables.
+    /// See the [accessibility guide](crate::_documentation::guides::accessibility) for the
+    /// features this disables.
     pub fn new_inaccessible(platform: Rc<dyn Platform>) -> Self {
         let this = Self::with_platform(platform);
         this.0.borrow_mut().accessibility_force_disabled = true;
         this
     }
 
-    /// Assigns the source of assets for the application.
-    pub fn with_assets(self, asset_source: impl AssetSource) -> Self {
+    /// Build every window's accessibility tree every frame, even when no
+    /// assistive technology is connected.
+    ///
+    /// For automation and tree inspection: [`crate::Window::debug_a11y_tree_json`]
+    /// otherwise reports nothing until a screen reader activates the platform
+    /// adapter. [`Application::new_inaccessible`] still wins when both are set.
+    pub fn with_accessibility_forced(self) -> Self {
+        self.0.borrow_mut().accessibility_forced = true;
+        self
+    }
+
+    /// Sets the source of assets (images, fonts and SVGs) that the app loads by path.
+    ///
+    /// The registry is returned by [`App::assets`], and the SVG renderer is rebuilt to
+    /// read from it. Set it before you open windows that load assets.
+    pub fn with_assets(self, assets: impl Into<AssetRegistry>) -> Self {
         let mut context_lock = self.0.borrow_mut();
-        let asset_source = Arc::new(asset_source);
-        context_lock.asset_source = asset_source.clone();
-        context_lock.svg_renderer = SvgRenderer::new(asset_source);
+        let asset_registry = Arc::new(assets.into());
+        context_lock.asset_registry = asset_registry.clone();
+        context_lock.svg_renderer = SvgRenderer::new(asset_registry);
         drop(context_lock);
         self
     }
 
-    /// Sets the HTTP client for the application.
+    /// Sets the command-line arguments that [`App::restart`] passes to the new process.
+    pub fn with_restart_arguments(self, arguments: Vec<OsString>) -> Self {
+        self.0.borrow_mut().restart_arguments = arguments;
+        self
+    }
+
+    /// Sets the HTTP client that [`App::http_client`] returns.
+    ///
+    /// The default fails every request. Pass a real client to let the app fetch URLs,
+    /// for example for remote images.
     pub fn with_http_client(self, http_client: Arc<dyn HttpClient>) -> Self {
         let mut context_lock = self.0.borrow_mut();
         context_lock.http_client = http_client;
@@ -216,8 +289,10 @@ impl Application {
         self
     }
 
-    /// Configures when the application should automatically quit.
-    /// By default, [`QuitMode::Default`] is used.
+    /// Sets when the app quits on its own. See [`QuitMode`] for the choices.
+    ///
+    /// Defaults to [`QuitMode::Default`]. You can also change it at runtime with
+    /// [`App::set_quit_mode`].
     pub fn with_quit_mode(self, mode: QuitMode) -> Self {
         self.0.borrow_mut().quit_mode = mode;
         self
@@ -231,32 +306,63 @@ impl Application {
     /// - `Prohibited`: Runs in background, no UI allowed
     ///
     /// This must be called before the application finishes launching to take effect.
-    ///
-    /// # Example
-    /// ```no_run
-    /// # use gpui::Application;
-    /// # fn configure(app: Application) -> Application {
-    /// app.with_activation_policy(gpui::MacActivationPolicy::Accessory)
-    /// # }
-    /// ```
+    /// The method exists only on macOS, so cross-platform code calls it behind
+    /// `#[cfg(target_os = "macos")]`.
     #[cfg(target_os = "macos")]
-    pub fn with_activation_policy(self, policy: MacActivationPolicy) -> Self {
-        self.0.borrow().platform.set_mac_activation_policy(policy);
+    pub fn with_activation_policy(self, policy: ActivationPolicy) -> Self {
+        self.0.borrow().platform.set_activation_policy(policy);
+        self
+    }
+
+    /// Starts the event loop and calls `on_finish_launching` once the app has launched.
+    ///
+    /// The callback runs on the main thread with the [`App`], and runs once. Open your
+    /// first window there. On native platforms this method blocks until the app quits,
+    /// so code after it runs only after the app exits. On the web it returns right away,
+    /// and the app keeps running in the page.
+    ///
+    /// See the [`Application`] example for a complete `main`.
+    /// Sets the windowing mode the app starts in. See [`App::request_windowing`].
+    ///
+    /// Defaults to windowed. On Linux, the default environment is the process's own, and the app
+    /// starts headless if that names no allowed display server. On macOS, headless means the app
+    /// starts without a Dock icon or menu bar ([`ActivationPolicy::Accessory`]). Has no effect on
+    /// other platforms.
+    pub fn with_windowing(self, request: WindowingRequest) -> Self {
+        self.0.borrow().platform.set_initial_windowing(request);
         self
     }
 
     /// Start the application. The provided callback will be called once the
     /// app is fully launched.
+    ///
+    /// On WebAssembly, this returns immediately and retains the app for the lifetime
+    /// of the Wasm instance. Use [`Self::run_embedded`] to control its lifetime explicitly.
     pub fn run<F>(self, on_finish_launching: F)
     where
         F: 'static + FnOnce(&mut App),
     {
+        #[cfg(all(
+            feature = "hot-patching",
+            debug_assertions,
+            not(target_family = "wasm")
+        ))]
+        dioxus_devtools::connect_subsecond();
+
         let this = self.0.clone();
         let platform = self.0.borrow().platform.clone();
         platform.run(Box::new(move || {
             let cx = &mut *this.borrow_mut();
+            // Some platforms only connect to their display server in `run`.
+            cx.displays_changed();
             on_finish_launching(cx);
         }));
+
+        // Native platform run loops block until shutdown, keeping `self` alive for the
+        // application's lifetime. The web platform schedules startup and returns
+        // immediately, so retain the application until the browser tears down the page.
+        #[cfg(target_family = "wasm")]
+        std::mem::forget(self);
     }
 
     /// Start the application for an embedder that drives the run loop itself.
@@ -276,13 +382,18 @@ impl Application {
         let platform = self.0.borrow().platform.clone();
         platform.run(Box::new(move || {
             let cx = &mut *this.borrow_mut();
+            // Some platforms only connect to their display server in `run`.
+            cx.displays_changed();
             on_finish_launching(cx);
         }));
         ApplicationHandle { app: self.0 }
     }
 
-    /// Register a handler to be invoked when the platform instructs the application
-    /// to open one or more URLs.
+    /// Registers a handler for URLs that the user asks the app to open.
+    ///
+    /// The handler receives the URLs as strings. Register a scheme with
+    /// [`App::register_url_scheme`] so the platform routes links with that scheme to
+    /// the app.
     pub fn on_open_urls<F>(&self, mut callback: F) -> &Self
     where
         F: 'static + FnMut(Vec<String>),
@@ -291,8 +402,11 @@ impl Application {
         self
     }
 
-    /// Invokes a handler when an already-running application is launched.
-    /// On macOS, this can occur when the application icon is double-clicked or the app is launched via the dock.
+    /// Registers a handler for a second launch while the app is already running.
+    ///
+    /// On macOS this happens when the user clicks the app icon in the Dock or in
+    /// Finder. A common response is to open a window if none is visible. The handler
+    /// receives the [`App`].
     pub fn on_reopen<F>(&self, mut callback: F) -> &Self
     where
         F: 'static + FnMut(&mut App),
@@ -306,45 +420,85 @@ impl Application {
         self
     }
 
-    /// Invokes a handler when the system wakes from sleep.
-    pub fn on_system_wake<F>(&self, mut callback: F) -> &Self
-    where
-        F: 'static + FnMut(&mut App),
-    {
-        let this = Rc::downgrade(&self.0);
-        self.0
-            .borrow_mut()
-            .platform
-            .on_system_wake(Box::new(move || {
-                if let Some(app) = this.upgrade() {
-                    callback(&mut app.borrow_mut());
-                }
-            }));
-        self
-    }
-
-    /// Returns a handle to the [`BackgroundExecutor`] associated with this app, which can be used to spawn futures in the background.
+    /// Returns the executor for `Send` futures. See [`BackgroundExecutor`] for platform behavior.
     pub fn background_executor(&self) -> BackgroundExecutor {
         self.0.borrow().background_executor.clone()
     }
 
-    /// Returns a handle to the [`ForegroundExecutor`] associated with this app, which can be used to spawn futures in the foreground.
+    /// Returns the executor for futures that run on the foreground thread.
     pub fn foreground_executor(&self) -> ForegroundExecutor {
         self.0.borrow().foreground_executor.clone()
     }
 
-    /// Returns a reference to the [`TextSystem`] associated with this app.
+    /// Returns a shared handle to the app's [`TextSystem`], which shapes and rasterizes text.
     pub fn text_system(&self) -> Arc<TextSystem> {
         self.0.borrow().text_system.clone()
     }
 
-    /// Returns the file URL of the executable with the specified name in the application bundle
+    /// Returns the path to a helper executable named `name` that ships with the app.
+    ///
+    /// Use this to launch a companion binary, such as a CLI or a helper process. It
+    /// returns an error if the platform cannot find the executable.
     pub fn path_for_auxiliary_executable(&self, name: &str) -> Result<PathBuf> {
         self.0.borrow().path_for_auxiliary_executable(name)
     }
 }
 
 type Handler = Box<dyn FnMut(&mut App) -> bool + 'static>;
+type AppLifecycleHandler = Box<dyn FnMut(AppLifecyclePhase, &mut App) -> bool + 'static>;
+type DisplayHandler = Box<dyn FnMut(DisplayEvent, &mut App) -> bool + 'static>;
+
+/// The properties of a display that GPUI reports changes to.
+#[derive(Clone, Copy, PartialEq)]
+struct DisplayState {
+    bounds: Bounds<Pixels>,
+    refresh_interval: Option<Duration>,
+}
+
+impl DisplayState {
+    fn changes_from(&self, previous: &DisplayState) -> DisplayChanges {
+        let mut changes = DisplayChanges::empty();
+        changes.set(DisplayChanges::BOUNDS, self.bounds != previous.bounds);
+        changes.set(
+            DisplayChanges::REFRESH_INTERVAL,
+            self.refresh_interval != previous.refresh_interval,
+        );
+        changes
+    }
+}
+
+fn read_displays(platform: &dyn Platform) -> HashMap<DisplayId, DisplayState> {
+    platform
+        .displays()
+        .into_iter()
+        .map(|display| {
+            let state = DisplayState {
+                bounds: display.bounds(),
+                refresh_interval: display.refresh_interval(),
+            };
+            (display.id(), state)
+        })
+        .collect()
+}
+
+/// The events that turn one snapshot of the connected displays into the next.
+fn display_events(
+    previous: &HashMap<DisplayId, DisplayState>,
+    current: &HashMap<DisplayId, DisplayState>,
+) -> Vec<DisplayEvent> {
+    let removed = previous
+        .keys()
+        .filter(|id| !current.contains_key(id))
+        .map(|id| DisplayEvent::Removed(*id));
+    let added_or_changed = current.iter().filter_map(|(id, state)| {
+        let Some(previous_state) = previous.get(id) else {
+            return Some(DisplayEvent::Added(*id));
+        };
+        let changes = state.changes_from(previous_state);
+        (!changes.is_empty()).then_some(DisplayEvent::Changed { id: *id, changes })
+    });
+    removed.chain(added_or_changed).collect()
+}
 type Listener = Box<dyn FnMut(&dyn Any, &mut App) -> bool + 'static>;
 pub(crate) type KeystrokeObserver =
     Box<dyn FnMut(&KeystrokeEvent, &mut Window, &mut App) -> bool + 'static>;
@@ -353,10 +507,22 @@ type WindowClosedHandler = Box<dyn FnMut(&mut App, WindowId)>;
 type ReleaseListener = Box<dyn FnOnce(&mut dyn Any, &mut App) + 'static>;
 type NewEntityListener = Box<dyn FnMut(AnyEntity, &mut Option<&mut Window>, &mut App) + 'static>;
 
-/// Defines when the application should automatically quit.
+/// Controls whether the app quits on its own when its last window closes.
+///
+/// The check runs each time a window closes. With [`QuitMode::LastWindowClosed`], the
+/// app quits as soon as no windows remain. With [`QuitMode::Explicit`], closing the
+/// last window leaves the app running until you call [`App::quit`].
+///
+/// # Examples
+///
+/// ```
+/// # use gpui::QuitMode;
+/// assert_eq!(QuitMode::default(), QuitMode::Default);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum QuitMode {
-    /// Use [`QuitMode::Explicit`] on macOS and [`QuitMode::LastWindowClosed`] on other platforms.
+    /// Behaves like [`QuitMode::LastWindowClosed`] on Linux and Windows, and like
+    /// [`QuitMode::Explicit`] on macOS, where closing the last window is normal.
     #[default]
     Default,
     /// Quit automatically when the last window is closed.
@@ -367,8 +533,8 @@ pub enum QuitMode {
 
 /// Controls when GPUI hides the mouse cursor in response to keyboard input.
 ///
-/// Restoration on mouse motion is handled by the platform layer; this enum
-/// only describes the policy for *triggering* a hide.
+/// GPUI decides when to hide the cursor. The platform shows it again on mouse motion.
+/// Set the mode with [`App::set_cursor_hide_mode`].
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum CursorHideMode {
     /// Never hide the cursor automatically.
@@ -381,17 +547,22 @@ pub enum CursorHideMode {
     OnTypingAndAction,
 }
 
+/// A tab in a group of native window tabs. Used by [`SystemWindowTabController`].
 #[doc(hidden)]
 #[derive(Clone, PartialEq, Eq)]
 pub struct SystemWindowTab {
+    /// The ID of the window this tab shows.
     pub id: WindowId,
+    /// The title shown on the tab.
     pub title: SharedString,
+    /// The handle to the window.
     pub handle: AnyWindowHandle,
+    /// When the tab was last active. Used to choose which tab in a group to show.
     pub last_active_at: Instant,
 }
 
 impl SystemWindowTab {
-    /// Create a new instance of the window tab.
+    /// Creates a tab for a window, with its current time as the last-active time.
     pub fn new(title: SharedString, handle: AnyWindowHandle) -> Self {
         Self {
             id: handle.id,
@@ -402,7 +573,10 @@ impl SystemWindowTab {
     }
 }
 
-/// A controller for managing window tabs.
+/// A global that tracks which windows are grouped into native window tabs.
+///
+/// Stored as a [`Global`]. Call [`SystemWindowTabController::init`] once at startup.
+/// The methods that take `cx` read and update this global.
 #[derive(Default)]
 pub struct SystemWindowTabController {
     visible: Option<bool>,
@@ -412,7 +586,7 @@ pub struct SystemWindowTabController {
 impl Global for SystemWindowTabController {}
 
 impl SystemWindowTabController {
-    /// Create a new instance of the window tab controller.
+    /// Creates an empty controller with no tab groups and tabs hidden.
     pub fn new() -> Self {
         Self {
             visible: None,
@@ -420,17 +594,21 @@ impl SystemWindowTabController {
         }
     }
 
-    /// Initialize the global window tab controller.
+    /// Sets the global [`SystemWindowTabController`] to a new, empty controller.
     pub fn init(cx: &mut App) {
         cx.set_global(SystemWindowTabController::new());
     }
 
-    /// Get all tab groups.
+    /// Returns every tab group, keyed by group ID.
     pub fn tab_groups(&self) -> &FxHashMap<usize, Vec<SystemWindowTab>> {
         &self.tab_groups
     }
 
-    /// Get the next tab group window handle.
+    /// Returns the handle of the window in the tab group that follows the group containing `id`
+    /// in the iteration order of `tab_groups`. That order is arbitrary.
+    ///
+    /// The window chosen is the most recently active tab in that group. Returns `None`
+    /// if `id` is not in a group.
     pub fn get_next_tab_group_window(cx: &mut App, id: WindowId) -> Option<&AnyWindowHandle> {
         let controller = cx.global::<SystemWindowTabController>();
         let current_group = controller
@@ -455,7 +633,11 @@ impl SystemWindowTabController {
             })
     }
 
-    /// Get the previous tab group window handle.
+    /// Returns the handle of the window in the tab group that precedes the group containing `id`
+    /// in the iteration order of `tab_groups`. That order is arbitrary.
+    ///
+    /// The window chosen is the most recently active tab in that group. Returns `None`
+    /// if `id` is not in a group.
     pub fn get_prev_tab_group_window(cx: &mut App, id: WindowId) -> Option<&AnyWindowHandle> {
         let controller = cx.global::<SystemWindowTabController>();
         let current_group = controller
@@ -484,14 +666,14 @@ impl SystemWindowTabController {
             })
     }
 
-    /// Get all tabs in the same window.
+    /// Returns the tabs in the group that contains the window `id`, or `None` if it has none.
     pub fn tabs(&self, id: WindowId) -> Option<&Vec<SystemWindowTab>> {
         self.tab_groups
             .values()
             .find(|tabs| tabs.iter().any(|tab| tab.id == id))
     }
 
-    /// Initialize the visibility of the system window tab controller.
+    /// Sets tab visibility to `visible`, but only if it has not been set yet.
     pub fn init_visible(cx: &mut App, visible: bool) {
         let mut controller = cx.global_mut::<SystemWindowTabController>();
         if controller.visible.is_none() {
@@ -499,18 +681,18 @@ impl SystemWindowTabController {
         }
     }
 
-    /// Get the visibility of the system window tab controller.
+    /// Returns whether window tabs are shown. Defaults to `false` until set.
     pub fn is_visible(&self) -> bool {
         self.visible.unwrap_or(false)
     }
 
-    /// Set the visibility of the system window tab controller.
+    /// Shows or hides window tabs.
     pub fn set_visible(cx: &mut App, visible: bool) {
         let mut controller = cx.global_mut::<SystemWindowTabController>();
         controller.visible = Some(visible);
     }
 
-    /// Update the last active of a window.
+    /// Records that the window `id` is now the active tab, for ordering tab groups.
     pub fn update_last_active(cx: &mut App, id: WindowId) {
         let mut controller = cx.global_mut::<SystemWindowTabController>();
         for windows in controller.tab_groups.values_mut() {
@@ -522,7 +704,9 @@ impl SystemWindowTabController {
         }
     }
 
-    /// Update the position of a tab within its group.
+    /// Moves the tab for window `id` to index `ix` within its group.
+    ///
+    /// Does nothing if `ix` is out of range or the tab is already there.
     pub fn update_tab_position(cx: &mut App, id: WindowId, ix: usize) {
         let mut controller = cx.global_mut::<SystemWindowTabController>();
         for (_, windows) in controller.tab_groups.iter_mut() {
@@ -536,7 +720,7 @@ impl SystemWindowTabController {
         }
     }
 
-    /// Update the title of a tab.
+    /// Sets the title of the tab for window `id`. Does nothing if the title is unchanged.
     pub fn update_tab_title(cx: &mut App, id: WindowId, title: SharedString) {
         let controller = cx.global::<SystemWindowTabController>();
         let tab = controller
@@ -560,7 +744,10 @@ impl SystemWindowTabController {
         }
     }
 
-    /// Insert a tab into a tab group.
+    /// Adds the window `id` to the group that holds the other tabs in `tabs`.
+    ///
+    /// If no existing group holds exactly the other tabs, `tabs` becomes a new group.
+    /// Does nothing if `tabs` does not contain `id`.
     pub fn add_tab(cx: &mut App, id: WindowId, tabs: Vec<SystemWindowTab>) {
         let mut controller = cx.global_mut::<SystemWindowTabController>();
         let Some(tab) = tabs.iter().find(|tab| tab.id == id).cloned() else {
@@ -588,12 +775,14 @@ impl SystemWindowTabController {
                 tabs.push(tab);
             }
         } else {
-            let new_group_id = controller.tab_groups.len();
+            let new_group_id = controller.tab_groups.keys().max().map_or(0, |id| id + 1);
             controller.tab_groups.insert(new_group_id, tabs);
         }
     }
 
-    /// Remove a tab from a tab group.
+    /// Removes the tab for window `id` from its group and returns it.
+    ///
+    /// A group that becomes empty is removed. Returns `None` if `id` is in no group.
     pub fn remove_tab(cx: &mut App, id: WindowId) -> Option<SystemWindowTab> {
         let mut controller = cx.global_mut::<SystemWindowTabController>();
         let mut removed_tab = None;
@@ -608,7 +797,7 @@ impl SystemWindowTabController {
         removed_tab
     }
 
-    /// Move a tab to a new tab group.
+    /// Moves the tab for window `id` out of its group into a new group of its own.
     pub fn move_tab_to_new_window(cx: &mut App, id: WindowId) {
         let mut removed_tab = Self::remove_tab(cx, id);
         let mut controller = cx.global_mut::<SystemWindowTabController>();
@@ -619,7 +808,7 @@ impl SystemWindowTabController {
         }
     }
 
-    /// Merge all tab groups into a single group.
+    /// Merges every tab group into one group, starting with the group that holds `id`.
     pub fn merge_all_windows(cx: &mut App, id: WindowId) {
         let mut controller = cx.global_mut::<SystemWindowTabController>();
         let Some(initial_tabs) = controller.tabs(id) else {
@@ -637,7 +826,7 @@ impl SystemWindowTabController {
         controller.tab_groups.insert(0, all_tabs);
     }
 
-    /// Selects the next tab in the tab group in the trailing direction.
+    /// Activates the tab after window `id`'s tab in its group, wrapping around at the end.
     pub fn select_next_tab(cx: &mut App, id: WindowId) {
         let mut controller = cx.global_mut::<SystemWindowTabController>();
         let Some(tabs) = controller.tabs(id) else {
@@ -648,11 +837,11 @@ impl SystemWindowTabController {
         let next_index = (current_index + 1) % tabs.len();
 
         let _ = &tabs[next_index].handle.update(cx, |_, window, _| {
-            window.activate_window();
+            window.activate();
         });
     }
 
-    /// Selects the previous tab in the tab group in the leading direction.
+    /// Activates the tab before window `id`'s tab in its group, wrapping around at the start.
     pub fn select_previous_tab(cx: &mut App, id: WindowId) {
         let mut controller = cx.global_mut::<SystemWindowTabController>();
         let Some(tabs) = controller.tabs(id) else {
@@ -667,7 +856,7 @@ impl SystemWindowTabController {
         };
 
         let _ = &tabs[previous_index].handle.update(cx, |_, window, _| {
-            window.activate_window();
+            window.activate();
         });
     }
 }
@@ -710,9 +899,73 @@ enum PlatformOwnedDragState {
     RestoredInSourceWindow,
 }
 
-/// Contains the state of the full application, and passed as a reference to a variety of callbacks.
-/// Other [Context] derefs to this type.
-/// You need a reference to an `App` to access the state of a [Entity].
+/// What a view read while it drew: entities, globals and handle revisions, with the revision
+/// each was at.
+#[derive(Default)]
+pub(crate) struct Dependencies {
+    entities: Vec<EntityId>,
+    globals: Vec<(TypeId, u64)>,
+    revisions: Vec<(Revision, u64)>,
+}
+
+impl Dependencies {
+    pub(crate) fn extend(&mut self, other: Dependencies) {
+        self.entities.extend(other.entities);
+        self.entities.sort_unstable();
+        self.entities.dedup();
+        self.globals.extend(other.globals);
+        self.globals.sort_unstable();
+        self.globals.dedup_by_key(|(global_type, _)| *global_type);
+        // A later phase saw the later revision, so it wins.
+        for (revision, seen) in other.revisions {
+            match self
+                .revisions
+                .iter_mut()
+                .find(|(known, _)| known.same(&revision))
+            {
+                Some(entry) => entry.1 = seen,
+                None => self.revisions.push((revision, seen)),
+            }
+        }
+    }
+}
+
+/// A counter for state that lives outside entities, such as a list's scroll position, so the
+/// views that read it are drawn again when it changes. The owner bumps it on every mutation.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Revision(Rc<Cell<u64>>);
+
+impl Revision {
+    pub(crate) fn bump(&self) {
+        self.0.set(self.0.get().wrapping_add(1));
+    }
+
+    fn same(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// The state of a running application: its entities, windows, globals and key bindings.
+///
+/// You get a `&mut App` from the callback passed to [`Application::run`], from
+/// `TestApp::update`, and from any [`Context`], which derefs to `App`. Read an
+/// entity with [`Entity::read`], and create one with [`AppContext::new`]. Callbacks that
+/// run after an `await` can't hold the `App`, so they use an [`AsyncApp`] instead.
+///
+/// `App` is not `Clone`. Keep one per app, and use the references you are given. It
+/// is not `Send`, so it only runs on the main thread.
+///
+/// # Examples
+///
+/// ```
+/// # use gpui::{AppContext, TestApp};
+/// let mut app = TestApp::new();
+/// let count = app.update(|cx| cx.new(|_| 1));
+/// app.read(|cx| assert_eq!(*count.read(cx), 1));
+/// ```
+///
+/// See [contexts](crate::_documentation::concepts::contexts) for how `App` relates to the
+/// other context types.
 pub struct App {
     pub(crate) this: Weak<AppCell>,
     pub(crate) platform: Rc<dyn Platform>,
@@ -723,11 +976,15 @@ pub struct App {
     platform_owned_drag: Option<PlatformOwnedDrag>,
     pub(crate) background_executor: BackgroundExecutor,
     pub(crate) foreground_executor: ForegroundExecutor,
+    #[cfg(feature = "profiler")]
+    foreground_journal: crate::profiler::journal::ForegroundJournal,
+    #[cfg(all(feature = "profiler", not(target_family = "wasm")))]
+    hang_monitor: Option<crate::profiler::hang::HangMonitor>,
     pub(crate) entities: EntityMap,
     pub(crate) new_entity_observers: SubscriberSet<TypeId, NewEntityListener>,
     pub(crate) windows: SlotMap<WindowId, Option<Box<Window>>>,
     pub(crate) window_handles: FxHashMap<WindowId, AnyWindowHandle>,
-    pub(crate) focus_handles: Arc<FocusMap>,
+    pub(crate) focus_handles: Arc<RwLock<FocusMap>>,
     pub(crate) keymap: Rc<RefCell<Keymap>>,
     pub(crate) keyboard_layout: Box<dyn PlatformKeyboardLayout>,
     pub(crate) keyboard_mapper: Rc<dyn PlatformKeyboardMapper>,
@@ -741,6 +998,14 @@ pub struct App {
     pub(crate) keystroke_interceptors: SubscriberSet<(), KeystrokeObserver>,
     pub(crate) keyboard_layout_observers: SubscriberSet<(), Handler>,
     pub(crate) thermal_state_observers: SubscriberSet<(), Handler>,
+    pub(crate) display_observers: SubscriberSet<(), DisplayHandler>,
+    /// The connected displays, as of the platform's last display change
+    /// notification.
+    displays: HashMap<DisplayId, DisplayState>,
+    pub(crate) system_sleep_observers: SubscriberSet<(), Handler>,
+    pub(crate) system_wake_observers: SubscriberSet<(), Handler>,
+    app_lifecycle_observers: SubscriberSet<(), AppLifecycleHandler>,
+    memory_warning_observers: SubscriberSet<(), Handler>,
     pub(crate) release_listeners: SubscriberSet<EntityId, ReleaseListener>,
     pub(crate) global_observers: SubscriberSet<TypeId, Handler>,
     pub(crate) quit_observers: SubscriberSet<(), QuitHandler>,
@@ -758,6 +1023,9 @@ pub struct App {
     // the tokio runtime. As any task attempting to spawn a blocking tokio task,
     // might panic.
     pub(crate) globals_by_type: TypeIdHashMap<Box<dyn Any>>,
+    global_revisions: TypeIdHashMap<u64>,
+    global_reads: RefCell<Vec<TypeId>>,
+    revision_reads: RefCell<Vec<Revision>>,
     // Entities which are retained until explicitly removed from the app or dropped at end of life-cycle.
     // This is an alternative way to define "global" data which uses entities.
     // There can be multiple entities of a given type & each `Entity<T>` is stored as `Box<dyn Any>`.
@@ -765,7 +1033,7 @@ pub struct App {
 
     // assets
     pub(crate) loading_assets: FxHashMap<(TypeId, u64), Box<dyn Any>>,
-    asset_source: Arc<dyn AssetSource>,
+    asset_registry: Arc<AssetRegistry>,
     pub(crate) svg_renderer: SvgRenderer,
     http_client: Arc<dyn HttpClient>,
 
@@ -773,6 +1041,7 @@ pub struct App {
     pub(crate) pending_notifications: FxHashSet<EntityId>,
     pub(crate) pending_global_notifications: TypeIdHashSet,
     pub(crate) restart_path: Option<PathBuf>,
+    pub(crate) restart_arguments: Vec<OsString>,
     pub(crate) layout_id_buffer: Vec<LayoutId>, // We recycle this memory across layout requests.
     pub(crate) propagate_event: bool,
     pub(crate) prompt_builder: Option<PromptBuilder>,
@@ -792,17 +1061,21 @@ pub struct App {
     pub(crate) mode: GpuiMode,
     pub(crate) cursor_hide_mode: CursorHideMode,
     pub(crate) reduce_motion: bool,
+    /// Origin of the shared clock that phase-locks synced repeating animations.
+    pub(crate) synced_animation_epoch: Instant,
     /// Whether the app was created by [`Application::new_inaccessible`]. No
     /// accesskit APIs will be called when this flag is set.
     pub(crate) accessibility_force_disabled: bool,
-    flushing_effects: bool,
+    /// Whether windows build their accessibility tree every frame without an
+    /// assistive-technology client. See [`Application::with_accessibility_forced`].
+    pub(crate) accessibility_forced: bool,
     pending_updates: usize,
     quit_mode: QuitMode,
     quitting: bool,
 
     // We need to ensure the leak detector drops last, after all tasks, callbacks and things have been dropped.
     // Otherwise it may report false positives.
-    #[cfg(any(test, feature = "leak-detection"))]
+    #[cfg(any(test, gpui_leak_detection))]
     _ref_counts: Arc<RwLock<EntityRefCounts>>,
 }
 
@@ -810,7 +1083,7 @@ impl App {
     #[allow(clippy::new_ret_no_self)]
     pub(crate) fn new_app(
         platform: Rc<dyn Platform>,
-        asset_source: Arc<dyn AssetSource>,
+        asset_registry: Arc<AssetRegistry>,
         http_client: Arc<dyn HttpClient>,
     ) -> Rc<AppCell> {
         let background_executor = platform.background_executor();
@@ -819,13 +1092,16 @@ impl App {
             background_executor.is_main_thread(),
             "must construct App on main thread"
         );
+        #[cfg(feature = "profiler")]
+        let foreground_journal = crate::profiler::journal::install_foreground_journal();
+        let synced_animation_epoch = background_executor.now();
 
         let text_system = Arc::new(TextSystem::new(platform.text_system()));
         let entities = EntityMap::new();
         let keyboard_layout = platform.keyboard_layout();
         let keyboard_mapper = platform.keyboard_mapper();
 
-        #[cfg(any(test, feature = "leak-detection"))]
+        #[cfg(any(test, gpui_leak_detection))]
         let _ref_counts = entities.ref_counts_drop_handle();
 
         let app = Rc::new_cyclic(|this| AppCell {
@@ -836,24 +1112,30 @@ impl App {
                 text_rendering_mode: Rc::new(Cell::new(TextRenderingMode::default())),
                 mode: GpuiMode::Production,
                 actions: Rc::new(ActionRegistry::default()),
-                flushing_effects: false,
                 pending_updates: 0,
                 active_drag: None,
                 platform_owned_drag: None,
                 background_executor,
                 foreground_executor,
-                svg_renderer: SvgRenderer::new(asset_source.clone()),
+                #[cfg(feature = "profiler")]
+                foreground_journal,
+                #[cfg(all(feature = "profiler", not(target_family = "wasm")))]
+                hang_monitor: None,
+                svg_renderer: SvgRenderer::new(asset_registry.clone()),
                 loading_assets: Default::default(),
-                asset_source,
+                asset_registry,
                 http_client,
                 globals_by_type: Default::default(),
+                global_revisions: Default::default(),
+                global_reads: Default::default(),
+                revision_reads: Default::default(),
                 global_entities: Default::default(),
                 entities,
                 new_entity_observers: SubscriberSet::new(),
                 windows: SlotMap::with_key(),
                 window_update_stack: Vec::new(),
                 window_handles: FxHashMap::default(),
-                focus_handles: Arc::new(RwLock::new(SlotMap::with_key())),
+                focus_handles: Arc::new(RwLock::new(FocusMap::default())),
                 keymap: Rc::new(RefCell::new(Keymap::default())),
                 keyboard_layout,
                 keyboard_mapper,
@@ -871,10 +1153,17 @@ impl App {
                 keystroke_interceptors: SubscriberSet::new(),
                 keyboard_layout_observers: SubscriberSet::new(),
                 thermal_state_observers: SubscriberSet::new(),
+                display_observers: SubscriberSet::new(),
+                displays: read_displays(platform.as_ref()),
+                system_sleep_observers: SubscriberSet::new(),
+                system_wake_observers: SubscriberSet::new(),
+                app_lifecycle_observers: SubscriberSet::new(),
+                memory_warning_observers: SubscriberSet::new(),
                 global_observers: SubscriberSet::new(),
                 quit_observers: SubscriberSet::new(),
                 restart_observers: SubscriberSet::new(),
                 restart_path: None,
+                restart_arguments: Vec::new(),
                 window_closed_observers: SubscriberSet::new(),
                 layout_id_buffer: Default::default(),
                 propagate_event: true,
@@ -887,20 +1176,24 @@ impl App {
                 quitting: false,
                 cursor_hide_mode: CursorHideMode::default(),
                 reduce_motion: false,
+                synced_animation_epoch,
                 accessibility_force_disabled: false,
+                accessibility_forced: false,
 
                 #[cfg(any(test, feature = "test-support", debug_assertions))]
                 name: None,
                 element_arena: RefCell::new(Arena::new(1024 * 1024)),
                 event_arena: Arena::new(1024 * 1024),
 
-                #[cfg(any(test, feature = "leak-detection"))]
+                #[cfg(any(test, gpui_leak_detection))]
                 _ref_counts,
             }),
         });
 
         init_app_menus(platform.as_ref(), &app.borrow());
         SystemWindowTabController::init(&mut app.borrow_mut());
+        #[cfg(feature = "profiler")]
+        crate::profiler::journal::observe_power(&app.borrow());
 
         platform.on_keyboard_layout_change(Box::new({
             let app = Rc::downgrade(&app);
@@ -928,11 +1221,81 @@ impl App {
             }
         }));
 
+        platform.on_displays_changed(Box::new({
+            let app = Rc::downgrade(&app);
+            move || {
+                if let Some(app) = app.upgrade() {
+                    app.borrow_mut().displays_changed();
+                }
+            }
+        }));
+
+        platform.on_system_sleep(Box::new({
+            let app = Rc::downgrade(&app);
+            move || {
+                if let Some(app) = app.upgrade() {
+                    let cx = &mut app.borrow_mut();
+                    cx.system_sleep_observers
+                        .clone()
+                        .retain(&(), move |callback| (callback)(cx));
+                }
+            }
+        }));
+
+        platform.on_system_wake(Box::new({
+            let app = Rc::downgrade(&app);
+            move || {
+                if let Some(app) = app.upgrade() {
+                    let cx = &mut app.borrow_mut();
+                    cx.system_wake_observers
+                        .clone()
+                        .retain(&(), move |callback| (callback)(cx));
+                }
+            }
+        }));
+
+        platform.on_app_lifecycle(Box::new({
+            let app = Rc::downgrade(&app);
+            move |phase| {
+                if let Some(app) = app.upgrade() {
+                    app.borrow_mut().update(|cx| {
+                        cx.app_lifecycle_observers
+                            .clone()
+                            .retain(&(), |callback| callback(phase, cx));
+                    });
+                }
+            }
+        }));
+
+        platform.on_memory_warning(Box::new({
+            let app = Rc::downgrade(&app);
+            move || {
+                if let Some(app) = app.upgrade() {
+                    app.borrow_mut().update(|cx| {
+                        cx.memory_warning_observers
+                            .clone()
+                            .retain(&(), |callback| callback(cx));
+                    });
+                }
+            }
+        }));
+
         platform.on_quit(Box::new({
             let cx = Rc::downgrade(&app);
             move || {
-                if let Some(cx) = cx.upgrade() {
-                    cx.borrow_mut().shutdown();
+                let Some(cx) = cx.upgrade() else {
+                    return true;
+                };
+                match cx.try_borrow_mut() {
+                    Ok(mut cx) => {
+                        cx.shutdown();
+                        true
+                    }
+                    Err(_) => {
+                        // Quit was requested while the AppCell was borrowed, so we can't shut down synchronously.
+                        // The platform decides how to proceed.
+                        false
+                    }
                 }
             }
         }));
@@ -950,7 +1313,7 @@ impl App {
     /// The returned [`LeakDetectorSnapshot`] can later be passed to
     /// [`assert_no_new_leaks`](Self::assert_no_new_leaks) to verify that no
     /// entities created after the snapshot are still alive.
-    #[cfg(any(test, feature = "leak-detection"))]
+    #[cfg(any(test, gpui_leak_detection))]
     pub fn leak_detector_snapshot(&self) -> LeakDetectorSnapshot {
         self.entities.leak_detector_snapshot()
     }
@@ -966,18 +1329,55 @@ impl App {
     /// Panics if any new entity handles exist. The panic message lists every
     /// leaked entity with its type name, and includes allocation-site backtraces
     /// when `LEAK_BACKTRACE` is set.
-    #[cfg(any(test, feature = "leak-detection"))]
+    #[cfg(any(test, gpui_leak_detection))]
     pub fn assert_no_new_leaks(&self, snapshot: &LeakDetectorSnapshot) {
         self.entities.assert_no_new_leaks(snapshot)
     }
 
-    /// Quit the application gracefully. Handlers registered with [`Context::on_app_quit`]
-    /// will be given `SHUTDOWN_TIMEOUT` to complete before exiting.
+    /// Without leak detection compiled in, this records nothing.
+    #[cfg(all(feature = "test-support", not(any(test, gpui_leak_detection))))]
+    pub fn leak_detector_snapshot(&self) -> LeakDetectorSnapshot {
+        LeakDetectorSnapshot::default()
+    }
+
+    /// Without leak detection compiled in, this checks nothing. Set
+    /// `GPUI_LEAK_DETECTION` when building to enable it.
+    #[cfg(all(feature = "test-support", not(any(test, gpui_leak_detection))))]
+    pub fn assert_no_new_leaks(&self, _snapshot: &LeakDetectorSnapshot) {}
+
+    /// Runs the quit handlers, closes every window and flushes pending effects.
+    ///
+    /// The platform calls this when the app quits. Handlers registered with
+    /// [`Context::on_app_quit`] run first. Native apps wait up to [`SHUTDOWN_TIMEOUT`]
+    /// for them to finish and log an error if they don't. On the web the handlers run
+    /// asynchronously as best-effort cleanup, because the event loop cannot block.
+    ///
+    /// To quit from your own code, call [`App::quit`] instead.
     pub fn shutdown(&mut self) {
-        let mut futures = Vec::new();
+        // Requested first so the final hang poll overlaps with the quit
+        // handlers. It's awaited alongside them, within `SHUTDOWN_TIMEOUT`.
+        #[cfg(all(feature = "profiler", not(target_family = "wasm")))]
+        let hang_monitor_flush = self
+            .hang_monitor
+            .as_ref()
+            .and_then(|hang_monitor| hang_monitor.request_flush());
+
+        let mut futures: Vec<LocalBoxFuture<'static, ()>> = Vec::new();
 
         for observer in self.quit_observers.remove(&()) {
             futures.push(observer(self));
+        }
+
+        #[cfg(all(feature = "profiler", not(target_family = "wasm")))]
+        if let Some(flushed) = hang_monitor_flush {
+            futures.push(
+                async move {
+                    if flushed.await.is_err() {
+                        log::warn!("hang monitor exited before flushing");
+                    }
+                }
+                .boxed_local(),
+            );
         }
 
         self.windows.clear();
@@ -986,6 +1386,7 @@ impl App {
         self.quitting = true;
 
         let futures = futures::future::join_all(futures);
+        #[cfg(not(target_family = "wasm"))]
         if self
             .foreground_executor
             .block_with_timeout(SHUTDOWN_TIMEOUT, futures)
@@ -993,21 +1394,31 @@ impl App {
         {
             log::error!("timed out waiting on app_will_quit");
         }
+        #[cfg(target_family = "wasm")]
+        self.foreground_executor.spawn(futures).detach();
 
         self.quitting = false;
     }
 
-    /// Get the id of the current keyboard layout
+    /// Returns the keyboard layout that is active now.
+    ///
+    /// Use it to translate between keystrokes and the characters they produce. The
+    /// value is updated when the layout changes, which [`App::on_keyboard_layout_change`]
+    /// reports.
     pub fn keyboard_layout(&self) -> &dyn PlatformKeyboardLayout {
         self.keyboard_layout.as_ref()
     }
 
-    /// Get the current keyboard mapper.
+    /// Returns the keyboard mapper for the active layout.
     pub fn keyboard_mapper(&self) -> &Rc<dyn PlatformKeyboardMapper> {
         &self.keyboard_mapper
     }
 
-    /// Invokes a handler when the current keyboard layout changes
+    /// Calls `callback` each time the user switches the keyboard layout.
+    ///
+    /// The subscription stays active while you hold it. Drop it to stop receiving
+    /// calls. By the time the callback runs, [`App::keyboard_layout`] already returns
+    /// the new layout.
     pub fn on_keyboard_layout_change<F>(&self, mut callback: F) -> Subscription
     where
         F: 'static + FnMut(&mut App),
@@ -1023,19 +1434,61 @@ impl App {
         subscription
     }
 
-    /// Gracefully quit the application via the platform's standard routine.
+    /// Asks the platform to quit the app, the same as choosing Quit from the app menu.
+    ///
+    /// The quit happens later, not inside this call. The platform then calls
+    /// [`App::shutdown`], which runs the [`Context::on_app_quit`] handlers and closes
+    /// the windows. Use this to quit from your own code. [`QuitMode`] controls quits
+    /// that happen when the last window closes.
     pub fn quit(&self) {
         self.platform.quit();
     }
 
-    /// Returns the current policy for hiding the cursor in response to
-    /// keyboard input.
+    /// Switches the platform between headless and windowed modes.
+    ///
+    /// On Linux, headless means no display server: windows opened afterwards lay out and handle
+    /// input but draw nothing. Windowed, the platform connects to the display server the
+    /// environment names. On macOS, the modes set the [`ActivationPolicy`]: headless is
+    /// `Accessory` (no Dock icon or menu bar) and windowed is `Regular`. Switching to windowed
+    /// doesn't activate the app: call [`App::activate`] for that.
+    ///
+    /// The returned task resolves once the switch has been applied. It fails if the platform is
+    /// already in the requested mode (switching to another display server means going headless
+    /// first), if the platform doesn't allow the mode or can't switch at all, if any window is
+    /// open (a window belongs to the display server that opened it), or if the display server
+    /// can't be reached.
+    pub fn request_windowing(&self, request: WindowingRequest) -> Task<anyhow::Result<()>> {
+        if !self.windows.is_empty() {
+            return Task::ready(Err(anyhow::anyhow!(
+                "cannot switch windowing modes while windows are open"
+            )));
+        }
+        self.platform.request_windowing(request)
+    }
+
+    /// The environment of the display server the platform is connected to, or `None` while
+    /// headless. Its activation token is always unset, since the connection has used it.
+    ///
+    /// Programs an app launches inherit this process's environment, which may name another
+    /// graphical session, or none if the app started headless. Pass them this one with
+    /// [`GraphicalEnvironment::apply_to`](crate::GraphicalEnvironment::apply_to).
+    ///
+    /// On macOS, the environment carries nothing, and this is `None` while the activation
+    /// policy is `Accessory`. Always `None` on platforms that can't switch windowing modes.
+    pub fn graphical_environment(&self) -> Option<crate::GraphicalEnvironment> {
+        self.platform.graphical_environment()
+    }
+
+    /// Returns the policy that decides when GPUI hides the cursor while typing.
+    ///
+    /// Defaults to [`CursorHideMode::OnTypingAndAction`].
     pub fn cursor_hide_mode(&self) -> CursorHideMode {
         self.cursor_hide_mode
     }
 
-    /// Sets the policy controlling when GPUI hides the cursor in response
-    /// to keyboard input.
+    /// Sets the policy that decides when GPUI hides the cursor while typing.
+    ///
+    /// Takes effect for the next keystroke. The cursor reappears when the mouse moves.
     pub fn set_cursor_hide_mode(&mut self, mode: CursorHideMode) {
         self.cursor_hide_mode = mode;
     }
@@ -1049,14 +1502,18 @@ impl App {
         self.platform.is_cursor_visible()
     }
 
-    /// Returns whether non-essential animations (e.g. loading spinners) should
-    /// be rendered in a static state instead of animating.
+    /// Returns whether non-essential animations should render in a static state.
+    ///
+    /// Check this before you start a decorative animation, such as a spinner that only
+    /// looks busy. The app sets it, and it defaults to `false`.
     pub fn reduce_motion(&self) -> bool {
         self.reduce_motion
     }
 
-    /// Sets whether non-essential animations (e.g. loading spinners) should be
-    /// rendered in a static state instead of animating.
+    /// Sets whether non-essential animations should render in a static state.
+    ///
+    /// Setting a different value redraws all windows. Animations that are needed to
+    /// show state, such as a progress bar, should keep running.
     pub fn set_reduce_motion(&mut self, reduce_motion: bool) {
         if self.reduce_motion != reduce_motion {
             self.reduce_motion = reduce_motion;
@@ -1064,12 +1521,16 @@ impl App {
         }
     }
 
-    /// Schedules all windows in the application to be redrawn. This can be called
-    /// multiple times in an update cycle and still result in a single redraw.
+    /// Redraws every window once the current update finishes.
+    ///
+    /// Calling it several times in one update still causes a single redraw per window.
+    /// Use [`Context::notify`] on the entity that changed instead when you can. Use this
+    /// when state outside any entity changes what is drawn.
     pub fn refresh_windows(&mut self) {
         self.pending_effects.push_back(Effect::RefreshWindows);
     }
 
+    #[inline(always)]
     pub(crate) fn update<R>(&mut self, update: impl FnOnce(&mut Self) -> R) -> R {
         self.start_update();
         let result = update(self);
@@ -1081,34 +1542,44 @@ impl App {
         self.pending_updates += 1;
     }
 
+    #[inline(never)]
     pub(crate) fn finish_update(&mut self) {
-        if !self.flushing_effects && self.pending_updates == 1 {
-            self.flushing_effects = true;
+        if self.pending_updates == 1 {
             self.flush_effects();
-            self.flushing_effects = false;
         }
         self.pending_updates -= 1;
     }
 
-    /// Emit an event of the specified type, which can be handled by other entities that have subscribed via `subscribe` methods on their respective contexts.
-    /// A globally-callable equivalent to `Context::emit` without requiring an entity update.
-    pub fn emit<EntityType, EventType>(&mut self, entity: &Entity<EntityType>, event: EventType)
-    where
-        EntityType: EventEmitter<EventType>,
-        EventType: 'static,
-    {
-        let event = self
-            .event_arena
-            .alloc(|| event)
-            .map(|it| it as &mut dyn Any);
-        self.pending_effects.push_back(Effect::Emit {
-            emitter: entity.entity_id(),
-            event_type: TypeId::of::<EventType>(),
-            event,
-        });
-    }
-
-    /// Arrange a callback to be invoked when the given entity calls `notify` on its respective context.
+    /// Calls `on_notify` each time `entity` calls [`Context::notify`].
+    ///
+    /// The callback receives the entity and the [`App`]. It runs when the update that
+    /// called `notify` finishes, not during that call. Keep the returned [`Subscription`]
+    /// alive, because dropping it ends the observation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use gpui::{AppContext, TestApp};
+    /// # use std::{cell::Cell, rc::Rc};
+    /// # let mut app = TestApp::new();
+    /// let seen = Rc::new(Cell::new(0));
+    /// let counter = app.update(|cx| cx.new(|_| 0));
+    /// let _subscription = app.update(|cx| {
+    ///     cx.observe(&counter, {
+    ///         let seen = seen.clone();
+    ///         move |counter, cx| seen.set(*counter.read(cx))
+    ///     })
+    /// });
+    /// app.update(|cx| {
+    ///     counter.update(cx, |count, cx| {
+    ///         *count = 2;
+    ///         cx.notify();
+    ///     })
+    /// });
+    /// assert_eq!(seen.get(), 2);
+    /// ```
+    ///
+    /// See [ownership and data flow](crate::_documentation::concepts::ownership).
     pub fn observe<W>(
         &mut self,
         entity: &Entity<W>,
@@ -1123,20 +1594,115 @@ impl App {
         })
     }
 
-    pub(crate) fn detect_accessed_entities<R>(
+    /// Runs `callback` and returns what it read: the entities, and the globals at their
+    /// current revisions. Reads by nested recordings count for the enclosing ones too.
+    pub(crate) fn record_dependencies<R>(
         &mut self,
         callback: impl FnOnce(&mut App) -> R,
-    ) -> (R, FxHashSet<EntityId>) {
-        let accessed_entities_start = self.entities.accessed_entities.get_mut().clone();
+    ) -> (R, Dependencies) {
+        let entities_start = self.entities.access_log.get_mut().len();
+        let globals_start = self.global_reads.get_mut().len();
+        let revisions_start = self.revision_reads.get_mut().len();
+        *self.entities.recordings.get_mut() += 1;
         let result = callback(self);
-        let entities_accessed_in_callback = self
-            .entities
-            .accessed_entities
-            .get_mut()
-            .difference(&accessed_entities_start)
+        let recordings = self.entities.recordings.get_mut();
+        *recordings -= 1;
+        let outermost = *recordings == 0;
+
+        let log = self.entities.access_log.get_mut();
+        let mut entities = log[entities_start..].to_vec();
+        entities.sort_unstable();
+        entities.dedup();
+        let reads = self.global_reads.get_mut();
+        let mut globals: Vec<(TypeId, u64)> = reads[globals_start..]
+            .iter()
+            .map(|global_type| (*global_type, 0))
+            .collect();
+        let revision_reads = self.revision_reads.get_mut();
+        let mut revisions: Vec<(Revision, u64)> = Vec::new();
+        for revision in revision_reads.drain(revisions_start..) {
+            if !revisions.iter().any(|(known, _)| known.same(&revision)) {
+                let seen = revision.0.get();
+                revisions.push((revision, seen));
+            }
+        }
+        if !outermost {
+            // Enclosing recordings depend on these too.
+            revision_reads.extend(revisions.iter().map(|(revision, _)| revision.clone()));
+        }
+        if outermost {
+            log.clear();
+            reads.clear();
+        }
+        globals.sort_unstable();
+        globals.dedup();
+        for (global_type, revision) in &mut globals {
+            *revision = self.global_revision(*global_type);
+        }
+        (
+            result,
+            Dependencies {
+                entities,
+                globals,
+                revisions,
+            },
+        )
+    }
+
+    /// Counts `dependencies` as read again, as when a view's output is reused.
+    pub(crate) fn replay_dependencies(&mut self, dependencies: &Dependencies) {
+        for entity_id in &dependencies.entities {
+            self.entities.note_access(*entity_id);
+        }
+        for (global_type, _) in &dependencies.globals {
+            self.note_global_read(*global_type);
+        }
+        for (revision, _) in &dependencies.revisions {
+            self.note_revision(revision);
+        }
+    }
+
+    /// Records that the drawing view read state versioned by `revision`.
+    pub(crate) fn note_revision(&self, revision: &Revision) {
+        if self.entities.recordings.get() > 0 {
+            self.revision_reads.borrow_mut().push(revision.clone());
+        }
+    }
+
+    /// Returns whether anything in `dependencies` changed: an entity in `dirty`, or a global
+    /// written since it was read.
+    pub(crate) fn dependencies_changed(
+        &self,
+        dependencies: &Dependencies,
+        dirty: &FxHashSet<EntityId>,
+    ) -> bool {
+        dependencies.entities.iter().any(|id| dirty.contains(id))
+            || dependencies
+                .globals
+                .iter()
+                .any(|(global_type, revision)| self.global_revision(*global_type) != *revision)
+            || dependencies
+                .revisions
+                .iter()
+                .any(|(revision, seen)| revision.0.get() != *seen)
+    }
+
+    fn note_global_read(&self, global_type: TypeId) {
+        if self.entities.recordings.get() > 0 {
+            self.global_reads.borrow_mut().push(global_type);
+        }
+    }
+
+    fn global_revision(&self, global_type: TypeId) -> u64 {
+        self.global_revisions
+            .get(&global_type)
             .copied()
-            .collect::<FxHashSet<EntityId>>();
-        (result, entities_accessed_in_callback)
+            .unwrap_or(0)
+    }
+
+    fn global_changed(&mut self, global_type: TypeId) {
+        *self.global_revisions.entry(global_type).or_default() += 1;
+        self.push_effect(Effect::NotifyGlobalObservers { global_type });
     }
 
     pub(crate) fn record_entities_accessed(
@@ -1196,8 +1762,35 @@ impl App {
         )
     }
 
-    /// Arrange for the given callback to be invoked whenever the given entity emits an event of a given type.
-    /// The callback is provided a handle to the emitting entity and a reference to the emitted event.
+    /// Calls `on_event` each time `entity` emits an event of type `Event`.
+    ///
+    /// The callback receives the entity, a reference to the event and the [`App`]. The
+    /// entity emits with [`Context::emit`]. Callbacks run when the update that emitted
+    /// the event finishes. Keep the returned [`Subscription`] alive, because dropping it
+    /// ends the subscription. Use [`App::observe`] when the entity only calls
+    /// [`Context::notify`] and doesn't send a payload.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use gpui::{AppContext, EventEmitter, TestApp};
+    /// # use std::{cell::Cell, rc::Rc};
+    /// struct Counter;
+    /// struct Incremented(usize);
+    /// impl EventEmitter<Incremented> for Counter {}
+    ///
+    /// # let mut app = TestApp::new();
+    /// let counter = app.update(|cx| cx.new(|_| Counter));
+    /// let total = Rc::new(Cell::new(0));
+    /// let _subscription = app.update(|cx| {
+    ///     cx.subscribe(&counter, {
+    ///         let total = total.clone();
+    ///         move |_, event: &Incremented, _| total.set(total.get() + event.0)
+    ///     })
+    /// });
+    /// app.update(|cx| counter.update(cx, |_, cx| cx.emit(Incremented(3))));
+    /// assert_eq!(total.get(), 3);
+    /// ```
     pub fn subscribe<T, Event>(
         &mut self,
         entity: &Entity<T>,
@@ -1249,9 +1842,11 @@ impl App {
         )
     }
 
-    /// Returns handles to all open windows in the application.
-    /// Each handle could be downcast to a handle typed for the root view of that window.
-    /// To find all windows of a given type, you could filter on
+    /// Returns handles to every open window.
+    ///
+    /// Each handle is untyped. [`AnyWindowHandle::downcast`] checks the root type recorded in
+    /// the handle. If the root may have been replaced, use [`AnyWindowHandle::update`] to
+    /// inspect the live root; the recorded type does not change with it.
     pub fn windows(&self) -> Vec<AnyWindowHandle> {
         self.windows
             .keys()
@@ -1268,10 +1863,11 @@ impl App {
         self.platform.window_stack()
     }
 
-    /// Register additional GPU device requirements (extra features and/or
-    /// limits) before opening any windows.  The `Box` must contain a
-    /// `gpui_wgpu::WgpuDeviceRequirements`.
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    /// Sets the GPU device requirements (extra features and limits) for the renderer.
+    /// Only macOS uses them.
+    ///
+    /// Call this before opening any window. The argument must be a
+    /// `gpui_wgpu::WgpuDeviceRequirements` boxed as `Box<dyn Any>`.
     pub fn set_gpu_requirements(&self, requirements: Box<dyn std::any::Any>) {
         self.platform.set_gpu_requirements(requirements);
     }
@@ -1282,14 +1878,47 @@ impl App {
         self.platform.set_keyring_label(label.into());
     }
 
-    /// Returns a handle to the window that is currently focused at the platform level, if one exists.
+    /// Returns the handle of the window that the platform reports as active, if any.
+    ///
+    /// Returns `None` when no window of this app has focus, for example when another
+    /// application is in front.
     pub fn active_window(&self) -> Option<AnyWindowHandle> {
         self.platform.active_window()
     }
 
-    /// Opens a new window with the given option and the root view returned by the given function.
-    /// The function is invoked with a `Window`, which can be used to interact with window-specific
-    /// functionality.
+    /// Opens a window and builds its root view.
+    ///
+    /// `build_root_view` runs once, with the new [`Window`] and the [`App`], and returns
+    /// the root entity. The window is drawn once before this method returns. Use the
+    /// returned [`WindowHandle`] to update or read the root view later.
+    ///
+    /// In tests, `TestApp::open_window` opens a window without a display.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the platform cannot create the window. In that case
+    /// `build_root_view` is not called.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use gpui::{AppContext, Context, Render, TestApp, Window, WindowOptions, div, prelude::*};
+    /// struct Hello;
+    ///
+    /// impl Render for Hello {
+    ///     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    ///         div().child("Hello")
+    ///     }
+    /// }
+    ///
+    /// # let mut app = TestApp::new();
+    /// let window = app.update(|cx| {
+    ///     cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| Hello))
+    ///         .unwrap()
+    /// });
+    /// app.read(|cx| assert_eq!(cx.windows().len(), 1));
+    /// # let _ = window;
+    /// ```
     pub fn open_window<V: 'static + Render>(
         &mut self,
         options: crate::WindowOptions,
@@ -1325,49 +1954,56 @@ impl App {
         })
     }
 
-    /// Instructs the platform to activate the application by bringing it to the foreground.
+    /// Brings the app to the front.
+    ///
+    /// Pass `ignoring_other_apps: true` to activate the app even when another app is in front.
+    /// Use it sparingly, because it moves the user's focus.
     pub fn activate(&self, ignoring_other_apps: bool) {
         self.platform.activate(ignoring_other_apps);
     }
 
-    /// Hide the application at the platform level.
+    /// Hides the app, the same as choosing Hide from the app menu.
     pub fn hide(&self) {
         self.platform.hide();
     }
 
-    /// Hide other applications at the platform level.
+    /// Hides all other applications.
     pub fn hide_other_apps(&self) {
         self.platform.hide_other_apps();
     }
 
-    /// Unhide other applications at the platform level.
+    /// Shows the applications hidden by [`App::hide_other_apps`].
     pub fn unhide_other_apps(&self) {
         self.platform.unhide_other_apps();
     }
 
-    /// Returns the list of currently active displays.
+    /// Returns the connected displays.
     pub fn displays(&self) -> Vec<Rc<dyn PlatformDisplay>> {
         self.platform.displays()
     }
 
-    /// Returns the primary display that will be used for new windows.
+    /// Returns the primary display, or `None` if the platform reports none.
     pub fn primary_display(&self) -> Option<Rc<dyn PlatformDisplay>> {
         self.platform.primary_display()
     }
 
-    /// Returns whether `screen_capture_sources` may work.
+    /// Returns whether [`App::screen_capture_sources`] can return sources on this platform.
     pub fn is_screen_capture_supported(&self) -> bool {
         self.platform.is_screen_capture_supported()
     }
 
-    /// Returns a list of available screen capture sources.
+    /// Asks the platform for the screens and windows that can be captured.
+    ///
+    /// The list arrives on the returned channel, so the call doesn't block. The channel
+    /// yields an error if the platform can't list sources. Check
+    /// [`App::is_screen_capture_supported`] first.
     pub fn screen_capture_sources(
         &self,
     ) -> oneshot::Receiver<Result<Vec<Rc<dyn ScreenCaptureSource>>>> {
         self.platform.screen_capture_sources()
     }
 
-    /// Returns the display with the given ID, if one exists.
+    /// Returns the display with the given [`DisplayId`], or `None` if it is not connected.
     pub fn find_display(&self, id: DisplayId) -> Option<Rc<dyn PlatformDisplay>> {
         self.displays()
             .iter()
@@ -1375,12 +2011,22 @@ impl App {
             .cloned()
     }
 
-    /// Returns the current thermal state of the system.
+    /// Returns the system's current [`ThermalState`].
+    ///
+    /// Check it before heavy work, such as a long animation or a background
+    /// computation, and reduce the work when the system is hot.
     pub fn thermal_state(&self) -> ThermalState {
         self.platform.thermal_state()
     }
 
-    /// Invokes a handler when the thermal state changes
+    /// Prevents idle sleep while the returned guard is held.
+    pub fn prevent_idle_sleep(&self, reason: &str) -> Task<Result<ActivityGuard>> {
+        self.platform.prevent_idle_sleep(reason)
+    }
+
+    /// Calls `callback` when the system's thermal state changes.
+    ///
+    /// The subscription stays active while you hold it.
     pub fn on_thermal_state_change<F>(&self, mut callback: F) -> Subscription
     where
         F: 'static + FnMut(&mut App),
@@ -1396,7 +2042,134 @@ impl App {
         subscription
     }
 
-    /// Returns the appearance of the application's windows.
+    /// Invokes a handler when the system is about to sleep.
+    ///
+    /// The platform gives the process only a short time before suspending, so
+    /// handlers should record state or cancel work rather than start it.
+    pub fn on_system_sleep<F>(&self, mut callback: F) -> Subscription
+    where
+        F: 'static + FnMut(&mut App),
+    {
+        let (subscription, activate) = self.system_sleep_observers.insert(
+            (),
+            Box::new(move |cx| {
+                callback(cx);
+                true
+            }),
+        );
+        activate();
+        subscription
+    }
+
+    pub(crate) fn displays_changed(&mut self) {
+        let current = read_displays(self.platform.as_ref());
+        let events = display_events(&self.displays, &current);
+        self.displays = current;
+        for event in &events {
+            let DisplayEvent::Changed { id, .. } = *event else {
+                continue;
+            };
+            for handle in self.windows() {
+                self.update_window(handle, |_, window, cx| {
+                    if window.display_id == Some(id) {
+                        window.notify_display_observers(cx);
+                    }
+                })
+                .log_err();
+            }
+        }
+        for event in events {
+            self.display_observers
+                .clone()
+                .retain(&(), |callback| (callback)(event, self));
+        }
+    }
+
+    pub(crate) fn knows_display(&self, id: DisplayId) -> bool {
+        self.displays.contains_key(&id)
+    }
+
+    /// The refresh interval of a connected display, as of the platform's last
+    /// display change notification.
+    pub(crate) fn display_refresh_interval(&self, id: DisplayId) -> Option<Duration> {
+        self.displays.get(&id)?.refresh_interval
+    }
+
+    /// Invokes a handler when a display is connected, disconnected, or its
+    /// properties change.
+    pub fn observe_displays<F>(&self, mut callback: F) -> Subscription
+    where
+        F: 'static + FnMut(DisplayEvent, &mut App),
+    {
+        let (subscription, activate) = self.display_observers.insert(
+            (),
+            Box::new(move |event, cx| {
+                callback(event, cx);
+                true
+            }),
+        );
+        activate();
+        subscription
+    }
+
+    /// Calls `callback` when the system wakes from sleep.
+    ///
+    /// Use it to reconnect to network services or refresh data that went stale
+    /// while the machine slept. The subscription stays active while you hold it.
+    pub fn on_system_wake<F>(&self, mut callback: F) -> Subscription
+    where
+        F: 'static + FnMut(&mut App),
+    {
+        let (subscription, activate) = self.system_wake_observers.insert(
+            (),
+            Box::new(move |cx| {
+                callback(cx);
+                true
+            }),
+        );
+        activate();
+        subscription
+    }
+
+    /// Observes mobile application lifecycle changes. Desktop platforms do not
+    /// emit these events. On iOS these currently describe the single connected
+    /// scene, not individual windows.
+    ///
+    /// Save important changes incrementally: neither disconnection nor quit is
+    /// guaranteed before the system terminates a backgrounded application.
+    /// Dropping the returned subscription removes the observer.
+    pub fn on_app_lifecycle(
+        &self,
+        mut callback: impl FnMut(AppLifecyclePhase, &mut App) + 'static,
+    ) -> Subscription {
+        let (subscription, activate) = self.app_lifecycle_observers.insert(
+            (),
+            Box::new(move |phase, cx| {
+                callback(phase, cx);
+                true
+            }),
+        );
+        activate();
+        subscription
+    }
+
+    /// Observes mobile memory-pressure warnings so applications can release
+    /// expendable caches. Dropping the subscription removes the observer.
+    pub fn on_memory_warning(&self, mut callback: impl FnMut(&mut App) + 'static) -> Subscription {
+        let (subscription, activate) = self.memory_warning_observers.insert(
+            (),
+            Box::new(move |cx| {
+                callback(cx);
+                true
+            }),
+        );
+        activate();
+        subscription
+    }
+
+    /// Returns whether the windows use the light or dark appearance.
+    ///
+    /// This is the system setting unless [`App::set_window_appearance`] overrides it.
     pub fn window_appearance(&self) -> WindowAppearance {
         self.platform.window_appearance()
     }
@@ -1415,55 +2188,91 @@ impl App {
         self.platform.set_window_appearance(appearance);
     }
 
-    /// Whether the current platform supports haptic feedback.
+    /// Returns whether [`App::play_haptic_feedback`] does anything on this platform.
     pub fn supports_haptic_feedback(&self) -> bool {
         self.platform.supports_haptic_feedback()
     }
 
-    /// Play a haptic feedback of the given style.
+    /// Plays a haptic feedback pulse of the given style.
     ///
-    /// Must be called from the main thread. This is a no-op on platforms that
-    /// do not support haptic feedback. Styles correspond to
+    /// Call it from the main thread, for example in response to a click or a drop that
+    /// the user should feel. It does nothing on platforms without haptics. Check
+    /// [`App::supports_haptic_feedback`] to decide whether to show a haptic option.
+    /// Styles correspond to
     /// [`NSHapticFeedbackPattern`](https://developer.apple.com/documentation/appkit/nshapticfeedbackmanager/feedbackpattern)
     /// values on macOS.
     pub fn play_haptic_feedback(&self, style: HapticFeedbackStyle) {
         self.platform.play_haptic_feedback(style)
     }
 
-    /// Returns the window button layout configuration when supported.
+    /// Returns the window button layout (the position of close, minimize and maximize), if the platform reports one.
+    ///
+    /// Returns `None` when the platform has no custom layout. Use it to draw your own
+    /// window controls in the same place as the native ones.
     pub fn button_layout(&self) -> Option<WindowButtonLayout> {
         self.platform.button_layout()
     }
 
-    /// Reads data from the platform clipboard.
+    /// Reads the current contents of the system clipboard.
+    ///
+    /// Returns `None` if the clipboard is empty or holds nothing GPUI can read. On
+    /// the web, use [`App::read_from_clipboard_async`] instead, because this method
+    /// cannot wait for permission.
     pub fn read_from_clipboard(&self) -> Option<ClipboardItem> {
         self.platform.read_from_clipboard()
     }
 
-    /// Sets the text rendering mode for the application.
+    /// Reads the system clipboard and resolves once the contents are available.
+    ///
+    /// Prefer this over [`App::read_from_clipboard`] in code that can await. On
+    /// platforms where clipboard access is asynchronous and permission-gated (such as
+    /// the web), the synchronous read always returns `None` while this method performs
+    /// a real read. The task resolves to an error if the read fails.
+    pub fn read_from_clipboard_async(
+        &self,
+    ) -> Task<Result<Option<ClipboardItem>, ClipboardReadError>> {
+        self.platform.read_from_clipboard_async()
+    }
+
+    /// Sets how text is rasterized for every window in the app.
+    ///
+    /// The default is [`TextRenderingMode::PlatformDefault`]. The new mode applies to
+    /// text drawn after this call.
     pub fn set_text_rendering_mode(&mut self, mode: TextRenderingMode) {
         self.text_rendering_mode.set(mode);
     }
 
-    /// Returns the current text rendering mode for the application.
+    /// Returns how text is currently rasterized. See [`App::set_text_rendering_mode`].
     pub fn text_rendering_mode(&self) -> TextRenderingMode {
         self.text_rendering_mode.get()
     }
 
-    /// Writes data to the platform clipboard.
+    /// Replaces the contents of the system clipboard with `item`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use gpui::{AppContext, ClipboardItem, TestApp};
+    /// # let mut app = TestApp::new();
+    /// app.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("copied".into())));
+    /// app.read(|cx| {
+    ///     let item = cx.read_from_clipboard().unwrap();
+    ///     assert_eq!(item.text().as_deref(), Some("copied"));
+    /// });
+    /// ```
     pub fn write_to_clipboard(&self, item: ClipboardItem) {
         self.platform.write_to_clipboard(item)
     }
 
     /// Reads data from the primary selection buffer.
-    /// Only available on Linux.
+    /// Only available on Linux and FreeBSD.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     pub fn read_from_primary(&self) -> Option<ClipboardItem> {
         self.platform.read_from_primary()
     }
 
     /// Writes data to the primary selection buffer.
-    /// Only available on Linux.
+    /// Only available on Linux and FreeBSD.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     pub fn write_to_primary(&self, item: ClipboardItem) {
         self.platform.write_to_primary(item)
@@ -1473,7 +2282,7 @@ impl App {
     ///
     /// Used to share the current search string between apps.
     ///
-    /// https://developer.apple.com/documentation/appkit/nspasteboard/name-swift.struct/find
+    /// <https://developer.apple.com/documentation/appkit/nspasteboard/name-swift.struct/find>
     #[cfg(target_os = "macos")]
     pub fn read_from_find_pasteboard(&self) -> Option<ClipboardItem> {
         self.platform.read_from_find_pasteboard()
@@ -1483,13 +2292,16 @@ impl App {
     ///
     /// Used to share the current search string between apps.
     ///
-    /// https://developer.apple.com/documentation/appkit/nspasteboard/name-swift.struct/find
+    /// <https://developer.apple.com/documentation/appkit/nspasteboard/name-swift.struct/find>
     #[cfg(target_os = "macos")]
     pub fn write_to_find_pasteboard(&self, item: ClipboardItem) {
         self.platform.write_to_find_pasteboard(item)
     }
 
-    /// Writes credentials to the platform keychain.
+    /// Stores a username and password for `url` in the platform keychain.
+    ///
+    /// The task resolves once the store finishes, or to an error if it fails. Await it
+    /// from a task spawned with [`App::spawn`].
     pub fn write_credentials(
         &self,
         url: &str,
@@ -1499,37 +2311,39 @@ impl App {
         self.platform.write_credentials(url, username, password)
     }
 
-    /// Reads credentials from the platform keychain.
+    /// Reads the username and password stored for `url`.
+    ///
+    /// The task resolves to `None` when nothing is stored for `url`. Use the same `url`
+    /// that you passed to [`App::write_credentials`].
     pub fn read_credentials(&self, url: &str) -> Task<Result<Option<(String, Vec<u8>)>>> {
         self.platform.read_credentials(url)
     }
 
-    /// Deletes credentials from the platform keychain.
+    /// Removes the credentials stored for `url` from the platform keychain.
     pub fn delete_credentials(&self, url: &str) -> Task<Result<()>> {
         self.platform.delete_credentials(url)
     }
 
-    /// Directs the platform's default browser to open the given URL.
+    /// Opens `url` in the platform's default browser or handler.
+    ///
+    /// The call returns immediately. In tests, `TestApp::opened_url` reports the last
+    /// URL passed here.
     pub fn open_url(&self, url: &str) {
         self.platform.open_url(url);
     }
 
-    /// Registers the given URL scheme (e.g. `zed` for `zed://` urls) to be
-    /// opened by the current app.
+    /// Registers `scheme` (for example `zed` for `zed://` links) so that links with it open this app.
     ///
-    /// On some platforms (e.g. macOS) you may be able to register URL schemes
-    /// as part of app distribution, but this method exists to let you register
-    /// schemes at runtime.
+    /// Use [`Application::on_open_urls`] to receive the links. On some platforms you
+    /// declare schemes when you package the app. This method registers them at runtime.
     pub fn register_url_scheme(&self, scheme: &str) -> Task<Result<()>> {
         self.platform.register_url_scheme(scheme)
     }
 
-    /// Sets the application's process-wide identity and user-visible name.
+    /// Sets the app's identifier and user-visible name for the operating system.
     ///
-    /// The identifier is used for platform identity mechanisms such as the
-    /// Windows AppUserModelID. The name is used wherever the operating system
-    /// presents the application to the user. Call this once, early in startup,
-    /// before opening windows or posting notifications.
+    /// The identifier is used for platform identity mechanisms such as the Windows
+    /// AppUserModelID. The name is shown wherever the operating system presents the app.
     pub fn set_app_identity(&self, identifier: &str, name: &str) {
         self.platform.set_app_identity(identifier, name);
     }
@@ -1575,23 +2389,25 @@ impl App {
         self.platform.app_path()
     }
 
-    /// On Linux, returns the name of the compositor in use.
+    /// On Linux, returns the name of the compositor in use. On the web, returns `"Web"`.
     ///
     /// Returns an empty string on other platforms.
     pub fn compositor_name(&self) -> &'static str {
         self.platform.compositor_name()
     }
 
-    /// Returns the file URL of the executable with the specified name in the application bundle
+    /// Returns the path to a helper executable named `name` that ships with the app.
+    ///
+    /// See [`Application::path_for_auxiliary_executable`].
     pub fn path_for_auxiliary_executable(&self, name: &str) -> Result<PathBuf> {
         self.platform.path_for_auxiliary_executable(name)
     }
 
-    /// Displays a platform modal for selecting paths.
+    /// Shows the platform's file or folder picker and returns the user's choice.
     ///
-    /// When one or more paths are selected, they'll be relayed asynchronously via the returned oneshot channel.
-    /// If cancelled, a `None` will be relayed instead.
-    /// May return an error on Linux if the file picker couldn't be opened.
+    /// The result arrives on the returned channel once the user picks paths or cancels.
+    /// Cancelling yields `Ok(None)`. The picker is shown without blocking the caller.
+    /// On Linux the channel yields an error if the picker can't be opened.
     pub fn prompt_for_paths(
         &self,
         options: PathPromptOptions,
@@ -1599,12 +2415,11 @@ impl App {
         self.platform.prompt_for_paths(options)
     }
 
-    /// Displays a platform modal for selecting a new path where a file can be saved.
+    /// Shows the platform's save dialog and returns the path the user chose.
     ///
-    /// The provided directory will be used to set the initial location.
-    /// When a path is selected, it is relayed asynchronously via the returned oneshot channel.
-    /// If cancelled, a `None` will be relayed instead.
-    /// May return an error on Linux if the file picker couldn't be opened.
+    /// `directory` is the folder the dialog opens in, and `suggested_name` pre-fills the
+    /// file name. The result arrives on the returned channel. Cancelling yields
+    /// `Ok(None)`. On Linux the channel yields an error if the dialog can't be opened.
     pub fn prompt_for_new_path(
         &self,
         directory: &Path,
@@ -1613,12 +2428,12 @@ impl App {
         self.platform.prompt_for_new_path(directory, suggested_name)
     }
 
-    /// Reveals the specified path at the platform level, such as in Finder on macOS.
+    /// Shows `path` in the platform's file manager, such as Finder on macOS.
     pub fn reveal_path(&self, path: &Path) {
         self.platform.reveal_path(path)
     }
 
-    /// Opens the specified path with the system's default application.
+    /// Opens `path` with the system's default application for its file type.
     pub fn open_with_system(&self, path: &Path) {
         self.platform.open_with_system(path)
     }
@@ -1628,36 +2443,56 @@ impl App {
         self.platform.should_auto_hide_scrollbars()
     }
 
-    /// Restarts the application.
+    /// Restarts the app. Runs the handlers from [`App::on_app_restart`], then asks the
+    /// platform to relaunch it.
+    ///
+    /// The relaunch uses the path from [`App::set_restart_path`] and the arguments from
+    /// [`Application::with_restart_arguments`].
     pub fn restart(&mut self) {
         self.restart_observers
             .clone()
             .retain(&(), |observer| observer(self));
-        self.platform.restart(self.restart_path.take())
+        self.platform.restart(
+            self.restart_path.take(),
+            std::mem::take(&mut self.restart_arguments),
+        )
     }
 
-    /// Sets the path to use when restarting the application.
+    /// Sets the executable path that [`App::restart`] launches. The path is used once, by the next restart.
     pub fn set_restart_path(&mut self, path: PathBuf) {
         self.restart_path = Some(path);
     }
 
-    /// Returns the HTTP client for the application.
+    /// Returns the app's HTTP client. See [`Application::with_http_client`].
     pub fn http_client(&self) -> Arc<dyn HttpClient> {
         self.http_client.clone()
     }
 
-    /// Sets the HTTP client for the application.
+    /// Replaces the HTTP client that [`App::http_client`] returns.
     pub fn set_http_client(&mut self, new_client: Arc<dyn HttpClient>) {
         self.http_client = new_client;
     }
 
-    /// Configures when the application should automatically quit.
-    /// By default, [`QuitMode::Default`] is used.
+    /// Sets when the app quits on its own. See [`QuitMode`].
+    ///
+    /// Defaults to [`QuitMode::Default`].
     pub fn set_quit_mode(&mut self, mode: QuitMode) {
         self.quit_mode = mode;
     }
 
-    /// Returns the SVG renderer used by the application.
+    /// Sets whether the application participates in the system's foreground UI.
+    ///
+    /// Only has an effect on macOS, where [`Self::request_windowing`] normally sets it. Use this
+    /// for an accessory app that shows windows, such as a menu bar utility. It overrides the
+    /// policy until the next [`Self::request_windowing`], and the app counts as headless while
+    /// `Accessory`. After switching to [`ActivationPolicy::Regular`], activate the app yourself
+    /// with [`Self::activate`]; otherwise its menu bar may not appear until the app is
+    /// reactivated.
+    pub fn set_activation_policy(&mut self, policy: ActivationPolicy) {
+        self.platform.set_activation_policy(policy);
+    }
+
+    /// Returns the SVG renderer that draws the app's SVG assets.
     pub fn svg_renderer(&self) -> SvgRenderer {
         self.svg_renderer.clone()
     }
@@ -1719,21 +2554,32 @@ impl App {
                     }
                 }
             } else {
-                #[cfg(any(test, feature = "test-support", feature = "bench"))]
-                for window in self
-                    .windows
-                    .values()
-                    .filter_map(|window| {
-                        let window = window.as_deref()?;
-                        window.invalidator.is_dirty().then_some(window.handle)
-                    })
-                    .collect::<Vec<_>>()
-                {
-                    self.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
-                        .unwrap();
+                #[cfg(any(test, feature = "test-support"))]
+                if matches!(self.mode, GpuiMode::Test { .. }) {
+                    for window in self
+                        .windows
+                        .values()
+                        .filter_map(|window| {
+                            let window = window.as_deref()?;
+                            window.invalidator.is_dirty().then_some(window.handle)
+                        })
+                        .collect::<Vec<_>>()
+                    {
+                        self.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
+                            .unwrap();
+                    }
                 }
 
                 if self.pending_effects.is_empty() {
+                    for window in self.windows.values().filter_map(|window| window.as_deref()) {
+                        if window.invalidator.is_dirty()
+                            || window.needs_present.get()
+                            || !window.next_frame_callbacks.borrow().is_empty()
+                        {
+                            window.platform_window.schedule_frame();
+                        }
+                    }
+
                     self.event_arena.clear();
                     break;
                 }
@@ -1765,25 +2611,36 @@ impl App {
 
     /// Repeatedly called during `flush_effects` to handle a focused handle being dropped.
     fn release_dropped_focus_handles(&mut self) {
-        self.focus_handles
-            .clone()
-            .write()
-            .retain(|handle_id, focus| {
-                if focus.ref_count.load(SeqCst) == 0 {
-                    for window_handle in self.windows() {
-                        window_handle
-                            .update(self, |_, window, _| {
-                                if window.focus == Some(handle_id) {
-                                    window.blur();
-                                }
-                            })
-                            .unwrap();
-                    }
-                    false
-                } else {
-                    true
-                }
-            });
+        let focus_handles = self.focus_handles.clone();
+        let mut focus_handles = focus_handles.write();
+        let FocusMap {
+            handles,
+            dropped_handles,
+        } = &mut *focus_handles;
+        if dropped_handles.is_empty() {
+            return;
+        }
+
+        let windows = self
+            .windows
+            .values()
+            .filter_map(|window| {
+                let window = window.as_ref()?;
+                dropped_handles
+                    .contains(&window.focus?)
+                    .then_some(window.handle)
+            })
+            .collect::<SmallVec<[_; 1]>>();
+        for handle_id in dropped_handles.drain(..) {
+            handles.remove(handle_id);
+        }
+        drop(focus_handles);
+
+        for window_handle in windows {
+            window_handle
+                .update(self, |_, window, cx| window.blur(cx))
+                .ok();
+        }
     }
 
     fn apply_notify_effect(&mut self, emitter: EntityId) {
@@ -1853,11 +2710,13 @@ impl App {
         });
     }
 
-    /// Run `f` against the entity's *current* window — the most recently
-    /// rendered window that referenced the entity, or its creation window if
-    /// it has yet to be rendered. Returns `None` if the entity has no
-    /// current window, or if that window has been closed, or if it is
-    /// already on the update stack.
+    /// Runs `f` with the window that most recently drew the entity `entity_id`.
+    ///
+    /// If the entity has not been drawn yet, the window it was created in is used. The
+    /// callback receives the [`Window`] and the [`App`]. Returns `None` if the entity has
+    /// no current window, if that window has closed, or if the window is already being
+    /// updated higher up the call stack.
+    #[inline(always)]
     pub fn with_window<R>(
         &mut self,
         entity_id: EntityId,
@@ -1874,65 +2733,28 @@ impl App {
             .or_insert(window);
     }
 
+    #[inline(always)]
     pub(crate) fn update_window_id<T, F>(&mut self, id: WindowId, update: F) -> Result<T>
     where
         F: FnOnce(AnyView, &mut Window, &mut App) -> T,
     {
-        self.update(|cx| {
-            let mut window = cx.windows.get_mut(id)?.take()?;
-
-            let root_view = window.root.clone().unwrap();
-
-            cx.window_update_stack.push(window.handle.id);
-            let result = update(root_view, &mut window, cx);
-            fn trail(id: WindowId, window: Box<Window>, cx: &mut App) -> Option<()> {
-                cx.window_update_stack.pop();
-
-                if window.removed {
-                    cx.end_platform_drag(id);
-                    cx.window_handles.remove(&id);
-                    cx.windows.remove(id);
-                    if let Some(tracked) = cx.tracked_entities.remove(&id) {
-                        for entity_id in tracked {
-                            if let Some(windows) =
-                                cx.window_invalidators_by_entity.get_mut(&entity_id)
-                            {
-                                windows.remove(&id);
-                            }
-                            if cx.current_window_by_entity.get(&entity_id) == Some(&id) {
-                                cx.current_window_by_entity.remove(&entity_id);
-                            }
-                        }
-                    }
-
-                    cx.window_closed_observers.clone().retain(&(), |callback| {
-                        callback(cx, id);
-                        true
-                    });
-
-                    let quit_on_empty = match cx.quit_mode {
-                        QuitMode::Explicit => false,
-                        QuitMode::LastWindowClosed => true,
-                        QuitMode::Default => cfg!(not(target_os = "macos")),
-                    };
-
-                    if quit_on_empty && cx.windows.is_empty() {
-                        cx.quit();
-                    }
-                } else {
-                    cx.windows.get_mut(id)?.replace(window);
-                }
-                Some(())
+        let mut update = Some(update);
+        let mut result = None;
+        self.update_window_erased(id, &mut |arguments| {
+            if let Some((root_view, window, cx)) = arguments {
+                result = Some(update.take().unwrap()(root_view, window, cx));
+            } else {
+                drop(update.take());
+                drop(result.take());
             }
-            trail(id, window, cx)?;
-
-            Some(result)
-        })
-        .context("window not found")
+        });
+        result.context("window not found")
     }
 
-    /// Creates an `AsyncApp`, which can be cloned and has a static lifetime
-    /// so it can be held across `await` points.
+    /// Returns an [`AsyncApp`] that can be held across `await` points.
+    ///
+    /// The [`AsyncApp`] holds the app weakly, so it does not keep the app alive. Use
+    /// it in tasks that outlive the current update.
     pub fn to_async(&self) -> AsyncApp {
         AsyncApp {
             app: self.this.clone(),
@@ -1941,12 +2763,25 @@ impl App {
         }
     }
 
-    /// Obtains a reference to the executor, which can be used to spawn futures.
+    /// Returns the [`BackgroundExecutor`] for `Send` futures.
+    ///
+    /// Native backends use worker threads; single-threaded web builds use the main thread.
     pub fn background_executor(&self) -> &BackgroundExecutor {
         &self.background_executor
     }
 
-    /// Obtains a reference to the executor, which can be used to spawn futures.
+    /// Whether this app runs on the deterministic test scheduler. See
+    /// [`BackgroundExecutor::is_test`].
+    pub fn is_test(&self) -> bool {
+        self.background_executor.is_test()
+    }
+
+    /// Returns the [`ForegroundExecutor`], which runs futures on the main thread.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called after the quit handlers have started running (from
+    /// [`App::on_app_quit`]).
     pub fn foreground_executor(&self) -> &ForegroundExecutor {
         if self.quitting {
             panic!("Can't spawn on main thread after on_app_quit")
@@ -1954,27 +2789,97 @@ impl App {
         &self.foreground_executor
     }
 
-    /// Spawns the future returned by the given function on the main thread. The closure will be invoked
-    /// with [AsyncApp], which allows the application state to be accessed across await points.
+    /// Returns the foreground work journal for this app's foreground thread.
+    /// Apps constructed on the same thread share the stream.
+    #[cfg(feature = "profiler")]
+    pub fn foreground_journal(&self) -> crate::profiler::journal::ForegroundJournal {
+        self.foreground_journal.clone()
+    }
+
+    /// Starts detecting foreground hangs on a dedicated thread.
+    ///
+    /// Nothing is spawned unless the app calls this. The thread polls a
+    /// detector over this app's foreground journal every `config.interval`
+    /// and passes each poll's incidents, including empty polls, to `on_poll`
+    /// on that thread. When the app quits, a final poll with
+    /// [`HangMonitorPollReason::Flush`] runs during shutdown, concurrently
+    /// with quit handlers and within [`SHUTDOWN_TIMEOUT`], so `on_poll` can
+    /// deliver batched results.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the monitor was already started or its thread can't be
+    /// spawned.
+    ///
+    /// [`HangMonitorPollReason::Flush`]: crate::profiler::hang::HangMonitorPollReason::Flush
+    #[cfg(all(feature = "profiler", not(target_family = "wasm")))]
+    pub fn start_hang_monitor(
+        &mut self,
+        config: crate::profiler::hang::HangMonitorConfig,
+        on_poll: impl FnMut(crate::profiler::hang::HangMonitorPoll) + Send + 'static,
+    ) -> Result<(), crate::profiler::hang::HangMonitorError> {
+        use crate::profiler::hang::{HangDetector, HangMonitor, HangMonitorError};
+
+        if self.hang_monitor.is_some() {
+            debug_assert!(false, "the hang monitor was started twice");
+            return Err(HangMonitorError::AlreadyStarted);
+        }
+        let detector = HangDetector::new(
+            self.foreground_journal(),
+            config.threshold,
+            config.frame_budget,
+        );
+        let monitor = HangMonitor::spawn(detector, config.interval, on_poll)
+            .map_err(HangMonitorError::Spawn)?;
+        self.hang_monitor = Some(monitor);
+        Ok(())
+    }
+
+    /// Runs an async block on the main thread, with an [`AsyncApp`] for access to app state.
+    ///
+    /// The closure receives `&mut AsyncApp`. Use it to update entities and windows after
+    /// an `await`. The future doesn't need to be `Send`, because it stays on the main
+    /// thread. Dropping the returned [`Task`] cancels it, so store it or call
+    /// [`Task::detach`] to let it run to completion in the background.
+    ///
+    /// Use [`App::background_executor`] for CPU-heavy or blocking work, and send the
+    /// result back to the main thread with a `spawn` task.
+    ///
+    /// # Panics
+    ///
+    /// In debug builds this panics if called after the quit handlers have started
+    /// running. Release builds log a debug message and continue.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use gpui::{AppContext, TestApp};
+    /// # use std::{cell::Cell, rc::Rc};
+    /// # let mut app = TestApp::new();
+    /// let ran = Rc::new(Cell::new(false));
+    /// app.update(|cx| {
+    ///     let ran = ran.clone();
+    ///     cx.spawn(async move |_cx| ran.set(true)).detach();
+    /// });
+    /// app.read(|_| assert!(ran.get()));
+    /// ```
+    ///
+    /// See [async work](crate::_documentation::guides::async_work) for the executors and
+    /// how to share state across tasks.
     #[track_caller]
+    #[inline(always)]
     pub fn spawn<AsyncFn, R>(&self, f: AsyncFn) -> Task<R>
     where
         AsyncFn: AsyncFnOnce(&mut AsyncApp) -> R + 'static,
         R: 'static,
     {
-        if self.quitting {
-            debug_panic!("Can't spawn on main thread after on_app_quit")
-        };
-
-        let mut cx = self.to_async();
+        let mut cx = self.prepare_spawn();
 
         self.foreground_executor
             .spawn(async move { f(&mut cx).await }.boxed_local())
     }
 
-    /// Spawns the future returned by the given function on the main thread with
-    /// the given priority. The closure will be invoked with [AsyncApp], which
-    /// allows the application state to be accessed across await points.
+    /// Like [`App::spawn`], but schedules the task with the given [`Priority`].
     pub fn spawn_with_priority<AsyncFn, R>(&self, priority: Priority, f: AsyncFn) -> Task<R>
     where
         AsyncFn: AsyncFnOnce(&mut AsyncApp) -> R + 'static,
@@ -1990,61 +2895,95 @@ impl App {
             .spawn_with_priority(priority, async move { f(&mut cx).await }.boxed_local())
     }
 
-    /// Schedules the given function to be run at the end of the current effect cycle, allowing entities
-    /// that are currently on the stack to be returned to the app.
+    /// Runs `f` after the current effect cycle finishes, with the [`App`].
+    ///
+    /// Use it to act on state that is borrowed right now. For example, you can change
+    /// an entity from inside its own `update`, which would otherwise be a double borrow.
+    /// The callback runs once the outermost update returns.
+    ///
+    /// ```
+    /// # use gpui::{AppContext, TestApp};
+    /// let mut app = TestApp::new();
+    /// let count = app.update(|cx| cx.new(|_| 0));
+    /// app.update(|cx| {
+    ///     let count = count.clone();
+    ///     cx.defer(move |cx| {
+    ///         count.update(cx, |count, _| *count += 1);
+    ///     });
+    /// });
+    /// app.read(|cx| assert_eq!(*count.read(cx), 1));
+    /// ```
     pub fn defer(&mut self, f: impl FnOnce(&mut App) + 'static) {
         self.push_effect(Effect::Defer {
             callback: Box::new(f),
         });
     }
 
-    /// Accessor for the application's asset source, which is provided when constructing the `App`.
-    pub fn asset_source(&self) -> &Arc<dyn AssetSource> {
-        &self.asset_source
+    /// Returns the asset registry that the app loads assets from. See [`Application::with_assets`].
+    pub fn assets(&self) -> &Arc<AssetRegistry> {
+        &self.asset_registry
     }
 
-    /// Accessor for the text system.
+    /// Returns the app's [`TextSystem`], which shapes and rasterizes text.
     pub fn text_system(&self) -> &Arc<TextSystem> {
         &self.text_system
     }
 
-    /// Check whether a global of the given type has been assigned.
+    /// Returns whether a global of type `G` has been set.
     pub fn has_global<G: Global>(&self) -> bool {
+        self.note_global_read(TypeId::of::<G>());
         self.globals_by_type.contains_key(&TypeId::of::<G>())
     }
 
-    /// Access the global of the given type. Panics if a global for that type has not been assigned.
+    /// Returns the global of type `G`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no global of type `G` has been set. Use [`App::try_global`] when the
+    /// global may be missing.
     #[track_caller]
     pub fn global<G: Global>(&self) -> &G {
+        self.note_global_read(TypeId::of::<G>());
         self.globals_by_type
             .get(&TypeId::of::<G>())
             .map(|any_state| any_state.downcast_ref::<G>().unwrap())
             .unwrap_or_else(|| panic!("no state of type {} exists", type_name::<G>()))
     }
 
-    /// Access the global of the given type if a value has been assigned.
+    /// Returns the global of type `G`, or `None` if it has not been set.
     pub fn try_global<G: Global>(&self) -> Option<&G> {
+        self.note_global_read(TypeId::of::<G>());
         self.globals_by_type
             .get(&TypeId::of::<G>())
             .map(|any_state| any_state.downcast_ref::<G>().unwrap())
     }
 
-    /// Access the global of the given type mutably. Panics if a global for that type has not been assigned.
+    /// Returns the global of type `G` for mutation, and notifies global observers.
+    ///
+    /// Observers registered with [`App::observe_global`] run when the current update
+    /// finishes. The notification happens on every call, even if you don't change the
+    /// value.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no global of type `G` has been set. Use [`App::default_global`] to
+    /// create one on first use.
     #[track_caller]
     pub fn global_mut<G: Global>(&mut self) -> &mut G {
         let global_type = TypeId::of::<G>();
-        self.push_effect(Effect::NotifyGlobalObservers { global_type });
+        self.global_changed(global_type);
         self.globals_by_type
             .get_mut(&global_type)
             .and_then(|any_state| any_state.downcast_mut::<G>())
             .unwrap_or_else(|| panic!("no state of type {} exists", type_name::<G>()))
     }
 
-    /// Access the global of the given type mutably. A default value is assigned if a global of this type has not
-    /// yet been assigned.
+    /// Returns the global of type `G` for mutation, first setting `G::default()` if it is missing.
+    ///
+    /// Like [`App::global_mut`], this notifies global observers.
     pub fn default_global<G: Global + Default>(&mut self) -> &mut G {
         let global_type = TypeId::of::<G>();
-        self.push_effect(Effect::NotifyGlobalObservers { global_type });
+        self.global_changed(global_type);
         self.globals_by_type
             .entry(global_type)
             .or_insert_with(|| Box::<G>::default())
@@ -2052,10 +2991,26 @@ impl App {
             .unwrap()
     }
 
-    /// Sets the value of the global of the given type.
+    /// Sets the global of type `G` to `global`, replacing any previous value.
+    ///
+    /// Notifies global observers when the current update finishes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use gpui::{AppContext, Global, TestApp};
+    /// struct Theme {
+    ///     name: &'static str,
+    /// }
+    /// impl Global for Theme {}
+    ///
+    /// # let mut app = TestApp::new();
+    /// app.update(|cx| cx.set_global(Theme { name: "dark" }));
+    /// app.read(|cx| assert_eq!(cx.global::<Theme>().name, "dark"));
+    /// ```
     pub fn set_global<G: Global>(&mut self, global: G) {
         let global_type = TypeId::of::<G>();
-        self.push_effect(Effect::NotifyGlobalObservers { global_type });
+        self.global_changed(global_type);
         self.globals_by_type.insert(global_type, Box::new(global));
     }
 
@@ -2065,10 +3020,16 @@ impl App {
         self.globals_by_type.drain();
     }
 
-    /// Remove the global of the given type from the app context. Does not notify global observers.
+    /// Removes the global of type `G` and returns it.
+    ///
+    /// Notifies global observers when the current update finishes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no global of type `G` has been set.
     pub fn remove_global<G: Global>(&mut self) -> G {
         let global_type = TypeId::of::<G>();
-        self.push_effect(Effect::NotifyGlobalObservers { global_type });
+        self.global_changed(global_type);
         *self
             .globals_by_type
             .remove(&global_type)
@@ -2077,7 +3038,31 @@ impl App {
             .unwrap()
     }
 
-    /// Register a callback to be invoked when a global of the given type is updated.
+    /// Calls `f` each time the global of type `G` is set, changed or removed.
+    ///
+    /// The observer is active once the current update finishes. Keep the returned
+    /// [`Subscription`] alive, because dropping it stops the observer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use gpui::{AppContext, Global, TestApp};
+    /// # use std::{cell::Cell, rc::Rc};
+    /// struct Count(usize);
+    /// impl Global for Count {}
+    ///
+    /// # let mut app = TestApp::new();
+    /// let calls = Rc::new(Cell::new(0));
+    /// let _subscription = app.update(|cx| {
+    ///     cx.set_global(Count(0));
+    ///     cx.observe_global::<Count>({
+    ///         let calls = calls.clone();
+    ///         move |_| calls.set(calls.get() + 1)
+    ///     })
+    /// });
+    /// app.update(|cx| cx.global_mut::<Count>().0 += 1);
+    /// assert_eq!(calls.get(), 1);
+    /// ```
     pub fn observe_global<G: Global>(
         &mut self,
         mut f: impl FnMut(&mut Self) + 'static,
@@ -2108,30 +3093,8 @@ impl App {
     pub(crate) fn end_global_lease<G: Global>(&mut self, lease: GlobalLease<G>) {
         let global_type = TypeId::of::<G>();
 
-        self.push_effect(Effect::NotifyGlobalObservers { global_type });
+        self.global_changed(global_type);
         self.globals_by_type.insert(global_type, lease.global);
-    }
-
-    /// Stores an entity in the app such that it wont be dropped if no other entities are referencing it.
-    /// Entities stored this way are dropped when the app is dropped, unless otherwise removed by [`remove_global_entity`].
-    pub fn insert_global_entity<T: 'static>(&mut self, entity: Entity<T>) {
-        let any = entity.into_any();
-        if !self.global_entities.contains(&any) {
-            self.global_entities.push(any);
-        }
-    }
-
-    /// Removes the entity from global storage. If no other entities are holding reference to it,
-    /// it will be dropped in the very near future.
-    pub fn remove_global_entity<T: 'static>(&mut self, entity: &Entity<T>) {
-        self.global_entities
-            .retain(|any| any.entity_id() != entity.entity_id());
-    }
-
-    /// Returns an iterator of all globally-stored entities which match the provided type.
-    pub fn global_entities<T: 'static>(&self) -> impl Iterator<Item = Entity<T>> {
-        let mut iter = self.global_entities.iter();
-        iter.filter_map(|any| any.clone().downcast::<T>().ok())
     }
 
     pub(crate) fn new_entity_observer(
@@ -2144,8 +3107,12 @@ impl App {
         subscription
     }
 
-    /// Arrange for the given function to be invoked whenever a view of the specified type is created.
-    /// The function will be passed a mutable reference to the view along with an appropriate context.
+    /// Calls `on_new` each time an entity of type `T` is created.
+    ///
+    /// The callback receives the new state, the [`Window`] if the entity was created with
+    /// one, and a [`Context`] for it. Use it to set up behavior for every instance of a
+    /// type, such as registering an observer. Keep the returned [`Subscription`] alive
+    /// for the callback to keep running.
     pub fn observe_new<T: 'static>(
         &self,
         on_new: impl 'static + Fn(&mut T, Option<&mut Window>, &mut Context<T>),
@@ -2165,8 +3132,11 @@ impl App {
         )
     }
 
-    /// Observe the release of a entity. The callback is invoked after the entity
-    /// has no more strong references but before it has been dropped.
+    /// Calls `on_release` when the entity behind `handle` is released.
+    ///
+    /// The callback runs after the entity's last strong handle is dropped, and before the
+    /// entity's state is dropped. It receives the state as `&mut T`. Keep the returned
+    /// [`Subscription`] alive for the callback to run.
     pub fn observe_release<T>(
         &self,
         handle: &Entity<T>,
@@ -2186,8 +3156,10 @@ impl App {
         subscription
     }
 
-    /// Observe the release of a entity. The callback is invoked after the entity
-    /// has no more strong references but before it has been dropped.
+    /// Calls `on_release` when the entity behind `handle` is released, inside `window`.
+    ///
+    /// Like [`App::observe_release`], but the callback also receives `window`. The
+    /// callback doesn't run if `window` has already closed when the entity is released.
     pub fn observe_release_in<T>(
         &self,
         handle: &Entity<T>,
@@ -2203,9 +3175,14 @@ impl App {
         })
     }
 
-    /// Register a callback to be invoked when a keystroke is received by the application
-    /// in any window. Note that this fires after all other action and event mechanisms have resolved
-    /// and that this API will not be invoked if the event's propagation is stopped.
+    /// Calls `f` for every keystroke that reaches any window of the app.
+    ///
+    /// The callback runs after action and event handling has finished, and the event
+    /// names the action that handled the keystroke, if any. Keystrokes consumed by an
+    /// interceptor or a raw keyboard event handler are not observed, and a modifier
+    /// pressed on its own is observed when it is released. Use
+    /// [`App::intercept_keystrokes`] to see keystrokes before they are dispatched. Keep
+    /// the returned [`Subscription`] alive.
     pub fn observe_keystrokes(
         &mut self,
         mut f: impl FnMut(&KeystrokeEvent, &mut Window, &mut App) + 'static,
@@ -2228,10 +3205,11 @@ impl App {
         )
     }
 
-    /// Register a callback to be invoked when a keystroke is received by the application
-    /// in any window. Note that this fires _before_ all other action and event mechanisms have resolved
-    /// unlike [`App::observe_keystrokes`] which fires after. This means that `cx.stop_propagation` calls
-    /// within interceptors will prevent action dispatch
+    /// Calls `f` for every key-down that reaches any window, before it is dispatched.
+    ///
+    /// Unlike [`App::observe_keystrokes`], which runs after handling, the interceptor runs
+    /// first. Calling [`App::stop_propagation`] inside it stops the keystroke from reaching
+    /// action dispatch. Keep the returned [`Subscription`] alive.
     pub fn intercept_keystrokes(
         &mut self,
         mut f: impl FnMut(&KeystrokeEvent, &mut Window, &mut App) + 'static,
@@ -2254,26 +3232,73 @@ impl App {
         )
     }
 
-    /// Register key bindings.
+    /// Adds key bindings to the app's keymap and redraws the windows.
+    ///
+    /// A binding maps a keystroke, optionally limited to a [`KeyContext`], to an action.
+    /// Bindings are matched during key dispatch. Calling this again adds to the existing
+    /// bindings, and [`App::clear_key_bindings`] removes them all.
+    ///
+    /// # Examples
+    ///
+    /// ```standalone_crate
+    /// use gpui::{AppContext, KeyBinding, Keystroke, TestApp, actions};
+    ///
+    /// actions!(app_bind_keys, [Save]);
+    ///
+    /// let mut app = TestApp::new();
+    /// app.update(|cx| cx.bind_keys([KeyBinding::new("ctrl-s", Save, None)]));
+    /// app.read(|cx| {
+    ///     let bindings = cx.all_bindings_for_input(&[Keystroke::parse("ctrl-s").unwrap()]);
+    ///     assert_eq!(bindings.len(), 1);
+    ///     assert_eq!(bindings[0].action().name(), "app_bind_keys::Save");
+    /// });
+    /// ```
+    ///
+    /// See [keyboard](crate::_documentation::guides::keyboard) for context rules and
+    /// [input dispatch](crate::_documentation::concepts::input_dispatch) for how a keystroke
+    /// picks an action.
     pub fn bind_keys(&mut self, bindings: impl IntoIterator<Item = KeyBinding>) {
         self.keymap.borrow_mut().add_bindings(bindings);
         self.pending_effects.push_back(Effect::RefreshWindows);
     }
 
-    /// Clear all key bindings in the app.
+    /// Removes every key binding from the app's keymap.
     pub fn clear_key_bindings(&mut self) {
         self.keymap.borrow_mut().clear();
         self.pending_effects.push_back(Effect::RefreshWindows);
     }
 
-    /// Get all key bindings in the app.
+    /// Returns the app's keymap, shared with the app.
+    ///
+    /// Borrow it to inspect bindings. Don't hold the borrow across a call that changes
+    /// bindings, such as [`App::bind_keys`], because the borrow panics.
     pub fn key_bindings(&self) -> Rc<RefCell<Keymap>> {
         self.keymap.clone()
     }
 
-    /// Register a global handler for actions invoked via the keyboard. These handlers are run at
-    /// the end of the bubble phase for actions, and so will only be invoked if there are no other
-    /// handlers or if they called `cx.propagate()`.
+    /// Registers a handler that runs when an action is dispatched. Global handlers run in
+    /// the bubble phase, after the handlers in the element tree, and only if no earlier
+    /// handler stopped the propagation. Use it for app-wide
+    /// commands such as Quit, which should work with no window focused. Dispatch an action
+    /// with [`App::dispatch_action`].
+    ///
+    /// # Examples
+    ///
+    /// ```standalone_crate
+    /// use gpui::{AppContext, TestApp, actions};
+    /// use std::{cell::Cell, rc::Rc};
+    ///
+    /// actions!(app_on_action, [Ping]);
+    ///
+    /// let mut app = TestApp::new();
+    /// let pings = Rc::new(Cell::new(0));
+    /// app.update(|cx| {
+    ///     let pings = pings.clone();
+    ///     cx.on_action(move |_: &Ping, _| pings.set(pings.get() + 1));
+    /// });
+    /// app.update(|cx| cx.dispatch_action(&Ping));
+    /// assert_eq!(pings.get(), 1);
+    /// ```
     pub fn on_action<A: Action>(
         &mut self,
         listener: impl Fn(&A, &mut Self) + 'static,
@@ -2290,23 +3315,29 @@ impl App {
         self
     }
 
-    /// Event handlers propagate events by default. Call this method to stop dispatching to
-    /// event handlers with a lower z-index (mouse) or higher in the tree (keyboard). This is
-    /// the opposite of [`Self::propagate`]. It's also possible to cancel a call to [`Self::propagate`] by
-    /// calling this method before effects are flushed.
+    /// Stops the current event or action from reaching later handlers.
+    ///
+    /// Handlers for mouse events further down the z-order, and keyboard handlers higher
+    /// in the tree, don't run after this. Call [`App::propagate`] to undo it before the
+    /// effects are flushed.
     pub fn stop_propagation(&mut self) {
         self.propagate_event = false;
     }
 
-    /// Action handlers stop propagation by default during the bubble phase of action dispatch
-    /// dispatching to action handlers higher in the element tree. This is the opposite of
-    /// [`Self::stop_propagation`]. It's also possible to cancel a call to [`Self::stop_propagation`] by calling
-    /// this method before effects are flushed.
+    /// Lets the current event or action continue to later handlers.
+    ///
+    /// Use it in a handler to pass the event on to the next handler, for example an
+    /// action listener on a parent element or a global handler from [`App::on_action`].
+    /// It cancels an earlier [`App::stop_propagation`] in the same dispatch.
     pub fn propagate(&mut self) {
         self.propagate_event = true;
     }
 
-    /// Build an action from some arbitrary data, typically a keymap entry.
+    /// Builds an action by its registered name, from JSON data such as a keymap entry.
+    ///
+    /// `data` is the action's parameters, or `None` for an action with no parameters.
+    /// Returns an [`ActionBuildError`] if the name is unknown or the data doesn't match
+    /// the action's type. Use it to load actions from a keymap file.
     pub fn build_action(
         &self,
         name: &str,
@@ -2315,20 +3346,26 @@ impl App {
         self.actions.build_action(name, data)
     }
 
-    /// Get all action names that have been registered. Note that registration only allows for
-    /// actions to be built dynamically, and is unrelated to binding actions in the element tree.
+    /// Returns the names of every action type that has been registered.
+    ///
+    /// Registration makes an action buildable by name with [`App::build_action`]. It
+    /// does not bind the action to a key or a handler. For that, use [`App::bind_keys`]
+    /// and [`App::on_action`].
     pub fn all_action_names(&self) -> &[&'static str] {
         self.actions.all_action_names()
     }
 
-    /// Returns key bindings that invoke the given action on the currently focused element, without
-    /// checking context. Bindings are returned in the order they were added. For display, the last
-    /// binding should take precedence.
+    /// Returns the bindings that match `input`, ignoring key context.
+    ///
+    /// The bindings come back in the order they were added. When you show one to the user,
+    /// use the last one, because it takes precedence.
     pub fn all_bindings_for_input(&self, input: &[Keystroke]) -> Vec<KeyBinding> {
         RefCell::borrow(&self.keymap).all_bindings_for_input(input)
     }
 
-    /// Get all non-internal actions that have been registered, along with their schemas.
+    /// Returns each registered action name with its JSON schema, if it has one.
+    ///
+    /// Use it to generate editor completions or to validate keymap files.
     pub fn action_schemas(
         &self,
         generator: &mut schemars::SchemaGenerator,
@@ -2336,10 +3373,10 @@ impl App {
         self.actions.action_schemas(generator)
     }
 
-    /// Get the schema for a specific action by name.
-    /// Returns `None` if the action is not found.
-    /// Returns `Some(None)` if the action exists but has no schema.
-    /// Returns `Some(Some(schema))` if the action exists and has a schema.
+    /// Returns the JSON schema for the action named `name`.
+    ///
+    /// Returns `None` if no action has that name. Returns `Some(None)` if the action
+    /// exists but has no schema, and `Some(Some(schema))` if it has one.
     pub fn action_schema_by_name(
         &self,
         name: &str,
@@ -2348,23 +3385,27 @@ impl App {
         self.actions.action_schema_by_name(name, generator)
     }
 
-    /// Get a map from a deprecated action name to the canonical name.
+    /// Returns a map from each deprecated action name to the name that replaces it.
     pub fn deprecated_actions_to_preferred_actions(&self) -> &HashMap<&'static str, &'static str> {
         self.actions.deprecated_aliases()
     }
 
-    /// Get a map from an action name to the deprecation messages.
+    /// Returns a map from each deprecated action name to its deprecation message.
     pub fn action_deprecation_messages(&self) -> &HashMap<&'static str, &'static str> {
         self.actions.deprecation_messages()
     }
 
-    /// Get a map from an action name to the documentation.
+    /// Returns a map from each action name to its documentation string.
     pub fn action_documentation(&self) -> &HashMap<&'static str, &'static str> {
         self.actions.documentation()
     }
 
-    /// Register a callback to be invoked when the application is about to quit.
-    /// It is not possible to cancel the quit event at this point.
+    /// Calls `on_quit` when the app is about to quit, and waits for the returned future.
+    ///
+    /// Use it to flush data to disk or close connections. The quit can't be cancelled
+    /// at this point. Native apps wait up to [`SHUTDOWN_TIMEOUT`] for the futures, so
+    /// keep the work short. Keep the returned [`Subscription`] alive for the callback to
+    /// run.
     pub fn on_app_quit<Fut>(
         &self,
         mut on_quit: impl FnMut(&mut App) -> Fut + 'static,
@@ -2383,9 +3424,9 @@ impl App {
         subscription
     }
 
-    /// Register a callback to be invoked when the application is about to restart.
+    /// Calls `on_restart` when the app is about to restart, before any [`App::on_app_quit`] handlers run.
     ///
-    /// These callbacks are called before any `on_app_quit` callbacks.
+    /// Keep the returned [`Subscription`] alive for the callback to run.
     pub fn on_app_restart(&self, mut on_restart: impl 'static + FnMut(&mut App)) -> Subscription {
         let (subscription, activate) = self.restart_observers.insert(
             (),
@@ -2398,8 +3439,10 @@ impl App {
         subscription
     }
 
-    /// Register a callback to be invoked when a window is closed
-    /// The window is no longer accessible at the point this callback is invoked.
+    /// Calls `on_closed` with the [`WindowId`] each time a window closes.
+    ///
+    /// The window is no longer accessible when the callback runs. Keep the returned
+    /// [`Subscription`] alive for the callback to run.
     pub fn on_window_closed(
         &self,
         mut on_closed: impl FnMut(&mut App, WindowId) + 'static,
@@ -2413,17 +3456,16 @@ impl App {
         for window in self.windows() {
             window
                 .update(self, |_, window, cx| {
-                    if window.pending_input_keystrokes().is_some() {
-                        window.clear_pending_keystrokes();
-                        window.pending_input_changed(cx);
-                    }
+                    window.clear_pending_keystrokes(cx);
                 })
                 .ok();
         }
     }
 
-    /// Checks if the given action is bound in the current context, as defined by the app's current focus,
-    /// the bindings in the element tree, and any global action listeners.
+    /// Returns whether `action` would be handled if it were dispatched now.
+    ///
+    /// Checks the active window's focus path and its bindings, then the global listeners
+    /// from [`App::on_action`]. Use it to enable or disable menu items.
     pub fn is_action_available(&mut self, action: &dyn Action) -> bool {
         let mut action_available = false;
         if let Some(window) = self.active_window()
@@ -2439,37 +3481,42 @@ impl App {
                 .contains_key(&action.as_any().type_id())
     }
 
-    /// Sets the menu bar for this application. This will replace any existing menu bar.
+    /// Replaces the app's menu bar with `menus`.
+    ///
+    /// Menu items that name an action show the key bindings from the keymap.
     pub fn set_menus(&self, menus: impl IntoIterator<Item = Menu>) {
         let menus: Vec<Menu> = menus.into_iter().collect();
         self.platform.set_menus(menus, &self.keymap.borrow());
     }
 
-    /// Gets the menu bar for this application.
+    /// Returns the menu bar most recently set with [`App::set_menus`], or `None` if none was set.
     pub fn get_menus(&self) -> Option<Vec<OwnedMenu>> {
         self.platform.get_menus()
     }
 
-    /// Sets the right click menu for the app icon in the dock
+    /// Sets the menu that appears when the user right-clicks the app's Dock icon.
     pub fn set_dock_menu(&self, menus: Vec<MenuItem>) {
         self.platform.set_dock_menu(menus, &self.keymap.borrow())
     }
 
-    /// Performs the action associated with the given dock menu item, only used on Windows for now.
+    /// Runs the dock menu item at index `action`, as set with [`App::set_dock_menu`].
+    ///
+    /// Only Windows uses this path.
     pub fn perform_dock_menu_action(&self, action: usize) {
         self.platform.perform_dock_menu_action(action);
     }
 
-    /// Adds given path to the bottom of the list of recent paths for the application.
-    /// The list is usually shown on the application icon's context menu in the dock,
-    /// and allows to open the recent files via that context menu.
-    /// If the path is already in the list, it will be moved to the bottom of the list.
+    /// On macOS, adds `path` to the recent documents list, which the Dock menu shows.
+    /// Other platforms do nothing.
+    ///
+    /// Call this when the user opens a document, so it appears in the recent list next time.
     pub fn add_recent_document(&self, path: &Path) {
         self.platform.add_recent_document(path);
     }
 
-    /// Updates the jump list with the updated list of recent paths for the application, only used on Windows for now.
-    /// Note that this also sets the dock menu on Windows.
+    /// Replaces the Windows jump list with `menus` and the recent `entries`.
+    ///
+    /// Only Windows uses this. It also sets the dock menu.
     pub fn update_jump_list(
         &self,
         menus: Vec<MenuItem>,
@@ -2478,8 +3525,11 @@ impl App {
         self.platform.update_jump_list(menus, entries)
     }
 
-    /// Dispatch an action to the currently active window or global action handler
-    /// See [`crate::Action`] for more information on how actions work
+    /// Dispatches `action` to the active window, or to the global listeners if no window is active.
+    ///
+    /// In a window, the action follows the focus path, as a keystroke bound to it would.
+    /// Without an active window, it goes to the listeners from [`App::on_action`]. See
+    /// [`crate::Action`] for how actions work.
     pub fn dispatch_action(&mut self, action: &dyn Action) {
         if let Some(active_window) = self.active_window() {
             active_window
@@ -2539,26 +3589,54 @@ impl App {
         }
     }
 
-    /// Is there currently something being dragged?
+    /// Returns whether a drag is in progress.
     pub fn has_active_drag(&self) -> bool {
         self.active_drag.is_some()
     }
 
-    /// Gets the cursor style of the currently active drag operation.
+    /// Returns the payload of the drag in progress, if any.
+    pub fn active_drag(&self) -> Option<&AnyDrag> {
+        self.active_drag.as_ref()
+    }
+
+    /// Returns the cursor style of the drag in progress, if it set one.
     pub fn active_drag_cursor_style(&self) -> Option<CursorStyle> {
         self.active_drag.as_ref().and_then(|drag| drag.cursor_style)
     }
 
-    /// Stops active drag and clears any related effects.
-    pub fn stop_active_drag(&mut self, window: &mut Window) -> bool {
-        if self.active_drag.is_some() {
-            self.active_drag = None;
-            if self.platform_owned_drag.as_ref().is_some_and(|drag| {
-                drag.source_window == window.window_handle().window_id()
-                    && matches!(&drag.state, PlatformOwnedDragState::RestoredInSourceWindow)
-            }) {
+    /// Starts a drag with `drag` as its payload. Refresh the windows after calling this, so the drag shows.
+    ///
+    /// # Panics
+    ///
+    /// Debug builds panic if a drag is already in progress.
+    pub fn start_drag(&mut self, drag: AnyDrag) {
+        debug_assert!(self.active_drag.is_none());
+        self.active_drag = Some(drag);
+    }
+
+    /// Ends the drag in progress and returns its payload, if there was one.
+    ///
+    /// Refresh the windows after calling this.
+    pub fn stop_drag(&mut self, window: &Window) -> Option<Arc<dyn Any>> {
+        let drag = self.active_drag.take();
+        if drag.is_some()
+            && let Some(platform_drag) = self.platform_owned_drag.as_ref()
+        {
+            if platform_drag.source_window == window.window_handle().window_id()
+                && matches!(
+                    &platform_drag.state,
+                    PlatformOwnedDragState::RestoredInSourceWindow
+                )
+            {
                 self.platform_owned_drag = None;
             }
+        }
+        Some(drag?.value)
+    }
+
+    /// Stops active drag and clears any related effects.
+    pub fn stop_active_drag(&mut self, window: &mut Window) -> bool {
+        if self.stop_drag(window).is_some() {
             window.refresh();
             true
         } else {
@@ -2623,7 +3701,7 @@ impl App {
         true
     }
 
-    /// Sets the cursor style for the currently active drag operation.
+    /// Sets the cursor shown during the active drag. Returns `false` if no drag is in progress.
     pub fn set_active_drag_cursor_style(
         &mut self,
         cursor_style: CursorStyle,
@@ -2638,8 +3716,11 @@ impl App {
         }
     }
 
-    /// Set the prompt renderer for GPUI. This will replace the default or platform specific
-    /// prompts with this custom implementation.
+    /// Replaces the default and platform prompts with `renderer`.
+    ///
+    /// The renderer is called for each prompt the app shows. It receives the prompt's
+    /// level, message, detail and buttons, and returns the handle that the window renders.
+    /// Use [`App::reset_prompt_builder`] to go back to the default prompts.
     pub fn set_prompt_builder(
         &mut self,
         renderer: impl Fn(
@@ -2661,88 +3742,54 @@ impl App {
         self.prompt_builder = Some(PromptBuilder::Default);
     }
 
-    /// Remove an asset from GPUI's cache
+    /// Removes the cached result for `source`, so the next [`App::fetch_asset`] loads it again.
     pub fn remove_asset<A: Asset>(&mut self, source: &A::Source) {
         let asset_id = (TypeId::of::<A>(), hash(source));
         self.loading_assets.remove(&asset_id);
     }
 
-    /// Check whether an asset is present in GPUI's cache (loading or loaded),
-    /// without fetching it.
+    /// Returns whether `source` is cached for asset type `A`, either loading or loaded.
+    ///
+    /// This doesn't start a load. Only available in tests and with the `test-support` feature.
     #[cfg(any(test, feature = "test-support"))]
     pub fn has_asset<A: Asset>(&self, source: &A::Source) -> bool {
         let asset_id = (TypeId::of::<A>(), hash(source));
         self.loading_assets.contains_key(&asset_id)
     }
 
-    /// Asynchronously load an asset, if the asset hasn't finished loading this will return None.
+    /// Starts loading an uncached asset and returns its result once available.
     ///
-    /// Note that the multiple calls to this method will only result in one `Asset::load` call at a
-    /// time, and the results of this call will be cached
-    pub fn fetch_asset<A: Asset>(&mut self, source: &A::Source) -> (Shared<Task<A::Output>>, bool) {
-        let asset_id = (TypeId::of::<A>(), hash(source));
-        let mut is_first = false;
-        let task = self
-            .loading_assets
-            .remove(&asset_id)
-            .map(|boxed_task| *boxed_task.downcast::<Shared<Task<A::Output>>>().unwrap())
-            .unwrap_or_else(|| {
-                is_first = true;
-                let future = A::load(source.clone(), self);
-
-                self.background_executor().spawn(future).shared()
-            });
-
-        self.loading_assets.insert(asset_id, Box::new(task.clone()));
-
-        (task, is_first)
+    /// Pending loads and completed results are cached until [`Self::remove_asset`].
+    /// This method does not subscribe a view to completion notifications.
+    pub fn fetch_asset<A: Asset>(&mut self, source: &A::Source) -> Option<A::Output> {
+        self.asset_entry::<A>(source).get()
     }
 
-    /// Obtain a new [`FocusHandle`], which allows you to track and manipulate the keyboard focus
-    /// for elements rendered within this window.
+    pub(crate) fn asset_entry<A: Asset>(&mut self, source: &A::Source) -> &CachedLoad<A::Output> {
+        let asset_id = (TypeId::of::<A>(), hash(source));
+        if !self.loading_assets.contains_key(&asset_id) {
+            let future = A::load(source.clone(), self);
+            let entry = CachedLoad::new(future, self);
+            self.loading_assets.insert(asset_id, Box::new(entry));
+        }
+        self.loading_assets
+            .get(&asset_id)
+            .and_then(|entry| entry.downcast_ref())
+            .expect("asset cache entries are keyed by their asset type")
+    }
+
+    /// Creates a new [`FocusHandle`] for tracking keyboard focus.
+    ///
+    /// Attach the handle to an element with `track_focus`, and move focus to it with
+    /// [`Window::focus`].
     #[track_caller]
     pub fn focus_handle(&self) -> FocusHandle {
         FocusHandle::new(&self.focus_handles)
     }
 
-    /// Tell GPUI that an entity has changed and observers of it should be notified.
-    pub fn notify(&mut self, entity_id: EntityId) {
-        let window_invalidators = mem::take(
-            self.window_invalidators_by_entity
-                .entry(entity_id)
-                .or_default(),
-        );
-
-        // `window_invalidators_by_entity` is monotonic, so an entry alone
-        // doesn't mean the window is currently rendering the entity. Filter
-        // through `tracked_entities` to keep invalidation tight to windows
-        // that actually display this entity right now.
-        let live_invalidators: SmallVec<[WindowInvalidator; 2]> = window_invalidators
-            .iter()
-            .filter(|(window_id, _)| {
-                self.tracked_entities
-                    .get(window_id)
-                    .is_some_and(|set| set.contains(&entity_id))
-            })
-            .map(|(_, invalidator)| invalidator.clone())
-            .collect();
-
-        if live_invalidators.is_empty() {
-            if self.pending_notifications.insert(entity_id) {
-                self.pending_effects
-                    .push_back(Effect::Notify { emitter: entity_id });
-            }
-        } else {
-            for invalidator in &live_invalidators {
-                invalidator.invalidate_view(entity_id, self);
-            }
-        }
-
-        self.window_invalidators_by_entity
-            .insert(entity_id, window_invalidators);
-    }
-
-    /// Returns the name for this [`App`].
+    /// Returns the debugging name of this app, if one was set.
+    ///
+    /// Only available in tests, with the `test-support` feature, or in debug builds.
     #[cfg(any(test, feature = "test-support", debug_assertions))]
     pub fn get_name(&self) -> Option<&'static str> {
         self.name
@@ -2755,7 +3802,8 @@ impl App {
 
     /// Removes an image from the sprite atlas on all windows.
     ///
-    /// If the current window is being updated, it will be removed from `App.windows`, you can use `current_window` to specify the current window.
+    /// A window that is being updated is not in `App.windows`, so pass it as `current_window` to
+    /// remove the image from it too.
     /// This is a no-op if the image is not in the sprite atlas.
     pub fn drop_image(&mut self, image: Arc<RenderImage>, current_window: Option<&mut Window>) {
         // remove the texture from all other windows
@@ -2777,18 +3825,102 @@ impl App {
 
     /// Registers a renderer specific to an inspector state.
     #[cfg(any(feature = "inspector", debug_assertions))]
-    pub fn register_inspector_element<T: 'static, R: crate::IntoElement>(
+    pub fn register_inspector_element<T: 'static, R: crate::IntoElement, F>(
         &mut self,
-        f: impl 'static + Fn(crate::InspectorElementId, &T, &mut Window, &mut App) -> R,
-    ) {
-        self.inspector_element_registry.register(f);
+        factory: impl 'static + Fn(&mut Window, &mut App) -> F,
+    ) where
+        F: 'static + FnMut(crate::InspectorElementId, &T, &mut Window, &mut App) -> R,
+    {
+        self.inspector_element_registry.register(factory);
     }
 
-    /// Initializes gpui's default colors for the application.
-    ///
-    /// These colors can be accessed through `cx.default_colors()`.
+    /// Sets the default [`Colors`] global, which `cx.default_colors()` returns.
     pub fn init_colors(&mut self) {
         self.set_global(GlobalColors(Arc::new(Colors::default())));
+    }
+
+    #[inline(never)]
+    fn update_window_erased(
+        &mut self,
+        window_id: WindowId,
+        update: &mut dyn FnMut(Option<(AnyView, &mut Window, &mut App)>),
+    ) {
+        self.update(|cx| {
+            let Some(mut window) = cx.windows.get_mut(window_id).and_then(Option::take) else {
+                update(None);
+                return;
+            };
+
+            let root_view = window.root.clone().unwrap();
+
+            cx.window_update_stack.push(window.handle.id);
+            update(Some((root_view, &mut window, cx)));
+            fn trail(window_id: WindowId, window: Box<Window>, cx: &mut App) -> Option<()> {
+                cx.window_update_stack.pop();
+
+                if window.removed {
+                    cx.end_platform_drag(window_id);
+                    cx.window_handles.remove(&window_id);
+                    cx.windows.remove(window_id);
+                    if let Some(tracked) = cx.tracked_entities.remove(&window_id) {
+                        for entity_id in tracked {
+                            if let Some(windows) =
+                                cx.window_invalidators_by_entity.get_mut(&entity_id)
+                            {
+                                windows.remove(&window_id);
+                            }
+                            if cx.current_window_by_entity.get(&entity_id) == Some(&window_id) {
+                                cx.current_window_by_entity.remove(&entity_id);
+                            }
+                        }
+                    }
+
+                    cx.window_closed_observers.clone().retain(&(), |callback| {
+                        callback(cx, window_id);
+                        true
+                    });
+
+                    let quit_on_empty = match cx.quit_mode {
+                        QuitMode::Explicit => false,
+                        QuitMode::LastWindowClosed => true,
+                        QuitMode::Default => cfg!(not(target_os = "macos")),
+                    };
+
+                    if quit_on_empty && cx.windows.is_empty() {
+                        cx.quit();
+                    }
+                } else {
+                    cx.windows.get_mut(window_id)?.replace(window);
+                }
+                Some(())
+            }
+            if trail(window_id, window, cx).is_none() {
+                update(None);
+            }
+        });
+    }
+
+    #[inline(never)]
+    fn update_entity_erased(
+        &mut self,
+        handle: &AnyEntity,
+        entity_type: &str,
+        update: &mut dyn FnMut(&mut dyn Any, &mut App),
+    ) {
+        self.update(|cx| {
+            let mut lease = cx.entities.lease_erased(handle, entity_type);
+            update(lease.entity.as_deref_mut().unwrap(), cx);
+            cx.entities.end_lease_erased(handle.entity_id, lease);
+        });
+    }
+
+    #[inline(never)]
+    #[track_caller]
+    fn prepare_spawn(&self) -> AsyncApp {
+        if self.quitting {
+            debug_panic!("Can't spawn on main thread after on_app_quit")
+        };
+        self.to_async()
     }
 }
 
@@ -2831,20 +3963,22 @@ impl AppContext for App {
 
     /// Updates the entity referenced by the given handle. The function is passed a mutable reference to the
     /// entity along with a `Context` for the entity.
+    #[inline(always)]
     fn update_entity<T: 'static, R>(
         &mut self,
         handle: &Entity<T>,
         update: impl FnOnce(&mut T, &mut Context<T>) -> R,
     ) -> R {
-        self.update(|cx| {
-            let mut entity = cx.entities.lease(handle);
-            let result = update(
-                &mut entity,
+        let mut update = Some(update);
+        let mut result = None;
+        self.update_entity_erased(handle, type_name::<T>(), &mut |entity, cx| {
+            let value = update.take().unwrap()(
+                entity.downcast_mut::<T>().unwrap(),
                 &mut Context::new_context(cx, handle.downgrade()),
             );
-            cx.entities.end_lease(entity);
-            result
-        })
+            result = Some(value);
+        });
+        result.unwrap()
     }
 
     fn as_mut<'a, T>(&'a mut self, handle: &Entity<T>) -> GpuiBorrow<'a, T>
@@ -2854,12 +3988,65 @@ impl AppContext for App {
         GpuiBorrow::new(handle.clone(), self)
     }
 
+    #[inline(always)]
     fn read_entity<T, R>(&self, handle: &Entity<T>, read: impl FnOnce(&T, &App) -> R) -> R
     where
         T: 'static,
     {
         let entity = self.entities.read(handle);
         read(entity, self)
+    }
+
+    fn notify(&mut self, entity_id: EntityId) {
+        let window_invalidators = mem::take(
+            self.window_invalidators_by_entity
+                .entry(entity_id)
+                .or_default(),
+        );
+
+        // `window_invalidators_by_entity` is monotonic, so an entry alone
+        // doesn't mean the window is currently rendering the entity. Filter
+        // through `tracked_entities` to keep invalidation tight to windows
+        // that actually display this entity right now.
+        let live_invalidators: SmallVec<[WindowInvalidator; 2]> = window_invalidators
+            .iter()
+            .filter(|(window_id, _)| {
+                self.tracked_entities
+                    .get(window_id)
+                    .is_some_and(|set| set.contains(&entity_id))
+            })
+            .map(|(_, invalidator)| invalidator.clone())
+            .collect();
+
+        if live_invalidators.is_empty() {
+            if self.pending_notifications.insert(entity_id) {
+                self.pending_effects
+                    .push_back(Effect::Notify { emitter: entity_id });
+            }
+        } else {
+            for invalidator in &live_invalidators {
+                invalidator.invalidate_view(entity_id, self);
+            }
+        }
+
+        self.window_invalidators_by_entity
+            .insert(entity_id, window_invalidators);
+    }
+
+    fn emit<EntityType, EventType>(&mut self, entity: &Entity<EntityType>, event: EventType)
+    where
+        EntityType: EventEmitter<EventType>,
+        EventType: 'static,
+    {
+        let event = self
+            .event_arena
+            .alloc(|| event)
+            .map(|it| it as &mut dyn Any);
+        self.pending_effects.push_back(Effect::Emit {
+            emitter: entity.entity_id(),
+            event_type: TypeId::of::<EventType>(),
+            event,
+        });
     }
 
     fn update_window<T, F>(&mut self, handle: AnyWindowHandle, update: F) -> Result<T>
@@ -2913,6 +4100,23 @@ impl AppContext for App {
     {
         let mut g = self.global::<G>();
         callback(g, self)
+    }
+
+    fn insert_global_entity<T: 'static>(&mut self, entity: Entity<T>) {
+        let any = entity.into_any();
+        if !self.global_entities.contains(&any) {
+            self.global_entities.push(any);
+        }
+    }
+
+    fn remove_global_entity<T: 'static>(&mut self, entity: &Entity<T>) {
+        self.global_entities
+            .retain(|any| any.entity_id() != entity.entity_id());
+    }
+
+    fn global_entities<T: 'static>(&self) -> impl Iterator<Item = Entity<T>> {
+        let mut iter = self.global_entities.iter();
+        iter.filter_map(|any| any.clone().downcast::<T>().ok())
     }
 }
 
@@ -2984,20 +4188,25 @@ impl<G: Global> DerefMut for GlobalLease<G> {
     }
 }
 
-/// Contains state associated with an active drag operation, started by dragging an element
-/// within the window or by dragging into the app from the underlying platform.
+/// The state of a drag in progress, started by dragging an element in a window.
+///
+/// Set with [`App::start_drag`]. Read it with [`App::active_drag`]. It is cleared by
+/// [`App::stop_drag`] when the drop happens.
+#[derive(derive_setters::Setters)]
+#[setters(generate = false)]
 pub struct AnyDrag {
-    /// The view used to render this drag
+    /// The view that draws the dragged item under the cursor.
     pub view: AnyView,
 
-    /// The value of the dragged item, to be dropped
+    /// The value that the drop target receives.
     pub value: Arc<dyn Any>,
 
-    /// This is used to render the dragged item in the same place
-    /// on the original element that the drag was initiated
+    /// The offset from the cursor to the drag view, so the view stays under the same point it was grabbed.
+    #[setters(generate, rename = "offset")]
     pub cursor_offset: Point<Pixels>,
 
-    /// The cursor style to use while dragging
+    /// The cursor shown during the drag, or `None` for the default.
+    #[setters(generate)]
     pub cursor_style: Option<CursorStyle>,
 
     /// Resolves the payload to offer the platform if the drag leaves the window.
@@ -3005,19 +4214,50 @@ pub struct AnyDrag {
     pub external_payload_source: Option<ExternalDragPayloadSource>,
 }
 
-/// Lazily resolves the payload handed to the platform when an internal drag is
-/// promoted to a native drag session.
+impl AnyDrag {
+    /// Creates a drag that carries `value` and draws `view` under the cursor.
+    pub fn new<T: 'static + Sized>(value: T, view: impl Into<AnyView>) -> Self {
+        Self {
+            view: view.into(),
+            value: Arc::new(value),
+            cursor_offset: Point::default(),
+            cursor_style: None,
+            external_payload_source: None,
+        }
+    }
+
+    /// Sets [`AnyDrag::external_payload_source`]: the closure builds the payload if the drag leaves the window.
+    pub fn external_payload(
+        mut self,
+        predicate: impl FnOnce(&mut Window, &mut App) -> Option<ExternalDragPayload> + 'static,
+    ) -> Self {
+        self.external_payload_source = Some(Box::new(predicate));
+        self
+    }
+
+    /// Returns whether the dragged value has type `T`.
+    pub fn is_type<T: 'static>(&self) -> bool {
+        self.value.as_ref().type_id() == TypeId::of::<T>()
+    }
+}
+
+/// A closure that builds the payload for a drag that leaves the window.
+///
+/// It runs when the drag becomes a native drag session, not when the drag starts. Set it
+/// with [`AnyDrag::external_payload`].
 pub type ExternalDragPayloadSource =
     Box<dyn FnOnce(&mut Window, &mut App) -> Option<ExternalDragPayload> + 'static>;
 
-/// Contains state associated with a tooltip. You'll only need this struct if you're implementing
-/// tooltip behavior on a custom element. Otherwise, use [Div::tooltip](crate::Interactivity::tooltip).
+/// The state of a tooltip that is currently shown.
+///
+/// You need this type only when you implement tooltip behavior on a custom element.
+/// Otherwise use [`Interactivity::tooltip`](crate::Interactivity::tooltip).
 #[derive(Clone)]
 pub struct AnyTooltip {
-    /// The view used to display the tooltip
+    /// The view that draws the tooltip.
     pub view: AnyView,
 
-    /// The absolute position of the mouse when the tooltip was deployed.
+    /// The absolute position of the mouse when the tooltip was shown.
     pub mouse_position: Point<Pixels>,
 
     /// Given the bounds of the tooltip, checks whether the tooltip should still be visible and
@@ -3026,20 +4266,41 @@ pub struct AnyTooltip {
     pub check_visible_and_update: Rc<dyn Fn(Bounds<Pixels>, &mut Window, &mut App) -> bool>,
 }
 
-/// A keystroke event, and potentially the associated action
+/// Whether a keystroke should prefer character input or key bindings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputPreference {
+    /// Prefer typing text over triggering key bindings.
+    CharacterInput,
+    /// Dispatch key bindings normally, if any match.
+    KeyBindings,
+}
+
+/// A keystroke that reached the app, with the action it resolved to, if any.
+///
+/// Passed to the callbacks from [`App::observe_keystrokes`] and [`App::intercept_keystrokes`].
 #[derive(Debug)]
 pub struct KeystrokeEvent {
-    /// The keystroke that occurred
+    /// The keystroke that was pressed.
     pub keystroke: Keystroke,
 
-    /// The action that was resolved for the keystroke, if any
+    /// Whether this keystroke should prefer character input or key bindings.
+    /// This is [`InputPreference::CharacterInput`] when the platform prefers text for the key
+    /// (e.g. AltGr on Windows) and the focused input accepts text. Interceptors still receive
+    /// these keystrokes and can consume them.
+    ///
+    /// If the keystroke is part of a multi-stroke binding, it still waits as pending input
+    /// even when this is [`InputPreference::CharacterInput`].
+    pub input_preference: InputPreference,
+
+    /// The action the keystroke resolved to, or `None` if no binding matched. Always
+    /// `None` in an `intercept_keystrokes` callback.
     pub action: Option<Box<dyn Action>>,
 
-    /// The context stack at the time
+    /// The key contexts that were active for the keystroke, from the outermost to the focused element.
     pub context_stack: Vec<KeyContext>,
 }
 
-/// A mutable reference to an entity owned by GPUI
+/// A mutable borrow of an entity's state, taken out of GPUI while the borrow is alive.
 pub struct GpuiBorrow<'a, T> {
     inner: Option<Lease<T>>,
     app: &'a mut App,
@@ -3093,9 +4354,123 @@ impl<'a, T> Drop for GpuiBorrow<'a, T> {
 
 #[cfg(test)]
 mod test {
-    use std::{cell::RefCell, rc::Rc};
+    use std::{
+        cell::{Cell, RefCell},
+        ffi::OsString,
+        path::PathBuf,
+        rc::Rc,
+    };
 
-    use crate::{AppContext, TestAppContext};
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
+
+    use crate::{AppContext, Context, Empty, IntoElement, Render, TestAppContext, Window};
+
+    struct RenderCounter(Rc<Cell<usize>>);
+
+    impl Render for RenderCounter {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.0.set(self.0.get() + 1);
+            Empty
+        }
+    }
+
+    #[gpui::test]
+    fn async_app_refresh_flushes_refresh_effect(cx: &mut TestAppContext) {
+        let render_count = Rc::new(Cell::new(0));
+
+        let _window = cx.add_window({
+            let render_count = render_count.clone();
+            move |_, _| RenderCounter(render_count)
+        });
+
+        cx.run_until_parked();
+        let render_count_before_refresh = render_count.get();
+
+        cx.to_async().refresh();
+
+        assert_eq!(render_count.get(), render_count_before_refresh + 1);
+    }
+
+    #[test]
+    fn embedded_update_flushes_effects() {
+        let cx = TestAppContext::single();
+        let handle = super::ApplicationHandle { app: cx.app };
+        let completed = Rc::new(Cell::new(false));
+
+        handle.update(|cx| {
+            cx.defer({
+                let completed = completed.clone();
+                move |_| completed.set(true)
+            });
+        });
+
+        assert!(completed.get());
+    }
+
+    #[gpui::test]
+    fn nested_update_defers_new_effects_until_current_effect_returns(cx: &mut TestAppContext) {
+        let order = Rc::new(RefCell::new(Vec::new()));
+        cx.update({
+            let order = order.clone();
+            move |cx| {
+                cx.defer(move |cx| {
+                    order.borrow_mut().push("outer-start");
+                    cx.update({
+                        let order = order.clone();
+                        |cx| {
+                            cx.defer(move |_| order.borrow_mut().push("nested"));
+                        }
+                    });
+                    order.borrow_mut().push("outer-end");
+                });
+            }
+        });
+
+        assert_eq!(*order.borrow(), ["outer-start", "outer-end", "nested"]);
+    }
+
+    #[gpui::test]
+    fn adding_a_tab_group_after_removal_preserves_other_groups(cx: &mut TestAppContext) {
+        use super::{SystemWindowTab, SystemWindowTabController};
+
+        let windows: Vec<_> = (0..4).map(|_| cx.add_window(|_, _| Empty)).collect();
+        cx.update(|cx| {
+            for (ix, window) in windows.iter().take(3).enumerate() {
+                SystemWindowTabController::add_tab(
+                    cx,
+                    window.window_id(),
+                    vec![SystemWindowTab::new(
+                        format!("Window {ix}").into(),
+                        (*window).into(),
+                    )],
+                );
+            }
+            SystemWindowTabController::remove_tab(cx, windows[0].window_id());
+            SystemWindowTabController::add_tab(
+                cx,
+                windows[3].window_id(),
+                vec![SystemWindowTab::new("New window".into(), windows[3].into())],
+            );
+
+            let controller = cx.global::<SystemWindowTabController>();
+            assert_eq!(controller.tab_groups.len(), 3);
+            for window in &windows[1..] {
+                assert_eq!(controller.tabs(window.window_id()).unwrap().len(), 1);
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn drag_type_matches_the_payload(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let view = cx.new(|_| Empty);
+            let drag = super::AnyDrag::new(String::from("row"), view);
+            assert!(drag.is_type::<String>());
+            assert!(!drag.is_type::<usize>());
+            assert!(!drag.is_type::<std::sync::Arc<dyn std::any::Any>>());
+        });
+    }
 
     #[test]
     fn test_gpui_borrow() {
@@ -3126,5 +4501,27 @@ mod test {
         });
 
         assert_eq!(*observation_count.borrow(), 2);
+    }
+
+    #[gpui::test]
+    async fn test_restart_preserves_path_and_arguments(cx: &mut TestAppContext) {
+        #[cfg(unix)]
+        let user_data_dir = OsString::from_vec(b"/tmp/zed data/\xff".to_vec());
+        #[cfg(not(unix))]
+        let user_data_dir = OsString::from("C:\\zed data");
+        let arguments = vec![OsString::from("--user-data-dir"), user_data_dir];
+        let restart_path = PathBuf::from("updated-zed");
+        let _application =
+            super::Application(cx.app.clone()).with_restart_arguments(arguments.clone());
+        let restart = cx.expect_restart();
+
+        cx.update(|cx| {
+            cx.set_restart_path(restart_path.clone());
+            cx.restart();
+        });
+
+        let (path, restart_arguments) = restart.await.expect("restart was not requested");
+        assert_eq!(path, Some(restart_path));
+        assert_eq!(restart_arguments, arguments);
     }
 }
