@@ -32,7 +32,7 @@ command-bar-window = []
 # gpui-ce is the community edition of Zed's GPUI (Apache-2.0): the same API,
 # synced from Zed and published to crates.io, which is what lets this crate be
 # published too. Imported as `gpui` so the code reads as GPUI code.
-gpui = { package = "gpui-ce", version = "0.2.2" }
+gpui = { package = "gpui-ce", version = "0.3.0" }
 unicode-segmentation = "1"
 
 # Only for `app-icon`, and only on the platform that wants them. Both are
@@ -58,7 +58,7 @@ image = { version = "0.25", optional = true, default-features = false, features 
 # backend lives here. `runtime_shaders` compiles the Metal shaders when the
 # app starts instead of at build time, so a machine with only the command line
 # tools — no full Xcode — can build the gallery.
-gpui_ce_platform = { version = "0.1.0", features = [
+gpui_ce_platform = { version = "0.3.0", features = [
     "font-kit",
     "runtime_shaders",
     "wayland",

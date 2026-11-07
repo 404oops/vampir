@@ -1416,7 +1416,7 @@ pub fn dialog<V: ControlHost>(
                         .child(div().flex().justify_end().gap(px(8.0)).children(footer)),
                 ),
         )
-        .with_priority(150),
+        .priority(150),
     )
 }
 

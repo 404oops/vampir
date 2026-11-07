@@ -1060,7 +1060,7 @@ pub fn combo<V: ControlHost>(
                                 )),
                         ),
                 )
-                .with_priority(100),
+                .priority(100),
             )
         })
 }

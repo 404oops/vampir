@@ -807,7 +807,7 @@ pub fn context_menu<V: ControlHost, I: Clone + 'static>(
                 .snap_to_window_with_margin(px(VIEWPORT_MARGIN))
                 .child(panel),
         )
-        .with_priority(200),
+        .priority(200),
     )
 }
 

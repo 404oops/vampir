@@ -11,8 +11,8 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, Bounds, ColorSpace, Context, ElementId, KeyDownEvent, MouseButton, MouseDownEvent,
-    Pixels, Rgba, Window, canvas, div, fill, linear_color_stop, linear_gradient, point, prelude::*,
-    px,
+    PaintQuad, Pixels, Rgba, Window, canvas, div, linear_color_stop, linear_gradient, point,
+    prelude::*, px,
 };
 
 use crate::color::{OklchHue, oklch_to_color};
@@ -280,7 +280,7 @@ pub fn color_pad<V: ControlHost>(
             let Some(colors) = colors else { return };
             let rows = colors.len() / PAD_COLUMNS;
             for (cell, gradient) in gradient_cells(bounds, &colors, PAD_COLUMNS, rows) {
-                window.paint_quad(fill(cell, gradient));
+                window.paint_quad(PaintQuad::new(cell).background(gradient));
             }
         },
     )

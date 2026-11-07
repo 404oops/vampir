@@ -1433,7 +1433,7 @@ fn palette_with_results<V: ControlHost>(
             )
             .child(panel),
     )
-    .with_priority(180)
+    .priority(180)
 }
 
 /// How wide a command palette is, in a window or over one.
