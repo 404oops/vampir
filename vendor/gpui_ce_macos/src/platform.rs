@@ -1318,7 +1318,11 @@ fn did_finish_launching(this: &GPUIApplicationDelegate) {
         register_system_power_observers(as_any_object(this));
         platform.0.lock().system_power_observers_registered = true;
     }
-    if let Some(callback) = platform.0.lock().finish_launching.take() {
+    // Taken out before it runs: under the 2024 edition the guard of an `if let` scrutinee lives
+    // to the end of its block, and the callback is the app's whole launch, which opens windows
+    // and sets menus through this same lock.
+    let callback = platform.0.lock().finish_launching.take();
+    if let Some(callback) = callback {
         callback();
     }
 }
