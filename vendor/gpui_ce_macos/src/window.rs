@@ -14,7 +14,8 @@ use gpui::{
     Pixels, PlatformAtlas, PlatformDisplay, PlatformFrameSignal, PlatformInput,
     PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
     SharedString, Size, SystemWindowTab, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControlArea, WindowKind, WindowParams, WindowVisibility, point, px, size,
+    WindowBounds, WindowControlArea, WindowKind, WindowParams, WindowVisibility, point,
+    popup::PopupOptions, px, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -666,11 +667,11 @@ unsafe fn build_window_class(
 
         decl.add_method(
             sel!(canBecomeMainWindow),
-            yes as unsafe extern "C" fn(_, _) -> _,
+            can_become_main as unsafe extern "C" fn(_, _) -> _,
         );
         decl.add_method(
             sel!(canBecomeKeyWindow),
-            yes as unsafe extern "C" fn(_, _) -> _,
+            can_become_key as unsafe extern "C" fn(_, _) -> _,
         );
         decl.add_method(
             sel!(windowDidResize:),
@@ -947,6 +948,16 @@ struct MacWindowState {
     accesskit_adapter: Option<accesskit_macos::SubclassingAdapter>,
     // The parent window if this window is a sheet (Dialog kind)
     sheet_parent: Option<ObjcId>,
+    /// For an anchored popup, where it goes and the NSWindow it is a child of. The parent is
+    /// cleared when the popup closes, since it may not outlive the popup.
+    popup: Option<PopupOptions>,
+    popup_parent: Option<ObjcId>,
+    /// Whether an anchored popup was opened to take the keyboard. One that was not — a scrim,
+    /// a hint — never becomes key, so a click on it leaves the keyboard where it is.
+    popup_takes_focus: bool,
+    /// The activity last reported to the activate callback, so a window whose popup takes the
+    /// keyboard does not report going inactive and straight back.
+    reported_active: Option<bool>,
 }
 
 impl MacWindowState {
@@ -1221,6 +1232,7 @@ impl MacWindow {
             tabbing_identifier,
             ..
         }: WindowParams,
+        popup_parent: Option<ObjcId>,
         cursor_visible: Arc<AtomicBool>,
         foreground_executor: ForegroundExecutor,
         background_executor: BackgroundExecutor,
@@ -1262,12 +1274,13 @@ impl MacWindow {
                 WindowKind::Normal => {
                     msg_send![&*WINDOW_CLASS, alloc]
                 }
-                // `AnchoredPopup` is rejected in `MacPlatform::open_window`, grouped here only
-                // for exhaustiveness.
-                WindowKind::PopUp | WindowKind::AnchoredPopup(_) => {
+                WindowKind::PopUp => {
                     style_mask |= NSWindowStyleMask::NonactivatingPanel;
                     msg_send![&*PANEL_CLASS, alloc]
                 }
+                // An ordinary, activating panel: it takes the keyboard like any window when
+                // asked to, and its level and ownership come from its parent below.
+                WindowKind::AnchoredPopup(_) => msg_send![&*PANEL_CLASS, alloc],
                 WindowKind::Floating | WindowKind::Dialog => {
                     msg_send![&*PANEL_CLASS, alloc]
                 }
@@ -1390,6 +1403,13 @@ impl MacWindow {
                 closed: Arc::new(AtomicBool::new(false)),
                 accesskit_adapter: None,
                 sheet_parent: None,
+                popup: match &kind {
+                    WindowKind::AnchoredPopup(options) => Some(options.clone()),
+                    _ => None,
+                },
+                popup_parent,
+                popup_takes_focus: focus,
+                reported_active: None,
             }));
             let mut window = Self(state, marker);
 
@@ -1468,9 +1488,25 @@ impl MacWindow {
                         let _: () = msg_send![native_window, setTabbingIdentifier:NIL];
                     }
                 }
-                // `AnchoredPopup` is rejected in `MacPlatform::open_window`, grouped here only
-                // for exhaustiveness.
-                WindowKind::PopUp | WindowKind::AnchoredPopup(_) => {
+                WindowKind::AnchoredPopup(_) => {
+                    // Above its parent and nothing else: a child window shares the parent's
+                    // level, moves with it, and is ordered out with it when it is minimised,
+                    // unlike a panel at a raised level, which floats over other applications.
+                    native_window.setLevel_(NSNormalWindowLevel);
+                    native_window.setAcceptsMouseMovedEvents_(Bool::new(true));
+                    let _: () = msg_send![native_window, setHidesOnDeactivate: Bool::new(false)];
+                    let _: () = msg_send![native_window, setFloatingPanel: Bool::new(false)];
+                    let _: () =
+                        msg_send![native_window, setBecomesKeyOnlyIfNeeded: Bool::new(false)];
+                    let _: () = msg_send![native_window, setTabbingIdentifier: NIL];
+                    let _: () = msg_send![
+                        native_window,
+                        setAnimationBehavior: NSWindowAnimationBehaviorUtilityWindow
+                    ];
+                    native_window
+                        .setCollectionBehavior_(NSWindowCollectionBehavior::FullScreenAuxiliary);
+                }
+                WindowKind::PopUp => {
                     add_mouse_tracking_area(
                         tracking_view,
                         NSTrackingAreaOptions::MouseEnteredAndExited
@@ -1509,6 +1545,7 @@ impl MacWindow {
             }
 
             if allows_automatic_window_tabbing
+                && popup_parent.is_none()
                 && !main_window.is_null()
                 && main_window != native_window
             {
@@ -1540,6 +1577,22 @@ impl MacWindow {
                 }
             }
 
+            if let Some(parent) = popup_parent {
+                // Placed before it is shown, so it never appears where the display-relative
+                // origin above put it.
+                let options = window.0.lock().popup.clone();
+                if let Some(options) = options {
+                    place_popup_window(native_window, parent, &options, bounds.size);
+                }
+                if show {
+                    let _: () = msg_send![
+                        parent,
+                        addChildWindow: native_window,
+                        ordered: NSWindowOrderingMode::Above
+                    ];
+                }
+            }
+
             if focus && show {
                 native_window.makeKeyAndOrderFront_(NIL);
             } else if show {
@@ -1550,7 +1603,9 @@ impl MacWindow {
             // Although we already specified the position using `initWithContentRect_styleMask_backing_defer_screen_`,
             // the window position might be incorrect if the main screen (the screen that contains the window that has focus)
             //  is different from the primary screen.
-            let _: () = msg_send![native_window, setFrameTopLeftPoint: window_rect.origin];
+            if popup_parent.is_none() {
+                let _: () = msg_send![native_window, setFrameTopLeftPoint: window_rect.origin];
+            }
             {
                 let mut window_state = window.0.lock();
                 window_state.move_traffic_light();
@@ -1598,6 +1653,26 @@ impl MacWindow {
             }
 
             window_handles
+        }
+    }
+
+    /// The NSWindow behind `handle`, if it is one of this application's open windows.
+    pub(crate) fn native_window_for(handle: AnyWindowHandle) -> Option<ObjcId> {
+        unsafe {
+            let app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
+            let windows: ObjcId = msg_send![app, windows];
+            let count: NSUInteger = msg_send![windows, count];
+            (0..count).find_map(|i| {
+                let window: ObjcId = msg_send![windows, objectAtIndex: i];
+                let ours: Bool = msg_send![window, isKindOfClass: &*WINDOW_CLASS];
+                let panel: Bool = msg_send![window, isKindOfClass: &*PANEL_CLASS];
+                if !ours.as_bool() && !panel.as_bool() {
+                    return None;
+                }
+                let state = get_window_state(&*window);
+                let lock = state.lock();
+                (lock.handle == handle && !lock.closed.load(Ordering::Acquire)).then_some(window)
+            })
         }
     }
 
@@ -1694,13 +1769,42 @@ impl PlatformWindow for MacWindow {
         let this = self.0.lock();
         let window = this.native_window;
         let closed = this.closed.clone();
+        // A popup grows from its anchor, not from its bottom-left corner.
+        let popup = this.popup.clone().zip(this.popup_parent);
         this.foreground_executor
             .spawn(async move {
                 if_window_not_closed(closed, || unsafe {
-                    window.setContentSize_(NSSize {
-                        width: size.width.as_f32() as f64,
-                        height: size.height.as_f32() as f64,
-                    });
+                    match popup {
+                        Some((options, parent)) => {
+                            place_popup_window(window, parent, &options, size);
+                        }
+                        None => window.setContentSize_(NSSize {
+                            width: size.width.as_f32() as f64,
+                            height: size.height.as_f32() as f64,
+                        }),
+                    }
+                })
+            })
+            .detach();
+    }
+
+    fn set_popup_anchor(&self, anchor_rect: Bounds<Pixels>) {
+        let mut this = self.0.lock();
+        let Some(options) = this.popup.as_mut() else {
+            return;
+        };
+        options.anchor_rect = anchor_rect;
+        let options = options.clone();
+        let Some(parent) = this.popup_parent else {
+            return;
+        };
+        let window = this.native_window;
+        let closed = this.closed.clone();
+        let size = this.content_size();
+        this.foreground_executor
+            .spawn(async move {
+                if_window_not_closed(closed, || unsafe {
+                    place_popup_window(window, parent, &options, size);
                 })
             })
             .detach();
@@ -2049,7 +2153,8 @@ impl PlatformWindow for MacWindow {
     }
 
     fn is_active(&self) -> bool {
-        unsafe { self.0.lock().native_window.isKeyWindow() == Bool::new(true) }
+        let native_window = self.0.lock().native_window;
+        unsafe { effectively_key(native_window) }
     }
 
     fn visibility(&self) -> WindowVisibility {
@@ -2774,10 +2879,6 @@ unsafe fn drop_window_state(object: &Objc2Object) {
     }
 }
 
-unsafe extern "C" fn yes(_: &Objc2Object, _: Sel) -> Bool {
-    Bool::new(true)
-}
-
 unsafe extern "C" fn dealloc_window(this: &Objc2Object, _: Sel) {
     unsafe {
         drop_window_state(this);
@@ -3463,6 +3564,9 @@ fn ns_error_description(error: ObjcId) -> String {
 }
 
 unsafe extern "C" fn window_did_move(this: &Objc2Object, _: Sel, _: ObjcId) {
+    // AppKit carries child windows along; placing them again applies the work-area
+    // constraints of whichever display the parent has arrived on.
+    unsafe { place_popup_children(this as *const Objc2Object as ObjcId) };
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
     if let Some(mut callback) = lock.moved_callback.take() {
@@ -3595,20 +3699,65 @@ unsafe extern "C" fn window_did_change_key_status(this: &Objc2Object, selector: 
         }
     }
 
+    let this = this as *const Objc2Object as ObjcId;
     executor
         .spawn(async move {
-            let mut lock = window_state.as_ref().lock();
-            if is_active {
-                lock.move_traffic_light();
+            // Read again once AppKit has finished moving the key window: a window whose own
+            // popup took the keyboard stays active, as it does under a menu, and only goes
+            // inactive when the keyboard leaves it and its popups altogether.
+            if window_state.lock().closed.load(Ordering::Acquire) {
+                return;
             }
-
-            if let Some(mut callback) = lock.activate_callback.take() {
-                drop(lock);
-                callback(is_active);
-                window_state.lock().activate_callback = Some(callback);
-            };
+            report_activation(&window_state, unsafe { effectively_key(this) });
+            // A popup taking or losing the keyboard is its parent's activity changing too.
+            let parent = window_state.lock().popup_parent;
+            if let Some(parent) = parent {
+                let parent_state = unsafe { get_window_state(&*parent) };
+                if !parent_state.lock().closed.load(Ordering::Acquire) {
+                    report_activation(&parent_state, unsafe { effectively_key(parent) });
+                }
+            }
         })
         .detach();
+}
+
+fn report_activation(window_state: &Arc<Mutex<MacWindowState>>, is_active: bool) {
+    let mut lock = window_state.as_ref().lock();
+    if lock.reported_active == Some(is_active) {
+        return;
+    }
+    lock.reported_active = Some(is_active);
+    if is_active {
+        lock.move_traffic_light();
+    }
+    if let Some(mut callback) = lock.activate_callback.take() {
+        drop(lock);
+        callback(is_active);
+        window_state.lock().activate_callback = Some(callback);
+    };
+}
+
+/// Whether `window` has the keyboard, itself or through one of its anchored popups.
+unsafe fn effectively_key(window: ObjcId) -> bool {
+    unsafe {
+        window.isKeyWindow().as_bool()
+            || popup_children(window)
+                .into_iter()
+                .any(|child| child.isKeyWindow().as_bool())
+    }
+}
+
+/// A popup is never the main window: its parent keeps that, and with it the look of the
+/// window in front, the way a window under a menu does.
+unsafe extern "C" fn can_become_main(this: &Objc2Object, _: Sel) -> Bool {
+    let window_state = unsafe { get_window_state(this) };
+    Bool::new(window_state.lock().popup.is_none())
+}
+
+unsafe extern "C" fn can_become_key(this: &Objc2Object, _: Sel) -> Bool {
+    let window_state = unsafe { get_window_state(this) };
+    let lock = window_state.lock();
+    Bool::new(lock.popup.is_none() || lock.popup_takes_focus)
 }
 
 unsafe extern "C" fn window_should_close(this: &Objc2Object, _: Sel, _: ObjcId) -> Bool {
@@ -3626,15 +3775,24 @@ unsafe extern "C" fn window_should_close(this: &Objc2Object, _: Sel, _: ObjcId) 
 
 unsafe extern "C" fn close_window(this: &Objc2Object, _: Sel) {
     unsafe {
-        let (close_callback, simple_fullscreen_state) = {
+        // A popup does not outlive its parent: AppKit would leave it on screen, owned by
+        // nothing. Each closes through this same method, so its own close callback runs.
+        for child in popup_children(this as *const Objc2Object as ObjcId) {
+            let _: () = msg_send![child, close];
+        }
+        let (close_callback, simple_fullscreen_state, popup_parent) = {
             let window_state = get_window_state(this);
             let mut lock = window_state.as_ref().lock();
             lock.closed.store(true, Ordering::Release);
             (
                 lock.close_callback.take(),
                 lock.simple_fullscreen_state.take(),
+                lock.popup_parent.take(),
             )
         };
+        if let Some(parent) = popup_parent {
+            let _: () = msg_send![parent, removeChildWindow: this];
+        }
 
         if simple_fullscreen_state.is_some() {
             pop_simple_fullscreen_presentation_options();
@@ -4430,5 +4588,91 @@ mod tests {
                 NSCursorFrameResizeDirections::All
             ))
         );
+    }
+}
+
+/// The anchored popups that are children of `window` and still open.
+unsafe fn popup_children(window: ObjcId) -> Vec<ObjcId> {
+    unsafe {
+        let children: ObjcId = msg_send![window, childWindows];
+        if children.is_null() {
+            return Vec::new();
+        }
+        let count: NSUInteger = msg_send![children, count];
+        (0..count)
+            .filter_map(|i| {
+                let child: ObjcId = msg_send![children, objectAtIndex: i];
+                let panel: Bool = msg_send![child, isKindOfClass: &*PANEL_CLASS];
+                if !panel.as_bool() {
+                    return None;
+                }
+                let state = get_window_state(&*child);
+                let lock = state.lock();
+                (lock.popup.is_some() && !lock.closed.load(Ordering::Acquire)).then_some(child)
+            })
+            .collect()
+    }
+}
+
+unsafe fn place_popup_children(window: ObjcId) {
+    unsafe {
+        for child in popup_children(window) {
+            let (options, size) = {
+                let state = get_window_state(&*child);
+                let lock = state.lock();
+                (lock.popup.clone(), lock.content_size())
+            };
+            if let Some(options) = options {
+                place_popup_window(child, window, &options, size);
+            }
+        }
+    }
+}
+
+/// Puts `popup` where `options` asks relative to `parent`'s content area, kept inside the
+/// visible frame of the parent's display. AppKit's screen space has its origin at the bottom
+/// left of the primary display; `place_popup` works top-down, so both ends convert through
+/// the primary display's height, which is the same for every display in the arrangement.
+unsafe fn place_popup_window(
+    popup: ObjcId,
+    parent: ObjcId,
+    options: &PopupOptions,
+    popup_size: Size<Pixels>,
+) {
+    unsafe {
+        let screens: ObjcId = msg_send![class!(NSScreen), screens];
+        let count: NSUInteger = msg_send![screens, count];
+        if count == 0 {
+            return;
+        }
+        let primary: ObjcId = msg_send![screens, objectAtIndex: 0 as NSUInteger];
+        let primary_frame: Objc2NSRect = msg_send![primary, frame];
+        let primary_height = primary_frame.size.height;
+        let top_down = |rect: Objc2NSRect| Bounds {
+            origin: point(
+                px(rect.origin.x as f32),
+                px((primary_height - rect.origin.y - rect.size.height) as f32),
+            ),
+            size: size(px(rect.size.width as f32), px(rect.size.height as f32)),
+        };
+        let content_view = parent.contentView();
+        let content_frame: Objc2NSRect = msg_send![content_view, frame];
+        let content: Objc2NSRect = msg_send![parent, convertRectToScreen: content_frame];
+        let screen = parent.screen();
+        let work_area = (!screen.is_null()).then(|| top_down(screen.visibleFrame()));
+        let placed =
+            gpui::popup::place_popup(options, top_down(content).origin, popup_size, work_area);
+        let content_rect = Objc2NSRect::new(
+            Objc2NSPoint::new(
+                placed.origin.x.as_f32() as f64,
+                primary_height - (placed.origin.y + placed.size.height).as_f32() as f64,
+            ),
+            NSSize::new(
+                placed.size.width.as_f32() as f64,
+                placed.size.height.as_f32() as f64,
+            ),
+        );
+        let frame: Objc2NSRect = msg_send![popup, frameRectForContentRect: content_rect];
+        popup.setFrame_display_(frame, Bool::new(true));
     }
 }

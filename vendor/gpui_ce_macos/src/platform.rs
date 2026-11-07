@@ -13,7 +13,6 @@ use gpui::{
     OsMenu, OwnedMenu, PathPromptOptions, Platform, PlatformDisplay, PlatformKeyboardLayout,
     PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, Result, SystemMenuType, Task,
     ThermalState, WindowAppearance, WindowKind, WindowParams, WindowingRequest,
-    popup::PopupNotSupportedError,
 };
 use gpui_apple::{
     AppleActivity, AppleDispatcher, keychain,
@@ -778,11 +777,15 @@ impl Platform for MacPlatform {
         handle: AnyWindowHandle,
         options: WindowParams,
     ) -> Result<Box<dyn PlatformWindow>> {
-        // Native popups are not implemented on macOS yet. Rejecting lets callers fall back to
-        // gpui's in-window popovers.
-        if let WindowKind::AnchoredPopup(_) = options.kind {
-            return Err(PopupNotSupportedError.into());
-        }
+        // A popup is a child of its parent's NSWindow. Without the parent there is nothing to
+        // own it, and an unowned popup would float above every other application's windows.
+        let popup_parent = match &options.kind {
+            WindowKind::AnchoredPopup(popup) => Some(
+                MacWindow::native_window_for(popup.parent)
+                    .ok_or_else(|| anyhow!("the popup's parent window is not open"))?,
+            ),
+            _ => None,
+        };
 
         let (cursor_visible, foreground_executor, background_executor, renderer_context) = {
             let guard = self.0.lock();
@@ -803,6 +806,7 @@ impl Platform for MacPlatform {
         Ok(Box::new(MacWindow::open(
             handle,
             options,
+            popup_parent,
             cursor_visible,
             foreground_executor,
             background_executor,
