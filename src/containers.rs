@@ -545,19 +545,25 @@ pub fn tab_bar_layout<V: ControlHost>(
                 .when(tab.closable, move |el| {
                     let on_close = on_close.clone();
                     el.child(
-                        tab_close_glyph()
-                            .id(element("tab-close"))
-                            .hover(move |style| style.bg(palette.row_hover))
-                            // A press on the ✕ is not a hold on the tab: it
-                            // must neither start a reorder nor, on release,
-                            // select a tab that has just been closed.
-                            .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
-                                cx.stop_propagation()
-                            })
-                            .on_click(cx.listener(move |this, _event, window, cx| {
+                        tab_close_glyph(if active {
+                            palette.control_label
+                        } else {
+                            palette.text_secondary
+                        })
+                        .id(element("tab-close"))
+                        .hover(move |style| style.bg(palette.row_hover))
+                        // A press on the ✕ is not a hold on the tab: it
+                        // must neither start a reorder nor, on release,
+                        // select a tab that has just been closed.
+                        .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                            cx.stop_propagation()
+                        })
+                        .on_click(cx.listener(
+                            move |this, _event, window, cx| {
                                 on_close(this, index, window, cx);
                                 cx.notify();
-                            })),
+                            },
+                        )),
                     )
                 })
                 .into_any_element(),
@@ -775,7 +781,13 @@ fn tab_face(tab: &Tab, active: bool, palette: Palette, layout: TabBarLayout) -> 
                 .child(tab.label.clone()),
         )
         .children(tab_badge(tab, palette))
-        .when(tab.closable, |el| el.child(tab_close_glyph()))
+        .when(tab.closable, |el| {
+            el.child(tab_close_glyph(if active {
+                palette.control_label
+            } else {
+                palette.text_secondary
+            }))
+        })
 }
 
 fn tab_badge(tab: &Tab, palette: Palette) -> Option<Div> {
@@ -788,7 +800,7 @@ fn tab_badge(tab: &Tab, palette: Palette) -> Option<Div> {
     })
 }
 
-fn tab_close_glyph() -> Div {
+fn tab_close_glyph(color: Rgba) -> Div {
     div()
         .w(px(14.0))
         .h(px(14.0))
@@ -797,8 +809,7 @@ fn tab_close_glyph() -> Div {
         .items_center()
         .justify_center()
         .rounded(px(3.0))
-        .text_size(px(10.0))
-        .child("\u{2715}")
+        .child(crate::controls::cross_glyph(6.5, color))
 }
 
 fn track_axis(vertical: bool) -> TrackAxis {

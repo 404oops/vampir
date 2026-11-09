@@ -593,7 +593,7 @@ impl Render for CommandBarWindow {
         let element = keyboard::handle_keys(div().id("vampir-command-bar"), self, cx)
             .size_full()
             .text_color(palette.text_primary)
-            .font_family(crate::ui_font())
+            .font(crate::ui_font_face())
             .child(
                 panel
                     .size_full()

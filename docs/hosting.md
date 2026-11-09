@@ -44,7 +44,7 @@ impl Render for Editor {
         let body = self.body(palette, window, cx);
         let root = vampir::root(div().id("root"), self, cx)
             .size_full()
-            .font_family(vampir::ui_font())
+            .font(vampir::ui_font_face())
             .bg(vampir::ground(palette.backdrop))
             .child(body);
         if self.controls.animating() {
@@ -121,7 +121,7 @@ self.controls.observe_appearance(window, cx);
 
 If the app offers theme customization, `scheme_picker`, `hue_picker` and `saturation_picker` bind directly to `ControlState::theme`; the toolkit handles their drags. The generic `saturation_slider` takes a saturation in `0.0..=2.0` and reports a normalized `0.0..=1.0` track position through `ControlHost::track_dragged`, like other sliders. Convert that position with `Theme::saturation_from_track(at.x)` before storing it.
 
-The window's own ground is `palette.backdrop`, lit with `vampir::ground(palette.backdrop)` on the root; `scroll_area` fades scrolling content into it at the right height. `vampir::ui_font()` is the system's interface face, for `.font_family` on the root.
+The window's own ground is `palette.backdrop`, lit with `vampir::ground(palette.backdrop)` on the root; `scroll_area` fades scrolling content into it at the right height. `.font(vampir::ui_font_face())` on the root sets text in the system's interface face, with the platform's symbol faces behind it: GPUI-CE's text system falls back only to a few text faces, and draws a stand-in for a symbol none of them has, such as ▣ or ✕ in a menu icon. `ui_font()` is the face's name alone.
 
 A host with a richer theme of its own can build `Palette` directly. It is a plain public struct of `Copy` colour roles: use `Palette::from_hue_and_saturation` or fill it field by field, then pass it, **by value**, into every control. See [Design](design.md#colour) for what the roles mean and when adding one is justified.
 

@@ -35,7 +35,8 @@ use vampir::{
     rank_results, ranked_command_palette, ranked_search_list, reorder, row, saturation_picker,
     scheme_picker, scroll_area, search_list, segmented, selectable_list, separator,
     shortcut_recorder, slider, spinbox, spinner, split_area, split_handle, swatch_grid, switch,
-    tab_bar, tab_bar_layout, table_header, table_row, text_area, text_field, tree_row, ui_font,
+    tab_bar, tab_bar_layout, table_header, table_row, text_area, text_field, tree_row,
+    ui_font_face,
 };
 
 // The gallery is also the smallest complete *macOS* host, so it carries the
@@ -721,7 +722,7 @@ impl Render for Gallery {
                 .size_full()
                 .flex()
                 .flex_col()
-                .font_family(ui_font())
+                .font(ui_font_face())
                 .text_size(px(TEXT_SIZE))
                 .bg(ground(palette.backdrop))
                 .text_color(palette.text_primary)

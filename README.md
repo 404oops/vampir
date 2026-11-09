@@ -121,7 +121,7 @@ The gallery supports both colour schemes:
 
 **Lighting** — `lit`, `raised`, `recessed`, `panel`, `rim`, `glow`, `shade`, `ground`. These helpers keep gradients and shadows consistent across controls.
 
-**The host's root** — `root`, `handle_keys`, `handle_mouse`, `bind_keys`, `edit_menu`, `ui_font`.
+**The host's root** — `root`, `handle_keys`, `handle_mouse`, `bind_keys`, `edit_menu`, `ui_font_face`.
 
 ## The app icon
 

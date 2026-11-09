@@ -109,4 +109,6 @@ pub use text_input::{Highlighter, InputStyle, Span, TextInput};
 pub use theme::{
     DEFAULT_HUE, Scheme, Theme, hue_picker, saturation_picker, scheme_picker, system_dark,
 };
-pub use typography::{SMALL_TEXT_SIZE, TEXT_SIZE, TITLE_TEXT_SIZE, ui_font};
+pub use typography::{
+    SMALL_TEXT_SIZE, TEXT_SIZE, TITLE_TEXT_SIZE, symbol_fonts, ui_font, ui_font_face,
+};

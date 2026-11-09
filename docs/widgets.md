@@ -146,4 +146,4 @@ input.update(cx, |input, cx| {
 
 ## Type — `vampir::typography`
 
-`ui_font()` is the system's interface face under the name each platform knows it by, for `.font_family` on the root. `TEXT_SIZE`, `SMALL_TEXT_SIZE` and `TITLE_TEXT_SIZE` are the three sizes the toolkit sets text in.
+`ui_font_face()` is the system's interface face under the name each platform knows it by, with the faces that platform keeps its symbols in (`symbol_fonts()`) behind it, for `.font` on the root. `ui_font()` is the face's name alone. `TEXT_SIZE`, `SMALL_TEXT_SIZE` and `TITLE_TEXT_SIZE` are the three sizes the toolkit sets text in.
