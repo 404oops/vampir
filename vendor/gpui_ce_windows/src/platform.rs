@@ -292,6 +292,14 @@ impl WindowsPlatform {
         self.inner.window_from_hwnd(hwnd)
     }
 
+    fn window_from_handle(&self, handle: AnyWindowHandle) -> Option<Rc<WindowsWindowInner>> {
+        self.raw_window_handles
+            .read()
+            .iter()
+            .filter_map(|hwnd| window_from_hwnd(hwnd.as_raw()))
+            .find(|window| window.handle == handle)
+    }
+
     #[inline]
     fn post_message(&self, message: u32, wparam: WPARAM, lparam: LPARAM) {
         self.raw_window_handles
@@ -525,7 +533,6 @@ fn encode_restart_arguments(arguments: &[OsString]) -> OsString {
         encoded.extend(std::iter::repeat_n(b'\\' as u16, backslash_count * 2));
         encoded.push(b'"' as u16);
     }
-
     OsString::from_wide(&encoded)
 }
 
@@ -750,7 +757,15 @@ impl Platform for WindowsPlatform {
         if !self.is_windowed() {
             return Err(anyhow!("cannot open windows while headless"));
         }
-        let window = WindowsWindow::new(handle, options, self.generate_creation_info())?;
+        let popup_owner = match &options.kind {
+            WindowKind::AnchoredPopup(popup) => Some(
+                self.window_from_handle(popup.parent)
+                    .context("an anchored popup's parent window is not open")?,
+            ),
+            _ => None,
+        };
+        let window =
+            WindowsWindow::new(handle, options, self.generate_creation_info(), popup_owner)?;
         let handle = window.get_raw_handle();
         self.raw_window_handles.write().push(TrackedWindow {
             handle: handle.into(),

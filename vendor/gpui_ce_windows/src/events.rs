@@ -92,8 +92,18 @@ impl WindowsWindowInner {
             // whichever window was active before the click. If that handler consumes the
             // press, `DefWindowProc` never sees it, so the window is never activated at all.
             // So, let's eagerly activate the window.
-            WM_MOUSEACTIVATE => Some(MA_ACTIVATE as isize),
-            WM_ACTIVATE => self.handle_activate_msg(wparam),
+            //
+            // An anchored popup opened without focus — a scrim — must not take activation from
+            // the popup that has it, but still gets the click.
+            WM_MOUSEACTIVATE => Some(
+                if self.popup.as_ref().is_some_and(|popup| !popup.takes_focus) {
+                    MA_NOACTIVATE
+                } else {
+                    MA_ACTIVATE
+                } as isize,
+            ),
+            WM_ACTIVATE => self.handle_activate_msg(wparam, lparam),
+            WM_NCACTIVATE => self.handle_nc_activate_msg(handle, wparam, lparam),
             WM_CREATE => self.handle_create_msg(handle),
             WM_MOVE => self.handle_move_msg(handle, lparam),
             WM_SIZE => self.handle_size_msg(wparam, lparam),
@@ -176,6 +186,7 @@ impl WindowsWindowInner {
             self.state.scale_factor.get(),
         );
         self.state.origin.set(origin);
+        self.move_owned_popups();
         let size = self.state.logical_size.get();
         let center_x = origin.x.as_f32() + size.width.as_f32() / 2.;
         let center_y = origin.y.as_f32() + size.height.as_f32() / 2.;
@@ -331,6 +342,7 @@ impl WindowsWindowInner {
 
     fn handle_destroy_msg(&self, handle: HWND) -> Option<isize> {
         let callback = { self.state.callbacks.close.take() };
+        self.detach_from_owner();
         // Re-enable parent window if this was a modal dialog
         if let Some(parent_hwnd) = self.parent_hwnd {
             unsafe {
@@ -789,8 +801,39 @@ impl WindowsWindowInner {
         }
     }
 
-    fn handle_activate_msg(self: &Rc<Self>, wparam: WPARAM) -> Option<isize> {
+    /// A window keeps its active caption while one of its own popups has the keyboard, the way
+    /// it does under a menu.
+    fn handle_nc_activate_msg(
+        &self,
+        handle: HWND,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Option<isize> {
+        let deactivating = wparam.0 == 0;
+        let to = HWND(lparam.0 as *mut _);
+        if deactivating && !to.is_invalid() && self.owns_popup(to) {
+            let result = unsafe { DefWindowProcW(handle, WM_NCACTIVATE, WPARAM(1), lparam) };
+            return Some(result.0);
+        }
+        None
+    }
+
+    fn handle_activate_msg(self: &Rc<Self>, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
         let activated = wparam.loword() > 0;
+
+        // A popup giving up the keyboard to anything but its owner or the owner's other popups
+        // — another application, another window — takes the owner's active caption with it,
+        // since the owner was never told it lost activation.
+        if !activated && let Some(owner) = self.popup_owner() {
+            let to = HWND(lparam.0 as *mut _);
+            let staying =
+                to == owner || window_from_hwnd(owner).is_some_and(|owner| owner.owns_popup(to));
+            if !staying {
+                unsafe {
+                    SendMessageW(owner, WM_NCACTIVATE, Some(WPARAM(0)), Some(LPARAM(0)));
+                }
+            }
+        }
 
         let events = self
             .state
@@ -826,11 +869,14 @@ impl WindowsWindowInner {
             }
         }
 
+        // Evaluated once Windows has finished moving activation, from where it ended up, so
+        // the keyboard passing between a window and its own popups is no change at all. A
+        // popup's change is its owner's too.
         self.executor
             .spawn(async move {
-                if let Some(mut func) = this.state.callbacks.active_status_change.take() {
-                    func(activated);
-                    this.state.callbacks.active_status_change.set(Some(func));
+                this.report_activation();
+                if let Some(owner) = this.popup_owner().and_then(|owner| window_from_hwnd(owner)) {
+                    owner.report_activation();
                 }
             })
             .detach();
@@ -934,6 +980,10 @@ impl WindowsWindowInner {
                 .log_err();
             }
         }
+        // The suggested rect keeps a window's place in proportion, not a popup's anchor, and
+        // the owner may not have moved, so nothing else would place them again.
+        self.follow_anchor();
+        self.move_owned_popups();
 
         Some(0)
     }
