@@ -195,7 +195,7 @@ fn baseline_fuzzy_score(query: &str, candidate: &str) -> Option<i32> {
 
 /// Commands matching a query, best first. Ties keep their original order,
 /// so a host's own ranking survives where the score cannot separate two.
-fn baseline_fuzzy_filter(query: &str, commands: &[Command]) -> Vec<Command> {
+pub(crate) fn baseline_fuzzy_filter(query: &str, commands: &[Command]) -> Vec<Command> {
     let mut scored: Vec<(i32, usize, Command)> = commands
         .iter()
         .enumerate()

@@ -53,7 +53,7 @@
 use std::rc::Rc;
 
 use std::cell::Cell;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gpui::popup::{PopupAnchor, PopupConstraintAdjustment, PopupGravity, PopupOptions};
 use gpui::{
@@ -66,7 +66,7 @@ use crate::controls::WidgetContext;
 use crate::easing::{ease_out_cubic, progress};
 use crate::lighting;
 use crate::overlay::{
-    self, Activate, Command, PALETTE_WIDTH, fuzzy_filter, palette_fill, palette_panel,
+    self, Activate, Command, PALETTE_WIDTH, command_results, palette_fill, palette_panel,
     palette_panel_height,
 };
 use crate::state::{COMBO_REVEAL, ComboId, ControlHost, ControlState};
@@ -183,6 +183,8 @@ pub fn open_command_bar<V: ControlHost>(
     let return_focus = window.focused(cx);
     let viewport = window.viewport_size();
     let width = bar_width(viewport);
+    let time_scale = this.control_state().time_scale();
+    let reveal_duration = this.control_state().scaled(COMBO_REVEAL);
     let display_id = window.display(cx).map(|display| display.id());
     // Opened before the bar so it is ordered under it. It never takes the
     // keyboard, so a press on it leaves the bar active long enough to hear
@@ -201,7 +203,7 @@ pub fn open_command_bar<V: ControlHost>(
                 false,
                 display_id,
             ),
-            |_, cx| cx.new(|_| Scrim::new(palette, slot)),
+            |_, cx| cx.new(|_| Scrim::new(palette, slot, reveal_duration)),
         )?)
     } else {
         None
@@ -265,7 +267,17 @@ pub fn open_command_bar<V: ControlHost>(
         display_id,
     );
     let bar = match cx.open_window(bar_options, |bar_window, cx| {
-        cx.new(|cx| CommandBarWindow::new(id, commands, palette, finish.clone(), bar_window, cx))
+        cx.new(|cx| {
+            CommandBarWindow::new(
+                id,
+                commands,
+                palette,
+                finish.clone(),
+                time_scale,
+                bar_window,
+                cx,
+            )
+        })
     }) {
         Ok(bar) => bar,
         Err(error) => {
@@ -348,14 +360,20 @@ fn popup_window(
 struct Scrim {
     palette: Palette,
     opened_at: Instant,
+    reveal_duration: Duration,
     bar: Rc<Cell<Option<WindowHandle<CommandBarWindow>>>>,
 }
 
 impl Scrim {
-    fn new(palette: Palette, bar: Rc<Cell<Option<WindowHandle<CommandBarWindow>>>>) -> Self {
+    fn new(
+        palette: Palette,
+        bar: Rc<Cell<Option<WindowHandle<CommandBarWindow>>>>,
+        reveal_duration: Duration,
+    ) -> Self {
         Self {
             palette,
             opened_at: Instant::now(),
+            reveal_duration,
             bar,
         }
     }
@@ -363,8 +381,7 @@ impl Scrim {
 
 impl Render for Scrim {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let duration = ControlState::default().scaled(COMBO_REVEAL);
-        let reveal = ease_out_cubic(progress(self.opened_at, duration));
+        let reveal = ease_out_cubic(progress(self.opened_at, self.reveal_duration));
         if reveal < 1.0 {
             window.request_animation_frame();
         }
@@ -416,6 +433,7 @@ pub fn set_command_bar_commands<V: ControlHost>(
     if let Some(bar) = command_bar(this.control_state(), id) {
         let _ = bar.update(cx, |bar, _, cx| {
             bar.commands = commands;
+            bar.matches.invalidate();
             cx.notify();
         });
     }
@@ -440,12 +458,39 @@ fn forget(state: &mut ControlState, id: ComboId) {
 
 type Finish = Rc<dyn Fn(CommandBarOutcome, &mut App)>;
 
+// Matching depends on the query and the private command list, not on animation
+// frames or window bounds. Share the cached rows while render updates the host.
+#[derive(Default)]
+struct CommandMatches {
+    query: Option<SharedString>,
+    rows: Rc<[overlay::SearchResult]>,
+}
+
+impl CommandMatches {
+    fn results(
+        &mut self,
+        query: &SharedString,
+        commands: &[Command],
+    ) -> Rc<[overlay::SearchResult]> {
+        if self.query.as_ref() != Some(query) {
+            self.rows = command_results(query, commands).into();
+            self.query = Some(query.clone());
+        }
+        self.rows.clone()
+    }
+
+    fn invalidate(&mut self) {
+        self.query = None;
+    }
+}
+
 /// The root view of a command bar's window: the palette panel, filling it.
 pub struct CommandBarWindow {
     id: ComboId,
     controls: ControlState,
     query: Entity<TextInput>,
     commands: Vec<Command>,
+    matches: CommandMatches,
     palette: Palette,
     width: f32,
     finish: Finish,
@@ -472,6 +517,7 @@ impl CommandBarWindow {
         commands: Vec<Command>,
         palette: Palette,
         finish: Finish,
+        time_scale: Option<f32>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -484,6 +530,9 @@ impl CommandBarWindow {
             )
         });
         let mut controls = ControlState::default();
+        if let Some(scale) = time_scale {
+            controls.set_time_scale(scale);
+        }
         // The in-window palette's own open: the highlight on the first row,
         // the list at its top, the keyboard in the field.
         controls.open_palette(id, &query, window, cx);
@@ -512,6 +561,7 @@ impl CommandBarWindow {
             controls,
             query,
             commands,
+            matches: CommandMatches::default(),
             palette,
             width: f32::from(window.viewport_size().width),
             finish,
@@ -536,11 +586,8 @@ impl Render for CommandBarWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let id = self.id;
         let palette = self.palette;
-        let text = self.query.read(cx).text();
-        let matches: Vec<_> = fuzzy_filter(&text, &self.commands)
-            .iter()
-            .map(overlay::command_result)
-            .collect();
+        let text = self.query.read(cx).shared_text();
+        let matches = self.matches.results(&text, &self.commands);
         let on_activate: Activate<Self> = Rc::new(move |bar, picked, window, cx| {
             bar.end(CommandBarOutcome::Chosen(picked), window, cx);
         });
@@ -614,6 +661,46 @@ impl Render for CommandBarWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unchanged_queries_reuse_rows_and_command_changes_invalidate_them() {
+        let mut matches = CommandMatches::default();
+        let commands = [
+            Command::new("open", "Open file"),
+            Command::new("save", "Save file"),
+        ];
+        let first = matches.results(&"file".into(), &commands);
+        let repeated = matches.results(&"file".into(), &commands);
+        assert!(Rc::ptr_eq(&first, &repeated));
+        let changed = matches.results(&"save".into(), &commands);
+        assert!(!Rc::ptr_eq(&first, &changed));
+        assert_eq!(changed[0].id.as_ref(), "save");
+        matches.invalidate();
+        let replaced = matches.results(&"save".into(), &[Command::new("new", "Save all")]);
+        assert_eq!(replaced[0].id.as_ref(), "new");
+        assert!(!Rc::ptr_eq(&changed, &replaced));
+    }
+
+    #[test]
+    #[ignore = "timing benchmark; run explicitly without concurrent tests"]
+    fn command_bar_cache_benchmark() {
+        use crate::menu::ownership_bench::measure;
+        use std::hint::black_box;
+        let commands: Vec<_> = (0..1000)
+            .map(|index| Command::new(format!("command-{index}"), format!("Open settings {index}")))
+            .collect();
+        for query in ["", "ops"] {
+            let query = SharedString::from(query);
+            let mut cache = CommandMatches::default();
+            cache.results(&query, &commands);
+            measure(&format!("unchanged_query_{query:?}_before"), || {
+                black_box(command_results(black_box(&query), black_box(&commands)));
+            });
+            measure(&format!("unchanged_query_{query:?}_after"), || {
+                black_box(cache.results(black_box(&query), black_box(&commands)));
+            });
+        }
+    }
 
     #[test]
     fn the_bar_sits_where_the_in_window_palette_does() {

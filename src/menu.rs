@@ -109,7 +109,7 @@ pub struct MenuAction<I = ComboId> {
     /// Right-aligned accelerator text, if the action has one.
     pub shortcut: Option<SharedString>,
     pub enabled: bool,
-    /// Draws a tick in the gutter, for a menu that toggles something.
+    /// Draws a trailing tick, for a menu that toggles something.
     pub checked: bool,
     /// Destructive: tinted, and always last in its group.
     pub danger: bool,
@@ -232,7 +232,7 @@ impl<I> MenuItem<I> {
     }
 
     /// Whether any row of `items` has an icon, so every label of the level
-    /// lines up after the icon column.
+    /// lines up before the trailing icon column.
     pub fn any_icon(items: &[MenuItem<I>]) -> bool {
         items.iter().any(|item| item.icon_of().is_some())
     }
@@ -1377,6 +1377,37 @@ mod tests {
     };
     use crate::ControlState;
     use crate::keyboard::Key;
+
+    #[test]
+    fn keyboard_snapshot_owns_typed_ids_without_retaining_icons_or_subtrees() {
+        let token = std::rc::Rc::new(());
+        let weak = std::rc::Rc::downgrade(&token);
+        let icon = MenuIcon::new(move |_, _| {
+            let _ = &token;
+            gpui::IntoElement::into_any_element(gpui::Empty)
+        });
+        let items = vec![
+            MenuItem::action(String::from("disabled"), "Disabled").disabled(),
+            MenuItem::action(String::from("open"), "Open").icon(icon),
+            MenuItem::submenu(
+                "More",
+                vec![MenuItem::action(String::from("nested"), "Nested")],
+            ),
+        ];
+        let reachable = reachable_indices(&items);
+        let commands = menu_commands(&items, &reachable);
+        drop(items);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(
+            menu_command(Key::Activate, Some(0), &commands),
+            Some(MenuCommand::Run(String::from("open")))
+        );
+        assert_eq!(menu_command(Key::Right, Some(0), &commands), None);
+        assert!(matches!(
+            menu_command(Key::Right, Some(1), &commands),
+            Some(MenuCommand::Enter { row: 2, at: 1, .. })
+        ));
+    }
 
     #[test]
     fn highlighted_menu_text_and_marks_use_the_fills_label_role() {

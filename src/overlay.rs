@@ -267,7 +267,7 @@ impl SearchResult {
 }
 
 /// A command as a result row, so commands and results share one drawing.
-pub(crate) fn command_result(command: &Command) -> SearchResult {
+fn command_result(command: &Command) -> SearchResult {
     SearchResult {
         id: command.id.clone(),
         label: command.label.clone(),
@@ -333,23 +333,46 @@ fn fuzzy_score_normalized(query: &str, candidate: &str) -> Option<i32> {
 /// Commands matching a query, best first. Ties keep their original order,
 /// so a host's own ranking survives where the score cannot separate two.
 pub fn fuzzy_filter(query: &str, commands: &[Command]) -> Vec<Command> {
-    if query.chars().all(char::is_whitespace) {
-        return commands.to_vec();
-    }
-    let query = query.to_lowercase();
-    let mut scored: Vec<(i32, usize, Command)> = commands
+    matching_commands(query, commands)
+        .map(Clone::clone)
+        .collect()
+}
+
+// Keep filtering borrowed until the caller chooses its final representation:
+// the command bar needs SearchResults, not an intermediate owned command list.
+fn matching_commands<'a>(
+    query: &str,
+    commands: &'a [Command],
+) -> impl Iterator<Item = &'a Command> {
+    let empty = query.chars().all(char::is_whitespace);
+    let mut scored: Vec<(i32, usize, &Command)> = if empty {
+        Vec::new()
+    } else {
+        let query = query.to_lowercase();
+        commands
+            .iter()
+            .enumerate()
+            .filter_map(|(index, command)| {
+                let haystack = match &command.group {
+                    Some(group) => Cow::Owned(format!("{group} {}", command.label)),
+                    None => Cow::Borrowed(command.label.as_ref()),
+                };
+                fuzzy_score_normalized(&query, &haystack).map(|score| (score, index, command))
+            })
+            .collect()
+    };
+    // The original index makes this ordering total while preserving ties.
+    scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let original = if empty { commands } else { &[] };
+    original
         .iter()
-        .enumerate()
-        .filter_map(|(index, command)| {
-            let haystack = match &command.group {
-                Some(group) => Cow::Owned(format!("{group} {}", command.label)),
-                None => Cow::Borrowed(command.label.as_ref()),
-            };
-            fuzzy_score_normalized(&query, &haystack).map(|score| (score, index, command.clone()))
-        })
-        .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    scored.into_iter().map(|(_, _, command)| command).collect()
+        .chain(scored.into_iter().map(|(_, _, command)| command))
+}
+
+pub(crate) fn command_results(query: &str, commands: &[Command]) -> Vec<SearchResult> {
+    matching_commands(query, commands)
+        .map(command_result)
+        .collect()
 }
 
 /// Results matching a query, best first within each section, for a host
@@ -365,27 +388,41 @@ pub fn fuzzy_filter(query: &str, commands: &[Command]) -> Vec<Command> {
 /// empty query keeps source order within each section and puts sections in
 /// their first-seen order.
 pub fn rank_results(query: &str, results: &[SearchResult]) -> Vec<SearchResult> {
+    let empty = query.chars().all(char::is_whitespace);
+    let query = query.to_lowercase();
     // Scored on the label alone: it is what the person reads and
     // abbreviates, and the score's length penalty would otherwise let a
     // long detail line push a result down. A result that matches only
     // through its detail or section still qualifies, after every result
     // whose label matched, in the order it came.
-    let rank = |result: &SearchResult| -> Option<Option<i32>> {
-        if let Some(score) = fuzzy_score(query, &result.label) {
+    let mut searchable = String::new();
+    let mut rank = |result: &SearchResult| -> Option<Option<i32>> {
+        if let Some(score) = fuzzy_score_normalized(&query, &result.label) {
             return Some(Some(score));
         }
-        let mut text = result.label.to_string();
-        for part in [&result.detail, &result.section].into_iter().flatten() {
-            text.push(' ');
-            text.push_str(part);
+        if result.detail.is_none() && result.section.is_none() {
+            return None;
         }
-        fuzzy_score(query, &text).map(|_| None)
+        let capacity = result.label.len()
+            + [&result.detail, &result.section]
+                .into_iter()
+                .flatten()
+                .map(|part| part.len() + 1)
+                .sum::<usize>();
+        searchable.clear();
+        searchable.reserve(capacity);
+        searchable.push_str(&result.label);
+        for part in [&result.detail, &result.section].into_iter().flatten() {
+            searchable.push(' ');
+            searchable.push_str(part);
+        }
+        fuzzy_score_normalized(&query, &searchable).map(|_| None)
     };
     type Run<'a> = Vec<(Option<i32>, &'a SearchResult)>;
     let mut sections: Vec<(Option<&str>, Run)> = Vec::new();
     let mut positions: HashMap<Option<&str>, usize> = HashMap::new();
     for result in results {
-        let Some(rank) = rank(result) else {
+        let Some(rank) = (if empty { Some(Some(0)) } else { rank(result) }) else {
             continue;
         };
         let section = result.section.as_deref();
@@ -396,11 +433,14 @@ pub fn rank_results(query: &str, results: &[SearchResult]) -> Vec<SearchResult> 
         });
         sections[index].1.push((rank, result));
     }
-    // Stable sorts, so ties keep the order the sources were assembled in.
-    for (_, run) in &mut sections {
-        run.sort_by_key(|(rank, _)| std::cmp::Reverse(*rank));
+    // Empty queries already have source order. Stable sorts keep that order
+    // for ties when a nonempty query actually needs ranking.
+    if !empty {
+        for (_, run) in &mut sections {
+            run.sort_by_key(|(rank, _)| std::cmp::Reverse(*rank));
+        }
+        sections.sort_by_key(|(_, run)| std::cmp::Reverse(run[0].0));
     }
-    sections.sort_by_key(|(_, run)| std::cmp::Reverse(run[0].0));
     sections
         .into_iter()
         .flat_map(|(_, run)| run)
@@ -1316,10 +1356,7 @@ pub fn command_palette<V: ControlHost>(
 ) -> Option<impl IntoElement> {
     let opened_at = palette_opened_at(ctx.view.control_state(), id)?;
     let text = query.read(ctx.cx).shared_text();
-    let matches: Vec<SearchResult> = fuzzy_filter(&text, commands)
-        .iter()
-        .map(command_result)
-        .collect();
+    let matches = command_results(&text, commands);
     let on_activate = closing_palette(on_activate);
     let list = result_list(
         id,
@@ -1909,3 +1946,7 @@ mod tests {
 #[cfg(test)]
 #[path = "emphasis_bench.rs"]
 mod emphasis_bench;
+
+#[cfg(test)]
+#[path = "search_bench.rs"]
+mod search_bench;

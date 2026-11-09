@@ -88,3 +88,60 @@ The same M1 Pro, compiler settings, allocator counter, warmup, and nine-sample p
 A failed abbreviation is a tradeoff: the temporary vector count is lower, but its speculative byte ranges are larger than the old character indices, so this fixture requests 32 extra bytes with the same allocation count. Its small timing difference should not be treated as a reliable speedup. Successful matches and membership construction show clearer improvements. These remain microbenchmarks, not application frame timings.
 
 Follow-up verification: 167 tests pass, strict Clippy and formatting pass, and the gallery builds. Search highlighting was checked in both schemes, tree keyboard navigation was exercised, and captures were inspected in `target/cheatsheet-review/`. Selection retention is covered by its existing filtering/re-homing test. The raw benchmark output is `target/cheatsheet-review/benchmarks.txt`.
+
+## Rebased PR and GPUI-CE 0.3.0
+
+The cleanup was rebased onto PR #7 at `c6b466bf8a99f6bbd052ada777c691393152089e`. Measurements below supersede the earlier GPUI-CE 0.2.2 timings for this PR. All pairs use the same GPUI-CE 0.3.0 dependencies and the same optimized-Vampir/development-dependency protocol; no builds or gallery were running during timing. Allocation counts include reallocations and bytes are cumulative requested bytes, not retained or peak memory. The full measurements are also in `docs/ownership-benchmarks-gpui-0.3.json`.
+
+The existing menu/filter/highlighting baselines retain the old algorithms, which were also present at the PR head; the new ranked-result baseline is copied from that PR head. Command-result cases include converting matches to the final `SearchResult` representation. Ranked-result fixtures alternate four sections and include detail text, testing both label matches and metadata fallback. Each unchanged-query cache case compares rebuilding the final command results with looking up an already-warm cache of 1,000 commands using the same query; it isolates skipped matching work and is not a whole-frame speedup. Cache invalidation after a changed query or replacement command list is tested.
+
+Reproduce all four opt-in benchmark suites:
+
+```bash
+cargo test --lib --features command-bar-window benchmark --config 'profile.dev.package.vampir.opt-level=3' -- --ignored --nocapture --test-threads=1
+```
+
+The ranked-result suite was repeated after eliminating the empty-query sorting pass:
+
+```bash
+cargo test --lib --features command-bar-window pr_search_benchmark --config 'profile.dev.package.vampir.opt-level=3' -- --ignored --nocapture
+```
+
+| Case | Before median (µs) | After median (µs) | Allocations | Requested bytes |
+|---|---:|---:|---:|---:|
+| `unchanged_query_""` | 12.2164 | 0.0105 | 1 → 0 | 160,000 → 0 |
+| `unchanged_query_"ops"` | 76.1341 | 0.0106 | 1,011 → 0 | 225,949 → 0 |
+| `menu_flat_16` | 0.8280 | 0.2058 | 6 → 5 | 3,168 → 864 |
+| `menu_nested_56` | 1.5653 | 0.3445 | 17 → 4 | 10,016 → 416 |
+| `search_100_""` | 14.1775 | 1.4927 | 208 → 1 | 58,073 → 9,600 |
+| `search_100_"ops"` | 25.7718 | 18.5374 | 408 → 258 | 61,263 → 21,691 |
+| `search_100_"zzzz"` | 21.9223 | 18.4246 | 400 → 251 | 7,635 → 6,044 |
+| `search_1000_""` | 137.6068 | 16.3415 | 2,011 → 1 | 499,497 → 96,000 |
+| `search_1000_"ops"` | 284.4147 | 203.9311 | 4,011 → 2,511 | 532,387 → 206,449 |
+| `search_1000_"zzzz"` | 235.5818 | 199.7413 | 4,000 → 2,501 | 77,835 → 61,394 |
+| `styled_label` | 0.2784 | 0.0446 | 3 → 1 | 288 → 160 |
+| `step_callback` | 0.0501 | 0.0283 | 2 → 1 | 40 → 24 |
+| `highlight_empty` | 0.1651 | 0.0036 | 3 → 0 | 672 → 0 |
+| `highlight_whole` | 0.5260 | 0.3775 | 9 → 6 | 1,032 → 784 |
+| `highlight_fuzzy` | 0.5777 | 0.4915 | 7 → 5 | 848 → 752 |
+| `highlight_failed` | 0.5369 | 0.5363 | 5 → 5 | 720 → 752 |
+| `highlight_overlap` | 0.5180 | 0.3157 | 10 → 6 | 792 → 544 |
+| `highlight_unicode` | 0.5271 | 0.3867 | 9 → 6 | 752 → 656 |
+| `highlight_detail` | 0.3868 | 0.2939 | 7 → 5 | 1,176 → 1,088 |
+| `visible_membership` | 42.6961 | 23.3185 | 1 → 1 | 51,208 → 18,440 |
+| `command_results_100_""` | 17.6083 | 1.6392 | 209 → 1 | 74,073 → 16,000 |
+| `ranked_results_100_""` | 8.2913 | 7.9073 | 22 → 22 | 32,316 → 32,316 |
+| `command_results_100_"ops"` | 29.0813 | 19.1242 | 409 → 258 | 77,263 → 28,091 |
+| `ranked_results_100_"ops"` | 18.1171 | 14.8748 | 222 → 123 | 35,006 → 34,709 |
+| `command_results_100_"zzzz"` | 22.5430 | 18.3696 | 400 → 251 | 7,635 → 6,044 |
+| `ranked_results_100_"zzzz"` | 47.4239 | 32.1367 | 700 → 203 | 25,610 → 8,252 |
+| `command_results_1000_""` | 163.7004 | 18.5427 | 2,012 → 1 | 659,497 → 160,000 |
+| `ranked_results_1000_""` | 74.1197 | 70.5881 | 34 → 34 | 312,988 → 312,988 |
+| `command_results_1000_"ops"` | 297.0309 | 193.3979 | 4,012 → 2,511 | 692,387 → 270,449 |
+| `ranked_results_1000_"ops"` | 165.5926 | 134.6746 | 2,034 → 1,035 | 340,878 → 337,881 |
+| `command_results_1000_"zzzz"` | 225.6826 | 190.3403 | 4,000 → 2,501 | 77,835 → 61,394 |
+| `ranked_results_1000_"zzzz"` | 477.3808 | 321.3489 | 7,000 → 2,003 | 265,010 → 82,952 |
+
+The flat-menu baseline had substantial scheduler noise (minimum 0.5277 µs, maximum 13.7824 µs); do not treat its median as a precise speedup. The JSON includes every sample range. Failed highlight matches still carry the previously documented 32-byte temporary-buffer tradeoff. The native-view placement cache and platform cleanup are not timed by these microbenchmarks.
+
+Additional best-practice changes in this update: borrowed matching until final result materialization; one normalized query and a reusable metadata buffer in ranked search; stable tie behavior with an allocation-free sort of uniquely indexed command scores; bounded native-command-bar caching with explicit invalidation; fewer native positioning/show calls when bounds/DPI/viewport are unchanged; native-view ownership and cleanup on all three backends; an interruptible X11 worker whose lifetime ends with its owner; fallible thread startup; narrower example/helper visibility; and a stored reveal duration instead of constructing `ControlState` every scrim frame. The command bar now inherits the host's slow-motion scale. Public toolkit signatures are preserved, apart from the additive `TextInput::shared_text()` accessor. No dependencies or vendored backend changes were added.
