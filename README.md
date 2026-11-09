@@ -26,13 +26,13 @@ Vampir builds on [gpui-ce](https://github.com/gpui-ce/gpui-ce), the community ed
 ```toml
 [dependencies]
 vampir = "0.2"
-gpui = { package = "gpui-ce", version = "0.2" }
+gpui = { package = "gpui-ce", version = "0.3" }
 ```
 
 Renaming the package to `gpui` lets your code, Vampir's and every GPUI example read the same way. The window and event loop live in the platform crate, which an application adds too:
 
 ```toml
-gpui_ce_platform = { version = "0.1", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
+gpui_ce_platform = { version = "0.3", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
 ```
 
 `runtime_shaders` builds the Metal shaders when the app starts, so a Mac with only the command line tools can run it; `wayland` and `x11` are the Linux backends and are harmless elsewhere.

@@ -1,6 +1,10 @@
 # Local changes to the vendored GPUI-CE
 
-Two changes. The first, in four crates: `WindowKind::AnchoredPopup`, which GPUI-CE 0.2.2 already defines and only its Wayland backend implements, now works on macOS, Windows and X11. The toolkit's command bar (`src/command_bar.rs`) is a popup of this kind: a window owned by the host's, above it and no other application's, over a live native view the toolkit cannot draw over from inside the host window. The second, in the Windows backend only: a native child window a host embeds shows, paints and gets its keys ([below](#native-child-windows-on-windows)).
+Three changes to GPUI-CE 0.3.0.
+
+- **Anchored popups**, in four crates: `WindowKind::AnchoredPopup`, which GPUI-CE defines and only its Wayland backend implements, works on macOS, Windows and X11. The toolkit's command bar (`src/command_bar.rs`) is a popup of this kind: a window owned by the host's, above it and no other application's, over a live native view the toolkit cannot draw over from inside the host window.
+- **Native child windows on Windows**: a native child window a host embeds shows and paints ([below](#native-child-windows-on-windows)).
+- **The macOS launch callback runs without the platform's lock.** 0.3.0 calls it inside `if let Some(callback) = platform.0.lock().finish_launching.take()`, and under the 2024 edition that guard lives to the end of the block, so the first thing a launch does through the platform — open a window, set the menus — waits on the lock forever. gpui-ce's main branch already takes the callback out first.
 
 Each commit touching `vendor/` after the one that adds it is one of these, and says what it does in full.
 
@@ -27,16 +31,16 @@ Each commit touching `vendor/` after the one that adds it is one of these, and s
 
 ## Native child windows on Windows
 
-The command bar exists for a host window that embeds a live native view, and on Windows GPUI-CE 0.2.2 could not show one at all. Three changes to `gpui_ce_windows` make a host's child `HWND` behave as a native view does over a GPUI window on macOS and X11:
+The command bar exists for a host window that embeds a live native view, and on Windows GPUI-CE could not show one at all. Two changes to `gpui_ce_windows` make a host's child `HWND` behave as a native view does over a GPUI window on macOS and X11:
 
 - **Composited under its children.** The DirectComposition target is created with `topmost: false`, so GPUI's swap chain is drawn behind the window's child windows rather than over them. A window without children looks the same.
 - **`WS_CLIPCHILDREN`.** Each frame ends with `ValidateRect` on the whole client area; without this style that also validated a child's area, so the child never received `WM_PAINT`.
-- **Keys go to the window that has them.** The message loop sent every `WM_KEYDOWN` to its window as GPUI's private `WM_GPUI_KEYDOWN` and treated a result of 0 as handled. A foreign child answers with `DefWindowProc`'s 0, so it never saw a key. Only GPUI's own windows (by class name) get the private message now. GPUI's shortcuts do not fire while a native child has the keyboard, as they do not for any other Win32 control that has it.
+A third, in 0.2.2, sent GPUI's private key-down message only to GPUI's own windows, since a foreign child answered it with `DefWindowProc`'s 0, which read as handled. 0.3.0 does that itself. GPUI's shortcuts do not fire while a native child has the keyboard, as they do not for any other Win32 control that has it.
 
 GPUI's window is `WS_EX_NOREDIRECTIONBITMAP`, so a plain child window has no surface for the desktop compositor to show: the child has to be layered (`WS_EX_LAYERED`, Windows 8 and later), as the gallery's `EDIT` control is. A web view or video player that renders through DirectComposition itself needs nothing.
 
 ## What has been run where
 
-- **macOS:** on screen, in the gallery's Native view page, over an `NSTextView` and a spinning `NSProgressIndicator`: opening, typing, choosing, Escape, a click on the parent, a click on the scrim, and the parent keeping its active title bar.
-- **Windows:** on screen on Windows 11 (x86_64-pc-windows-gnu; scale 1.0, and the bar's placement, size, choosing and typing at 2.0, and through a live change of the display from 2.0 to 1.0 with the window open), in the gallery's Native view page, over a layered `EDIT` control: opening, typing, choosing, Escape, a click on the parent, a click on the native view, another application coming forward, the scrim and a click on it, moving and resizing the parent with the bar open, minimising it, and the parent keeping its active caption. Not yet run across monitors of different DPIs.
-- **X11:** type-checked and linted from macOS (`tools/check-linux.sh`, with `clippy` as its first argument for the lints: zig stands in for the C compiler, nothing is linked), and built and tested by CI. Not yet run on screen. `tools/check-windows.sh` does the same for Windows.
+- **macOS, 0.3.0:** on screen, in the gallery's Native view page, over an `NSTextView` and a spinning `NSProgressIndicator`: opening, typing, choosing, Escape (the caret back in the text view), a click on the parent, the scrim and a click on it, and the parent keeping its active title bar, in both schemes.
+- **Windows, 0.2.2:** on screen on Windows 11 (x86_64-pc-windows-gnu; scale 1.0, and the bar's placement, size, choosing and typing at 2.0, and through a live change of the display from 2.0 to 1.0 with the window open), in the gallery's Native view page, over a layered `EDIT` control: opening, typing, choosing, Escape, a click on the parent, a click on the native view, another application coming forward, the scrim and a click on it, moving and resizing the parent with the bar open, minimising it, and the parent keeping its active caption. Not yet across monitors of different DPIs.
+- **Windows, 0.3.0, and X11:** type-checked and linted from macOS, and built and tested by CI. Not yet run on screen. `tools/check-windows.sh` and `tools/check-linux.sh` run the check, or the lints with `clippy` as the first argument: zig stands in for the C and resource compilers, the Windows renderer's shaders are allowed to be missing, and nothing is linked.
