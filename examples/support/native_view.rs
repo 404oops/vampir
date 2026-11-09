@@ -44,6 +44,8 @@ mod imp {
     pub struct View {
         container: Retained<NSView>,
         content: Retained<NSView>,
+        /// GPUI's own view, which takes the keyboard back when this hides.
+        gpui_view: Retained<NSView>,
     }
 
     impl View {
@@ -57,6 +59,7 @@ mod imp {
             // SAFETY: GPUI hands out its own live NSView, on the main thread.
             let gpui_view: &NSView = unsafe { handle.ns_view.cast().as_ref() };
             let content = gpui_view.window()?.contentView()?;
+            let gpui_view: Retained<NSView> = gpui_view.into();
             let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(10.0, 10.0));
             let container = NSView::initWithFrame(NSView::alloc(mtm), frame);
             container.setHidden(true);
@@ -93,7 +96,11 @@ mod imp {
             container.addSubview(&spinner);
 
             content.addSubview_positioned_relativeTo(&container, NSWindowOrderingMode::Above, None);
-            let view = View { container, content };
+            let view = View {
+                container,
+                content,
+                gpui_view,
+            };
             view.layout_children(NSSize::new(10.0, 10.0));
             Some(view)
         }
@@ -116,6 +123,15 @@ mod imp {
 
         pub fn place(&self, bounds: Option<Bounds<Pixels>>, _window: &Window) {
             let Some(bounds) = bounds else {
+                // A hidden first responder leaves the window answering keys
+                // itself, and GPUI never hears them: hand them back first.
+                if let Some(window) = self.container.window()
+                    && let Some(responder) = window.firstResponder()
+                    && let Ok(view) = responder.downcast::<NSView>()
+                    && view.isDescendantOf(&self.container)
+                {
+                    window.makeFirstResponder(Some(&self.gpui_view));
+                }
                 self.container.setHidden(true);
                 return;
             };
@@ -153,6 +169,7 @@ mod imp {
         CLEARTYPE_QUALITY, CreateFontW, DEFAULT_CHARSET, DeleteObject, FW_NORMAL, HFONT,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, ES_AUTOVSCROLL, ES_MULTILINE, LWA_ALPHA, SW_HIDE, SW_SHOWNA,
         SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetLayeredWindowAttributes, SetWindowPos,
@@ -163,6 +180,8 @@ mod imp {
 
     pub struct View {
         hwnd: HWND,
+        /// GPUI's window, which takes the keyboard back when this hides.
+        parent: HWND,
         /// The control's font and the scale it was made for. Without one an
         /// `EDIT` draws in the stock system font, which does not follow the
         /// monitor's scale: tiny at 200%.
@@ -260,6 +279,7 @@ mod imp {
             unsafe { SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA) }.ok()?;
             let view = View {
                 hwnd,
+                parent,
                 font: Cell::new(None),
             };
             view.match_font(window.scale_factor());
@@ -269,6 +289,11 @@ mod imp {
         pub fn place(&self, bounds: Option<Bounds<Pixels>>, window: &Window) {
             let Some(bounds) = bounds else {
                 unsafe {
+                    // A hidden window keeps the keyboard if it had it, and
+                    // every key would go to a control nobody can see.
+                    if GetFocus() == self.hwnd {
+                        let _ = SetFocus(Some(self.parent));
+                    }
                     let _ = ShowWindow(self.hwnd, SW_HIDE);
                 }
                 return;
