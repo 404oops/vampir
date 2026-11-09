@@ -303,6 +303,11 @@ impl TextInput {
         cx.notify();
     }
 
+    /// Shares the current text without copying its bytes.
+    pub fn shared_text(&self) -> SharedString {
+        self.content.clone()
+    }
+
     pub fn text(&self) -> String {
         self.content.to_string()
     }

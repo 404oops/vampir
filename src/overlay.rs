@@ -1,6 +1,7 @@
 //! Things that float above the view: tooltips and a command palette, and
 //! the search field with results that the palette is built from.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
@@ -288,13 +289,20 @@ pub fn fuzzy_score(query: &str, candidate: &str) -> Option<i32> {
     if query.chars().all(char::is_whitespace) {
         return Some(0);
     }
+    fuzzy_score_normalized(&query.to_lowercase(), candidate)
+}
+
+fn fuzzy_score_normalized(query: &str, candidate: &str) -> Option<i32> {
+    if query.chars().all(char::is_whitespace) {
+        return Some(0);
+    }
     let candidate_lower = candidate.to_lowercase();
     let mut haystack = candidate_lower.chars().enumerate();
     let mut score = 0i32;
     let mut last_index: Option<usize> = None;
     let mut previous = None;
 
-    for needle in query.to_lowercase().chars() {
+    for needle in query.chars() {
         if needle.is_whitespace() {
             continue;
         }
@@ -325,15 +333,19 @@ pub fn fuzzy_score(query: &str, candidate: &str) -> Option<i32> {
 /// Commands matching a query, best first. Ties keep their original order,
 /// so a host's own ranking survives where the score cannot separate two.
 pub fn fuzzy_filter(query: &str, commands: &[Command]) -> Vec<Command> {
+    if query.chars().all(char::is_whitespace) {
+        return commands.to_vec();
+    }
+    let query = query.to_lowercase();
     let mut scored: Vec<(i32, usize, Command)> = commands
         .iter()
         .enumerate()
         .filter_map(|(index, command)| {
             let haystack = match &command.group {
-                Some(group) => format!("{group} {}", command.label),
-                None => command.label.to_string(),
+                Some(group) => Cow::Owned(format!("{group} {}", command.label)),
+                None => Cow::Borrowed(command.label.as_ref()),
             };
-            fuzzy_score(query, &haystack).map(|score| (score, index, command.clone()))
+            fuzzy_score_normalized(&query, &haystack).map(|score| (score, index, command.clone()))
         })
         .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
@@ -412,57 +424,57 @@ enum Line {
 /// picks out "in" but not the middle of "morning", and scattered letters
 /// that happen to come in the right order are not a match at all.
 fn matched_ranges(text: &str, query: &str, line: Line) -> Vec<Range<usize>> {
+    if query.trim().is_empty() {
+        return Vec::new();
+    }
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     let same = |a: char, b: char| a.to_lowercase().eq(b.to_lowercase());
-    let mut ranges = Vec::new();
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    let byte_at = |index: usize| chars.get(index).map_or(text.len(), |ch| ch.0);
     for word in query.split_whitespace() {
         let needle: Vec<char> = word.chars().collect();
         let starts_word = |start: usize| start == 0 || !chars[start - 1].1.is_alphanumeric();
-        let whole = (0..=chars.len().saturating_sub(needle.len()))
-            .find(|&start| {
-                start + needle.len() <= chars.len()
-                    && (line == Line::Label || starts_word(start))
-                    && needle
-                        .iter()
-                        .enumerate()
-                        .all(|(offset, &ch)| same(chars[start + offset].1, ch))
-            })
-            .map(|start| (start..start + needle.len()).collect::<Vec<_>>());
-        let positions = whole.or_else(|| {
-            if line == Line::Detail {
-                return None;
-            }
-            let mut found = Vec::new();
+        let whole = (0..=chars.len().saturating_sub(needle.len())).find(|&start| {
+            start + needle.len() <= chars.len()
+                && (line == Line::Label || starts_word(start))
+                && needle
+                    .iter()
+                    .enumerate()
+                    .all(|(offset, &ch)| same(chars[start + offset].1, ch))
+        });
+        if let Some(start) = whole {
+            ranges.push(byte_at(start)..byte_at(start + needle.len()));
+        } else if line == Line::Label {
+            // A failed abbreviation must not leave its matched prefix highlighted.
+            let checkpoint = ranges.len();
             let mut from = 0;
             for &ch in &needle {
-                let index = (from..chars.len()).find(|&i| same(chars[i].1, ch))?;
-                found.push(index);
+                let Some(index) = (from..chars.len()).find(|&i| same(chars[i].1, ch)) else {
+                    ranges.truncate(checkpoint);
+                    break;
+                };
+                ranges.push(byte_at(index)..byte_at(index + 1));
                 from = index + 1;
             }
-            Some(found)
-        });
-        for index in positions.into_iter().flatten() {
-            let start = chars[index].0;
-            let end = chars.get(index + 1).map_or(text.len(), |next| next.0);
-            ranges.push(start..end);
         }
     }
-    ranges.sort_by_key(|range| range.start);
-    let mut merged: Vec<Range<usize>> = Vec::new();
-    for range in ranges {
-        if let Some(last) = merged.last_mut()
-            && range.start <= last.end
-        {
-            last.end = last.end.max(range.end);
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut merged = 0;
+    for index in 0..ranges.len() {
+        let range = ranges[index].clone();
+        if merged > 0 && range.start <= ranges[merged - 1].end {
+            ranges[merged - 1].end = ranges[merged - 1].end.max(range.end);
         } else {
-            merged.push(range);
+            ranges[merged] = range;
+            merged += 1;
         }
     }
-    merged
+    ranges.truncate(merged);
+    ranges
 }
 
 fn emphasised(text: &SharedString, query: &str, line: Line) -> StyledText {
-    StyledText::new(text.to_string()).with_highlights(
+    StyledText::new(text.clone()).with_highlights(
         matched_ranges(text, query, line)
             .into_iter()
             .map(|range| (range, FontWeight::SEMIBOLD.into())),
@@ -889,7 +901,7 @@ pub fn search_list<V: ControlHost>(
 ) -> Div {
     let palette = ctx.palette;
     let on_activate: Activate<V> = Rc::new(on_activate);
-    let text = query.read(ctx.cx).text();
+    let text = query.read(ctx.cx).shared_text();
     let matches = fuzzy_filter(&text, items);
     let ids: Rc<[SharedString]> = matches.iter().map(|command| command.id.clone()).collect();
     let (highlighted, _) = ctx.view.control_state().follow_list(id, &text, &ids);
@@ -943,7 +955,7 @@ pub fn ranked_search_list<V: ControlHost>(
     on_activate: impl Fn(&mut V, SharedString, &mut Window, &mut Context<V>) + 'static,
 ) -> Div {
     let palette = ctx.palette;
-    let text = query.read(ctx.cx).text();
+    let text = query.read(ctx.cx).shared_text();
     let on_activate: Activate<V> = Rc::new(on_activate);
     let list = result_list(
         id,
@@ -1303,7 +1315,7 @@ pub fn command_palette<V: ControlHost>(
     on_activate: impl Fn(&mut V, SharedString, &mut Window, &mut Context<V>) + 'static,
 ) -> Option<impl IntoElement> {
     let opened_at = palette_opened_at(ctx.view.control_state(), id)?;
-    let text = query.read(ctx.cx).text();
+    let text = query.read(ctx.cx).shared_text();
     let matches: Vec<SearchResult> = fuzzy_filter(&text, commands)
         .iter()
         .map(command_result)
@@ -1344,7 +1356,7 @@ pub fn ranked_command_palette<V: ControlHost>(
     on_activate: impl Fn(&mut V, SharedString, &mut Window, &mut Context<V>) + 'static,
 ) -> Option<impl IntoElement> {
     let opened_at = palette_opened_at(ctx.view.control_state(), id)?;
-    let text = query.read(ctx.cx).text();
+    let text = query.read(ctx.cx).shared_text();
     let on_activate = closing_palette(on_activate);
     let list = result_list(
         id,
@@ -1893,3 +1905,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "emphasis_bench.rs"]
+mod emphasis_bench;

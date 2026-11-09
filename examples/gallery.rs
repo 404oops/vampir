@@ -26,17 +26,17 @@ use vampir::AppIcon;
 use vampir::{
     BadgeTone, ButtonVariant, CARD_LIFT, CONTROL_HEIGHT, ChipSelection, Choice, Chord, Column,
     ComboId, Command, ControlHost, ControlState, DialogButton, Hint, InputStyle, ListSelection,
-    MAX_CHROMA, MenuItem, Oklch, Palette, Scheme, ScrollAxis, SearchResult, SelectionIntent,
-    SliderTrack, SortDirection, Span, TEXT_SIZE, TITLE_TEXT_SIZE, Tab, TabBarLayout, TextInput,
-    Theme, TreeRow, WidgetContext, arriving, badge, bind_keys, button, caption, card, card_at,
-    checkbox, chip_group, collapsible, color_pad, column, combo, command_palette, context_menu,
-    dialog, edit_menu, fading_text, flatten_tree, glyph, ground, hue_picker, hue_slider, hue_wheel,
-    icon_button, labelled, lit, lit_stops, menu_button, menu_target, progress_bar, radio_group,
-    rank_results, ranked_command_palette, ranked_search_list, reorder, row, saturation_picker,
-    scheme_picker, scroll_area, search_list, segmented, selectable_list, separator,
-    shortcut_recorder, slider, spinbox, spinner, split_area, split_handle, swatch_grid, switch,
-    tab_bar, tab_bar_layout, table_header, table_row, text_area, text_field, tree_row,
-    ui_font_face,
+    MAX_CHROMA, MenuItem, Oklch, Palette, SMALL_TEXT_SIZE, Scheme, ScrollAxis, SearchResult,
+    SelectionIntent, SliderTrack, SortDirection, Span, TEXT_SIZE, TITLE_TEXT_SIZE, Tab,
+    TabBarLayout, TextInput, Theme, TreeRow, WidgetContext, arriving, badge, bind_keys, button,
+    caption, card, card_at, checkbox, chip_group, collapsible, color_pad, column, combo,
+    command_palette, context_menu, dialog, edit_menu, fading_text, flatten_tree, glyph, ground,
+    hue_picker, hue_slider, hue_wheel, icon_button, labelled, lit, lit_stops, menu_button,
+    menu_target, progress_bar, radio_group, rank_results, ranked_command_palette,
+    ranked_search_list, reorder, row, saturation_picker, scheme_picker, scroll_area, search_list,
+    segmented, selectable_list, separator, shortcut_recorder, slider, spinbox, spinner, split_area,
+    split_handle, swatch_grid, switch, tab_bar, tab_bar_layout, table_header, table_row, text_area,
+    text_field, tree_row, ui_font_face,
 };
 
 // The gallery is also the smallest complete *macOS* host, so it carries the
@@ -710,7 +710,7 @@ impl Render for Gallery {
         // is not a page change.
         let body = arriving("page", page as u64, &self.controls, body);
         let ranked_palette_results = if self.controls.is_palette_open("ranked-commands") {
-            self.ranked_results(&self.ranked_palette_query.read(cx).text())
+            self.ranked_results(&self.ranked_palette_query.read(cx).shared_text())
         } else {
             Vec::new()
         };
@@ -900,13 +900,16 @@ impl Gallery {
             .child(separator(false, palette))
             .child(
                 row()
+                    .text_size(px(SMALL_TEXT_SIZE))
+                    .text_color(palette.text_secondary)
                     .px(px(20.0))
                     .py(px(10.0))
-                    .child(caption(palette, "Last action"))
-                    .child(
-                        fading_text("last-action", self.last_action.clone(), &self.controls)
-                            .text_color(palette.text_secondary),
-                    )
+                    .child("Last action")
+                    .child(fading_text(
+                        "last-action",
+                        self.last_action.clone(),
+                        &self.controls,
+                    ))
                     .child(div().flex_1())
                     // Says so when the gallery is running slowed down, so a
                     // screenshot taken that way cannot pass for the real thing.
@@ -1201,7 +1204,7 @@ impl Gallery {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let ranked_query = self.ranked_query.read(cx).text();
+        let ranked_query = self.ranked_query.read(cx).shared_text();
         let ranked_results = self.ranked_results(&ranked_query);
         // The card is a gradient, so each of the list's edge fades takes the
         // card's colour at that edge, from where both painted last frame.

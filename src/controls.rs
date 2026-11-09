@@ -462,7 +462,7 @@ pub fn spinbox<V: ControlHost>(
     let typed_from = edit_input.clone();
     let inc = commit;
 
-    type Step<V> = Box<dyn Fn(&mut V, &mut Window, &mut Context<V>) + 'static>;
+    type Step<V> = Rc<dyn Fn(&mut V, &mut Window, &mut Context<V>) + 'static>;
     let step_button = |id: ElementId,
                        glyph: &'static str,
                        active: bool,
@@ -482,7 +482,6 @@ pub fn spinbox<V: ControlHost>(
             // A stepper at its limit stays visible but stops responding:
             // removing it would shift the other one under the pointer.
             .when(enabled && active, move |el| {
-                let handler = Rc::new(handler);
                 let key_handler = handler.clone();
                 el.relative()
                     .cursor_pointer()
@@ -549,7 +548,7 @@ pub fn spinbox<V: ControlHost>(
             // number the host does not have.
             .on_action(cx.listener(
                 move |this, _: &crate::text_input::Enter, window, cx| {
-                    let text = typed_from.read(cx).text();
+                    let text = typed_from.read(cx).shared_text();
                     match text.trim().parse::<i32>() {
                         Ok(entered) => typed(this, entered.clamp(min, max), window, cx),
                         Err(_) => typed_from.update(cx, |input, cx| {
@@ -565,7 +564,7 @@ pub fn spinbox<V: ControlHost>(
             "\u{2212}",
             value > min,
             cx,
-            Box::new(move |this, window, cx| {
+            Rc::new(move |this, window, cx| {
                 dec(this, (value - 1).max(min), window, cx);
             }),
         ))
@@ -582,7 +581,7 @@ pub fn spinbox<V: ControlHost>(
             "+",
             value < max,
             cx,
-            Box::new(move |this, window, cx| {
+            Rc::new(move |this, window, cx| {
                 inc(this, (value + 1).min(max), window, cx);
             }),
         ))

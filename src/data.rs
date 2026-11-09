@@ -225,7 +225,7 @@ pub fn tree_row<V: ControlHost>(
     // The moves this row can make, worked out now while the whole flattened
     // list is in hand. A row on its own knows nothing about its neighbours,
     // and the arrows are entirely about neighbours.
-    let moves: Vec<(Key, TreeMove)> = [
+    let targets: Vec<(Key, TreeMove, Option<SharedString>)> = [
         Key::Up,
         Key::Down,
         Key::Left,
@@ -235,17 +235,14 @@ pub fn tree_row<V: ControlHost>(
     ]
     .into_iter()
     .filter_map(|key| tree_step(rows, index, key).map(|moved| (key, moved)))
+    .map(|(key, moved)| {
+        let id = match moved {
+            TreeMove::To(at) => rows.get(at).map(|row| row.id.clone()),
+            TreeMove::Expand(_) => None,
+        };
+        (key, moved, id)
+    })
     .collect();
-    let targets: Vec<(Key, TreeMove, Option<SharedString>)> = moves
-        .into_iter()
-        .map(|(key, moved)| {
-            let id = match moved {
-                TreeMove::To(at) => rows.get(at).map(|row| row.id.clone()),
-                TreeMove::Expand(_) => None,
-            };
-            (key, moved, id)
-        })
-        .collect();
 
     // Made before the element chain so the chain keeps `cx` for the
     // chevron's own listener further down.

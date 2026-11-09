@@ -48,7 +48,7 @@ The page itself is laid out with the same vocabulary: `card` is the lit panel wi
 
 ## Menus — `vampir::menu`
 
-`context_menu` renders the open menu; `MenuItem::action(id, label).shortcut(..).checked(..).danger().disabled()` builds action rows, `MenuItem::submenu(label, items)` nests a menu to any depth, and `MenuItem::header` and `MenuItem::separator` break rows up. A submenu can also be disabled, and `enabled(bool)` sets either from a value. An action's `id` is what comes back when it is chosen: a `&'static str` by default, or the host's own command type — `MenuItem<Option<Command>>` is a menu whose rows carry what they do, with `None` for a row that only says something — so there is no table to keep in step with the rows. Any action or submenu can carry an icon with `.icon(..)`: a `MenuIcon` is whatever the host draws at a size in a colour, converted once from the host's icon type with `impl From<Icon> for MenuIcon`, and a level with an icon anywhere in it keeps an icon column so its labels line up. Open the menu from wherever the press happened:
+`context_menu` renders the open menu; `MenuItem::action(id, label).shortcut(..).checked(..).danger().disabled()` builds action rows, `MenuItem::submenu(label, items)` nests a menu to any depth, and `MenuItem::header` and `MenuItem::separator` break rows up. Checkmarks sit at the trailing edge after any shortcut, keeping checked and unchecked labels aligned. A submenu can also be disabled, and `enabled(bool)` sets either from a value. An action's `id` is what comes back when it is chosen: a `&'static str` by default, or the host's own command type — `MenuItem<Option<Command>>` is a menu whose rows carry what they do, with `None` for a row that only says something — so there is no table to keep in step with the rows. Any action or submenu can carry an icon with `.icon(..)`: a `MenuIcon` is whatever the host draws at a size in a colour, converted once from the host's icon type with `impl From<Icon> for MenuIcon`, and a level with an icon anywhere in it keeps a trailing icon column so its labels line up. Open the menu from wherever the press happened:
 
 ```rust
 .on_mouse_down(MouseButton::Right, cx.listener(|this, event: &MouseDownEvent, _w, cx| {
@@ -122,7 +122,7 @@ Every `ControlState` carries a `Theme` — hue, saturation, and a `Scheme` of `S
 
 ![Text fields, a rich-text area and a shortcut recorder](fields.png)
 
-`TextInput` is a full input: selection, IME composition, undo, clipboard, multi-line wrapping. It is the one thing in the crate that is an entity rather than a function, because a text cursor genuinely is state.
+`TextInput` is a full input: selection, IME composition, undo, clipboard, multi-line wrapping. It is the one thing in the crate that is an entity rather than a function, because a text cursor genuinely is state. Read with `shared_text()` when retaining the immutable text across context updates: it clones a shared string without copying its bytes. `text()` returns an owned `String` when one is needed.
 
 `InputStyle::from_palette(palette, size)` is the style to start from; an input styled that way is kept in step with the palette by whichever field holds it, so a host never re-styles its inputs by hand.
 

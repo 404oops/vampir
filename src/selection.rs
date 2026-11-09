@@ -212,7 +212,7 @@ impl ListSelection {
 
     /// Reconciles a selection with the rows still shown after filtering.
     pub fn retain_visible(&mut self, order: &[SharedString]) {
-        let visible: HashSet<_> = order.iter().cloned().collect();
+        let visible: HashSet<_> = order.iter().collect();
         self.selected.retain(|id| visible.contains(id));
         if self.active.as_ref().is_some_and(|id| !visible.contains(id)) {
             self.active = order.first().cloned();

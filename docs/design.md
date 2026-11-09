@@ -69,6 +69,7 @@ Palette tests cover hues, saturation levels and both schemes, including greyscal
 - **Full width is a decision, not a default.** `button` fills its slot, which is right for a dialog footer and wrong for a list of twenty choices. When the options are a set rather than a sequence of actions, use `chip`.
 - **Pop-up triggers toggle their pop-up.** Pressing an open menu or pop-up button closes it. Dismiss-on-press-outside must ignore the trigger; otherwise it closes on press and reopens on click. `context_menu` and `combo` both check the trigger before dismissing.
 - **Pop-up lists open over their button.** The current option lands on the button, so the pointer is already on it and every other option is one row away; a list too long to show whole starts scrolled so that row is in view. `anchored` shifts the list back inside the window when that would put it over an edge. A menu picks an action rather than shows a value, so it drops below its button instead.
+- **Menu symbols trail the label.** Checkmarks, shortcuts, submenu arrows and the back arrow sit on the right. Checked and unchecked actions share the same left inset.
 - **Deferred priorities:** context menus 200, command palette 180, dialogs 150, pop-up lists 100. Keep new overlays inside that ordering.
 
 ## Motion
