@@ -7,7 +7,8 @@ use gpui::{
     Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
     Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, ScaledPixels, Scene, Size,
     Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowDecorations, WindowKind, WindowParams, WindowVisibility, popup::PopupNotSupportedError,
+    WindowDecorations, WindowKind, WindowParams, WindowVisibility,
+    popup::{PopupOptions, place_popup},
     px,
 };
 use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig};
@@ -19,8 +20,9 @@ use x11rb::{
     connection::Connection,
     cookie::{Cookie, VoidCookie},
     errors::ConnectionError,
-    properties::{WmHints, WmSizeHints},
+    properties::{WmHints, WmSizeHints, WmSizeHintsSpecification},
     protocol::{
+        randr::ConnectionExt as _,
         sync,
         xinput::{self, ConnectionExt as _},
         xproto::{self, ClientMessageEvent, ConnectionExt, TranslateCoordinatesReply},
@@ -84,6 +86,14 @@ x11rb::atom_manager! {
         _GTK_FRAME_EXTENTS,
         _GTK_EDGE_CONSTRAINTS,
         _NET_CLIENT_LIST_STACKING,
+        WM_STATE,
+        _NET_WM_STATE_SKIP_TASKBAR,
+        _NET_WM_STATE_SKIP_PAGER,
+        _NET_WORKAREA,
+        _NET_CURRENT_DESKTOP,
+        // Private: a zero-length append to it is how a popup gets a server timestamp to take
+        // focus with (ICCCM §2.1), since the input that opened it may have gone to another client.
+        _GPUI_TIMESTAMP,
     }
 }
 
@@ -227,6 +237,207 @@ fn find_visuals(xcb: &XCBConnection, screen_index: usize) -> VisualSet {
     set
 }
 
+/// What a [`WindowKind::AnchoredPopup`] keeps between placements.
+///
+/// The popup is an ordinary managed top-level, transient for its parent, that this backend
+/// positions itself: at creation, whenever the parent moves (the parent's ConfigureNotify), when
+/// the anchor changes and when it is resized. `PopupOptions::grab` has no effect on X11: the
+/// popup takes the keyboard like any focused window, and dismissing it on an outside click is
+/// up to the caller.
+struct PopupState {
+    options: PopupOptions,
+    parent: X11WindowStatePtr,
+    /// The size asked for, kept apart from the window's bounds so a placement made before the
+    /// server confirms a resize does not put the old size back, and so a popup shrunk to fit by
+    /// a constraint adjustment grows again when there is room.
+    size: Size<Pixels>,
+    focus: PopupFocus,
+}
+
+enum PopupFocus {
+    /// Not asked for, or already given.
+    Done,
+    /// Asked for; waiting for the server timestamp requested on map.
+    AwaitingTimestamp,
+    /// Asked for, with a timestamp; waiting for the window to be viewable, since SetInputFocus
+    /// on a window that is not is a BadMatch.
+    Pending(xproto::Timestamp),
+}
+
+/// Where a popup of `size` goes, in device pixels relative to the root window.
+///
+/// The parent's origin comes from TranslateCoordinates rather than its ConfigureNotify, because
+/// under a reparenting window manager a ConfigureNotify that is not synthetic is relative to
+/// the frame. Placement itself happens in logical pixels, the space `PopupOptions` is in, using
+/// the backend's single scale factor for both directions.
+fn place_popup_on_screen(
+    xcb: &XCBConnection,
+    atoms: &XcbAtoms,
+    x_screen_index: usize,
+    parent: xproto::Window,
+    options: &PopupOptions,
+    size: Size<Pixels>,
+    scale_factor: f32,
+) -> anyhow::Result<Bounds<DevicePixels>> {
+    let root = xcb.setup().roots[x_screen_index].root;
+    let origin = get_reply(
+        || "X11 TranslateCoordinates for the parent of a popup failed.",
+        xcb.translate_coordinates(parent, root, 0, 0),
+    )?;
+    let to_logical = |value: i32| px(value as f32 / scale_factor);
+    let parent_origin = Point::new(
+        to_logical(origin.dst_x as i32),
+        to_logical(origin.dst_y as i32),
+    );
+    let anchor = options.anchor_rect.center();
+    let anchor = Point::new(
+        origin.dst_x as i32 + (f32::from(anchor.x) * scale_factor).round() as i32,
+        origin.dst_y as i32 + (f32::from(anchor.y) * scale_factor).round() as i32,
+    );
+    let work_area = work_area_at(xcb, atoms, x_screen_index, anchor);
+    let work_area = Bounds {
+        origin: Point::new(
+            to_logical(work_area.origin.x),
+            to_logical(work_area.origin.y),
+        ),
+        size: Size {
+            width: to_logical(work_area.size.width),
+            height: to_logical(work_area.size.height),
+        },
+    };
+    let placed = place_popup(options, parent_origin, size, Some(work_area));
+    let to_device = |value: Pixels| (f32::from(value) * scale_factor).round() as i32;
+    Ok(Bounds {
+        origin: Point::new(
+            DevicePixels(to_device(placed.origin.x)),
+            DevicePixels(to_device(placed.origin.y)),
+        ),
+        size: Size {
+            width: DevicePixels(to_device(placed.size.width).max(1)),
+            height: DevicePixels(to_device(placed.size.height).max(1)),
+        },
+    })
+}
+
+/// The usable part of the monitor at `point` (root coordinates, device pixels): the RandR
+/// monitor holding it, or the nearest one, less what `_NET_WORKAREA` reserves for panels. The
+/// whole screen when RandR 1.5 is missing. `_NET_WORKAREA` is one rectangle across every
+/// monitor, so a panel on one monitor only trims another if it lies along the shared edge.
+fn work_area_at(
+    xcb: &XCBConnection,
+    atoms: &XcbAtoms,
+    x_screen_index: usize,
+    point: Point<i32>,
+) -> Bounds<i32> {
+    let screen = &xcb.setup().roots[x_screen_index];
+    let root = screen.root;
+    let whole_screen = Bounds {
+        origin: Point::new(0, 0),
+        size: Size {
+            width: screen.width_in_pixels as i32,
+            height: screen.height_in_pixels as i32,
+        },
+    };
+
+    let monitor = xcb
+        .randr_get_monitors(root, true)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        .and_then(|reply| {
+            let monitors = reply.monitors.iter().map(|monitor| Bounds {
+                origin: Point::new(monitor.x as i32, monitor.y as i32),
+                size: Size {
+                    width: monitor.width as i32,
+                    height: monitor.height as i32,
+                },
+            });
+            let distance = |bounds: &Bounds<i32>| {
+                let dx = (bounds.origin.x - point.x)
+                    .max(point.x - (bounds.origin.x + bounds.size.width))
+                    .max(0) as i64;
+                let dy = (bounds.origin.y - point.y)
+                    .max(point.y - (bounds.origin.y + bounds.size.height))
+                    .max(0) as i64;
+                dx * dx + dy * dy
+            };
+            monitors.min_by_key(distance)
+        })
+        .unwrap_or(whole_screen);
+
+    let work_area = maybe!({
+        let desktop = get_reply(
+            || "X11 GetProperty for _NET_CURRENT_DESKTOP failed.",
+            xcb.get_property(
+                false,
+                root,
+                atoms._NET_CURRENT_DESKTOP,
+                xproto::AtomEnum::CARDINAL,
+                0,
+                1,
+            ),
+        )?
+        .value32()
+        .and_then(|mut values| values.next())
+        .unwrap_or(0);
+        let reply = get_reply(
+            || "X11 GetProperty for _NET_WORKAREA failed.",
+            xcb.get_property(
+                false,
+                root,
+                atoms._NET_WORKAREA,
+                xproto::AtomEnum::CARDINAL,
+                desktop * 4,
+                4,
+            ),
+        )?;
+        let values: Vec<u32> = reply
+            .value32()
+            .map(|values| values.collect())
+            .unwrap_or_default();
+        let [x, y, width, height] = values[..] else {
+            anyhow::bail!("_NET_WORKAREA has no entry for desktop {desktop}");
+        };
+        anyhow::Ok(Bounds {
+            origin: Point::new(x as i32, y as i32),
+            size: Size {
+                width: width as i32,
+                height: height as i32,
+            },
+        })
+    });
+
+    match work_area {
+        Ok(work_area) => {
+            let usable = monitor.intersect(&work_area);
+            if usable.size.width > 0 && usable.size.height > 0 {
+                usable
+            } else {
+                monitor
+            }
+        }
+        Err(_) => monitor,
+    }
+}
+
+/// WM_NORMAL_HINTS for a popup: a user-specified position, so the window manager keeps the one
+/// it is given instead of placing the window itself (mutter and kwin centre transient dialogs
+/// otherwise), a fixed size, and static gravity, so the position is the client area's even
+/// under a window manager that decorates it anyway.
+fn popup_size_hints(bounds: Bounds<DevicePixels>) -> WmSizeHints {
+    let (x, y) = (bounds.origin.x.0, bounds.origin.y.0);
+    let (width, height) = (bounds.size.width.0, bounds.size.height.0);
+    let mut hints = WmSizeHints::new();
+    hints.position = Some((WmSizeHintsSpecification::UserSpecified, x, y));
+    hints.size = Some((WmSizeHintsSpecification::UserSpecified, width, height));
+    hints.min_size = Some((width, height));
+    hints.max_size = Some((width, height));
+    hints.win_gravity = Some(xproto::Gravity::STATIC);
+    hints
+}
+
+/// _MOTIF_WM_HINTS with the decorations flag set and no decorations.
+const MOTIF_NO_DECORATIONS: [u32; 5] = [1 << 1, 0, 0, 0, 0];
+
 #[derive(Debug, Clone, Copy)]
 struct RawWindow {
     connection: *mut c_void,
@@ -259,6 +470,14 @@ pub struct Callbacks {
 pub struct X11WindowState {
     parent: Option<X11WindowStatePtr>,
     children: FxHashSet<xproto::Window>,
+    /// Set on an anchored popup.
+    popup: Option<PopupState>,
+    /// The anchored popups this window is the parent of. Unlike `children` they do not block
+    /// input; they follow this window and close with it.
+    popups: FxHashSet<xproto::Window>,
+    /// The keyboard focus last reported to GPUI, so that focus moving between this window and
+    /// its own popups is not reported as it going inactive and straight back.
+    reported_active: Option<bool>,
     client: X11ClientStatePtr,
     executor: ForegroundExecutor,
     atoms: XcbAtoms,
@@ -476,15 +695,25 @@ impl X11WindowState {
         supports_xinput_gestures: bool,
         is_bgr: bool,
     ) -> anyhow::Result<Self> {
-        // Native popups are not implemented on X11 yet. Rejecting lets callers fall back to
-        // gpui's in-window popovers.
-        if let WindowKind::AnchoredPopup(_) = params.kind {
-            return Err(PopupNotSupportedError.into());
-        }
+        // For an anchored popup `parent_window` is the parent its options name, not the
+        // focused window: the client resolves it from `PopupOptions::parent`.
+        let popup = match &params.kind {
+            WindowKind::AnchoredPopup(options) => Some((
+                options.clone(),
+                parent_window
+                    .clone()
+                    .context("X11: the parent of an anchored popup is not an open window")?,
+            )),
+            _ => None,
+        };
+        let focus_on_map = params.focus;
 
-        let x_screen_index = params
-            .display_id
-            .map_or(x_main_screen_index, |did| u64::from(did) as usize);
+        let x_screen_index = match &popup {
+            Some((_, parent)) => parent.state.borrow().x_screen_index,
+            None => params
+                .display_id
+                .map_or(x_main_screen_index, |did| u64::from(did) as usize),
+        };
 
         let visual_set = find_visuals(xcb, x_screen_index);
 
@@ -513,7 +742,13 @@ impl X11WindowState {
             // https://stackoverflow.com/questions/43218127/x11-xlib-xcb-creating-a-window-requires-border-pixel-if-specifying-colormap-wh
             .border_pixel(visual_set.black_pixel)
             .colormap(colormap)
-            .override_redirect((params.kind == WindowKind::PopUp) as u32)
+            // A popup that never takes the keyboard — a scrim between a parent and a focused
+            // popup — is left to itself: managed, a click on it could get it raised over the
+            // popup it sits under, or focused. It closes with its parent, and the toolkit closes
+            // it when the focused popup goes, so it is never left above other applications.
+            .override_redirect(
+                (params.kind == WindowKind::PopUp || (popup.is_some() && !focus_on_map)) as u32,
+            )
             .event_mask(
                 xproto::EventMask::EXPOSURE
                     | xproto::EventMask::STRUCTURE_NOTIFY
@@ -535,6 +770,27 @@ impl X11WindowState {
             bounds.size.height = 600.into();
         }
 
+        let popup_size = Size {
+            width: px(bounds.size.width.0 as f32 / scale_factor),
+            height: px(bounds.size.height.0 as f32 / scale_factor),
+        };
+        if let Some((options, parent)) = &popup {
+            bounds = place_popup_on_screen(
+                xcb,
+                atoms,
+                x_screen_index,
+                parent.x_window,
+                options,
+                popup_size,
+                scale_factor,
+            )?;
+        }
+        // Other windows are created 2px right of where they were asked for, part of the
+        // workaround below for content drawn outside the window at the default position on
+        // GNOME. A popup's position is computed against its anchor and pinned with
+        // USPosition, so it is neither at the default position nor free to be nudged.
+        let nudge_x = if popup.is_some() { 0 } else { 2 };
+
         check_reply(
             || {
                 format!(
@@ -542,7 +798,7 @@ impl X11WindowState {
                     visual.depth,
                     x_window,
                     visual_set.root,
-                    bounds.origin.x.0 + 2,
+                    bounds.origin.x.0 + nudge_x,
                     bounds.origin.y.0,
                     bounds.size.width.0,
                     bounds.size.height.0
@@ -552,7 +808,7 @@ impl X11WindowState {
                 visual.depth,
                 x_window,
                 visual_set.root,
-                (bounds.origin.x.0 + 2) as i16,
+                (bounds.origin.x.0 + nudge_x) as i16,
                 bounds.origin.y.0 as i16,
                 bounds.size.width.0 as u16,
                 bounds.size.height.0 as u16,
@@ -578,7 +834,7 @@ impl X11WindowState {
             )?;
 
             let reply = get_reply(|| "X11 GetGeometry failed.", xcb.get_geometry(x_window))?;
-            if reply.x == 0 && reply.y == 0 {
+            if popup.is_none() && reply.x == 0 && reply.y == 0 {
                 bounds.origin.x.0 += 2;
                 // Work around a bug where our rendered content appears
                 // outside the window bounds when opened at the default position
@@ -645,6 +901,69 @@ impl X11WindowState {
                         ),
                     )?;
                 }
+            }
+
+            if let Some((_, parent)) = &popup {
+                // A managed window rather than override-redirect, so the window manager gives
+                // it the keyboard and an input method can attach to it; transient for the
+                // parent named in the options, never the focused window, which is nobody's
+                // when a native child window of the parent holds the keyboard.
+                check_reply(
+                    || "X11 ChangeProperty32 setting WM_TRANSIENT_FOR for a popup failed.",
+                    xcb.change_property32(
+                        xproto::PropMode::REPLACE,
+                        x_window,
+                        atoms.WM_TRANSIENT_FOR,
+                        xproto::AtomEnum::WINDOW,
+                        &[parent.x_window],
+                    ),
+                )?;
+                // DIALOG rather than UTILITY: every common window manager focuses a dialog
+                // transient for the active window when it maps, while some (xfwm4, openbox)
+                // treat utility windows as palettes that do not take focus. Being transient
+                // keeps it above its parent without _NET_WM_STATE_ABOVE, which would put it
+                // above every other application too.
+                check_reply(
+                    || "X11 ChangeProperty32 setting window type for a popup failed.",
+                    xcb.change_property32(
+                        xproto::PropMode::REPLACE,
+                        x_window,
+                        atoms._NET_WM_WINDOW_TYPE,
+                        xproto::AtomEnum::ATOM,
+                        &[atoms._NET_WM_WINDOW_TYPE_DIALOG],
+                    ),
+                )?;
+                check_reply(
+                    || "X11 ChangeProperty32 setting the state of a popup failed.",
+                    xcb.change_property32(
+                        xproto::PropMode::REPLACE,
+                        x_window,
+                        atoms._NET_WM_STATE,
+                        xproto::AtomEnum::ATOM,
+                        &[
+                            atoms._NET_WM_STATE_SKIP_TASKBAR,
+                            atoms._NET_WM_STATE_SKIP_PAGER,
+                        ],
+                    ),
+                )?;
+                check_reply(
+                    || "X11 ChangeProperty for _MOTIF_WM_HINTS on a popup failed.",
+                    xcb.change_property(
+                        xproto::PropMode::REPLACE,
+                        x_window,
+                        atoms._MOTIF_WM_HINTS,
+                        atoms._MOTIF_WM_HINTS,
+                        size_of::<u32>() as u8 * 8,
+                        5,
+                        bytemuck::cast_slice::<u32, u8>(&MOTIF_NO_DECORATIONS),
+                    ),
+                )?;
+                let mut wm_hints = WmHints::new();
+                wm_hints.input = Some(focus_on_map);
+                check_reply(
+                    || "X11 ChangeProperty for WM_HINTS on a popup failed.",
+                    wm_hints.set(xcb, x_window),
+                )?;
             }
 
             let parent = if params.kind == WindowKind::Dialog
@@ -793,11 +1112,15 @@ impl X11WindowState {
             // This prevents the window from being resized larger than what the GPU can render.
             let max_texture_size = renderer.max_texture_size();
             let mut size_hints = WmSizeHints::new();
-            if let Some(size) = params.window_min_size {
-                size_hints.min_size =
-                    Some((f32::from(size.width) as i32, f32::from(size.height) as i32));
+            if popup.is_some() {
+                size_hints = popup_size_hints(bounds);
+            } else {
+                if let Some(size) = params.window_min_size {
+                    size_hints.min_size =
+                        Some((f32::from(size.width) as i32, f32::from(size.height) as i32));
+                }
+                size_hints.max_size = Some((max_texture_size as i32, max_texture_size as i32));
             }
-            size_hints.max_size = Some((max_texture_size as i32, max_texture_size as i32));
             check_reply(
                 || {
                     format!(
@@ -833,9 +1156,26 @@ impl X11WindowState {
 
             let display = Rc::new(X11Display::new(xcb, scale_factor, x_screen_index)?);
 
+            let popup = popup.map(|(options, parent)| {
+                parent.state.borrow_mut().popups.insert(x_window);
+                PopupState {
+                    options,
+                    parent,
+                    size: popup_size,
+                    focus: if focus_on_map {
+                        PopupFocus::AwaitingTimestamp
+                    } else {
+                        PopupFocus::Done
+                    },
+                }
+            });
+
             Ok(Self {
                 parent,
                 children: FxHashSet::default(),
+                popup,
+                popups: FxHashSet::default(),
+                reported_active: None,
                 client,
                 executor,
                 display,
@@ -894,6 +1234,40 @@ impl Drop for X11Window {
 
         if let Some(parent) = state.parent.as_ref() {
             parent.state.borrow_mut().children.remove(&self.0.x_window);
+        }
+
+        if let Some(popup) = state.popup.as_ref() {
+            let parent = &popup.parent;
+            parent.state.borrow_mut().popups.remove(&self.0.x_window);
+            // Hand the keyboard to the parent rather than leave it to the revert-to of a
+            // destroyed window, which some window managers resolve to whatever is under the
+            // pointer or to nothing at all. A native child of the parent that held the
+            // keyboard before the popup opened gets it back only if the host asks for it.
+            // A closing window leaves the client's map before its popups close, so a parent
+            // still in it is still open.
+            let (popup_has_keyboard, parent_open) = state
+                .client
+                .0
+                .upgrade()
+                .and_then(|client| {
+                    client.try_borrow().ok().map(|client| {
+                        (
+                            client.keyboard_focused_window == Some(self.0.x_window),
+                            client.windows.contains_key(&parent.x_window),
+                        )
+                    })
+                })
+                .unwrap_or((false, false));
+            if popup_has_keyboard && parent_open {
+                self.0
+                    .xcb
+                    .set_input_focus(
+                        xproto::InputFocus::POINTER_ROOT,
+                        parent.x_window,
+                        xproto::Time::CURRENT_TIME,
+                    )
+                    .log_err();
+            }
         }
 
         // The renderer's GPU objects use the X connection, and a display mode switch closes the
@@ -1077,6 +1451,33 @@ impl X11WindowStatePtr {
             self.set_wm_properties(state)?;
         } else if event.atom == state.atoms._GTK_EDGE_CONSTRAINTS {
             self.set_edge_constraints(state)?;
+        } else if event.atom == state.atoms._GPUI_TIMESTAMP {
+            drop(state);
+            self.popup_timestamp(event.time);
+        } else if event.atom == state.atoms.WM_STATE && !state.popups.is_empty() {
+            // ICCCM: every window manager sets WM_STATE, and IconicState (3) is the window
+            // minimized. Whether a window manager also hides the transients of a minimized
+            // window varies, so close them here instead of leaving a popup over nothing.
+            let reply = get_reply(
+                || "X11 GetProperty for WM_STATE failed.",
+                self.xcb.get_property(
+                    false,
+                    self.x_window,
+                    state.atoms.WM_STATE,
+                    xproto::AtomEnum::ANY,
+                    0,
+                    1,
+                ),
+            )?;
+            drop(state);
+            const ICONIC_STATE: u32 = 3;
+            let iconic = reply
+                .value32()
+                .and_then(|mut values| values.next())
+                .is_some_and(|value| value == ICONIC_STATE);
+            if iconic {
+                self.close_popups();
+            }
         }
         Ok(())
     }
@@ -1185,10 +1586,158 @@ impl X11WindowStatePtr {
                 }
             }
         }
+        self.close_popups();
 
         let mut callbacks = self.callbacks.borrow_mut();
         if let Some(fun) = callbacks.close.take() {
             fun()
+        }
+    }
+
+    /// Closes every popup anchored to this window through the normal close path, so each
+    /// `on_close` runs once: the callback is taken when it runs.
+    pub(crate) fn close_popups(&self) {
+        let state = self.state.borrow();
+        let client = state.client.clone();
+        let popups: Vec<xproto::Window> = state.popups.iter().copied().collect();
+        drop(state);
+
+        if let Some(client) = client.get_client() {
+            for popup in popups {
+                if let Some(popup_window) = client.get_window(popup) {
+                    popup_window.close();
+                }
+            }
+        }
+    }
+
+    /// Places every popup anchored to this window again, after this window moved or resized.
+    pub(crate) fn reposition_popups(&self) {
+        let state = self.state.borrow();
+        if state.popups.is_empty() {
+            return;
+        }
+        let client = state.client.clone();
+        let popups: Vec<xproto::Window> = state.popups.iter().copied().collect();
+        drop(state);
+
+        if let Some(client) = client.get_client() {
+            for popup in popups {
+                if let Some(popup_window) = client.get_window(popup) {
+                    popup_window.place_popup();
+                }
+            }
+        }
+    }
+
+    /// Moves and sizes this popup to where its options put it against its parent now. Writes
+    /// the size hints first: they pin the size, so a resize the hints do not allow would be
+    /// refused.
+    fn place_popup(&self) {
+        let state = self.state.borrow();
+        let Some(popup) = state.popup.as_ref() else {
+            return;
+        };
+        let Some(bounds) = place_popup_on_screen(
+            &self.xcb,
+            &state.atoms,
+            state.x_screen_index,
+            popup.parent.x_window,
+            &popup.options,
+            popup.size,
+            state.scale_factor,
+        )
+        .log_err() else {
+            return;
+        };
+        drop(state);
+
+        check_reply(
+            || "X11 change of WM_SIZE_HINTS for a popup failed.",
+            popup_size_hints(bounds).set_normal_hints(&*self.xcb, self.x_window),
+        )
+        .log_err();
+        check_reply(
+            || format!("X11 ConfigureWindow for a popup failed. bounds: {bounds:?}"),
+            self.xcb.configure_window(
+                self.x_window,
+                &xproto::ConfigureWindowAux::new()
+                    .x(bounds.origin.x.0)
+                    .y(bounds.origin.y.0)
+                    .width(bounds.size.width.0 as u32)
+                    .height(bounds.size.height.0 as u32),
+            ),
+        )
+        .log_err();
+        xcb_flush(&self.xcb);
+    }
+
+    fn popup_timestamp(&self, time: xproto::Timestamp) {
+        {
+            let mut state = self.state.borrow_mut();
+            let Some(popup) = state.popup.as_mut() else {
+                return;
+            };
+            if !matches!(popup.focus, PopupFocus::AwaitingTimestamp) {
+                return;
+            }
+            popup.focus = PopupFocus::Pending(time);
+        }
+        self.focus_popup_if_pending();
+    }
+
+    /// Gives a popup that asked for focus the keyboard, once it has both a timestamp and a
+    /// viewable window. Called on the timestamp's PropertyNotify, on MapNotify and on
+    /// VisibilityNotify, since which comes last depends on the window manager.
+    ///
+    /// _NET_ACTIVE_WINDOW (source 1, an application) is the request a window manager with
+    /// focus stealing prevention weighs; SetInputFocus with the same fresh timestamp follows,
+    /// for window managers without EWMH or that refused. FocusIn then takes the usual path,
+    /// which points the input method at this window.
+    pub(crate) fn focus_popup_if_pending(&self) {
+        let state = self.state.borrow();
+        let Some(popup) = state.popup.as_ref() else {
+            return;
+        };
+        let PopupFocus::Pending(time) = popup.focus else {
+            return;
+        };
+        let parent = popup.parent.x_window;
+        let root = state.x_root_window;
+        let active_window = state.atoms._NET_ACTIVE_WINDOW;
+        drop(state);
+
+        let viewable = get_reply(
+            || "X11 GetWindowAttributes for a popup failed.",
+            self.xcb.get_window_attributes(self.x_window),
+        )
+        .log_err()
+        .is_some_and(|attributes| attributes.map_state == xproto::MapState::VIEWABLE);
+        if !viewable {
+            return;
+        }
+
+        let message =
+            ClientMessageEvent::new(32, self.x_window, active_window, [1, time, parent, 0, 0]);
+        check_reply(
+            || "X11 SendEvent of _NET_ACTIVE_WINDOW for a popup failed.",
+            self.xcb.send_event(
+                false,
+                root,
+                xproto::EventMask::SUBSTRUCTURE_REDIRECT | xproto::EventMask::SUBSTRUCTURE_NOTIFY,
+                message,
+            ),
+        )
+        .log_err();
+        // Unchecked: if the window stopped being viewable since the query, the BadMatch is
+        // an error event the event loop drops, and the window manager's answer stands.
+        self.xcb
+            .set_input_focus(xproto::InputFocus::POINTER_ROOT, self.x_window, time)
+            .log_err();
+        xcb_flush(&self.xcb);
+
+        if let Some(popup) = self.state.borrow_mut().popup.as_mut() {
+            popup.focus = PopupFocus::Done;
         }
     }
 
@@ -1343,6 +1892,31 @@ impl X11WindowStatePtr {
         Ok(())
     }
 
+    /// Tells GPUI whether this window has the keyboard, itself or through one of its own
+    /// popups, given the window that has it now, if that changed since it was last told. Under
+    /// its popup a window stays the window in front, as it does under a menu.
+    pub(crate) fn report_activation(&self, focused: Option<xproto::Window>) {
+        let active = {
+            let mut state = self.state.borrow_mut();
+            let active = focused
+                .is_some_and(|focused| focused == self.x_window || state.popups.contains(&focused));
+            if state.reported_active.replace(active) == Some(active) {
+                return;
+            }
+            active
+        };
+        self.set_active(active);
+    }
+
+    /// The parent of this window, if it is an anchored popup.
+    pub(crate) fn popup_parent(&self) -> Option<X11WindowStatePtr> {
+        self.state
+            .borrow()
+            .popup
+            .as_ref()
+            .map(|popup| popup.parent.clone())
+    }
+
     pub fn set_active(&self, focus: bool) {
         let callback = self.callbacks.borrow_mut().active_status_change.take();
         if let Some(mut fun) = callback {
@@ -1448,6 +2022,20 @@ impl PlatformWindow for X11Window {
     }
 
     fn resize(&mut self, size: Size<Pixels>) {
+        // A popup keeps its anchor: it is placed again for the new size rather than grown from
+        // its top-left corner.
+        let is_popup = {
+            let mut state = self.0.state.borrow_mut();
+            if let Some(popup) = state.popup.as_mut() {
+                popup.size = size;
+            }
+            state.popup.is_some()
+        };
+        if is_popup {
+            self.0.place_popup();
+            return;
+        }
+
         let state = self.0.state.borrow();
         let size = size.to_device_pixels(state.scale_factor);
         let width = size.width.0 as u32;
@@ -1469,6 +2057,17 @@ impl PlatformWindow for X11Window {
         )
         .log_err();
         xcb_flush(&self.0.xcb);
+    }
+
+    fn set_popup_anchor(&self, anchor_rect: Bounds<Pixels>) {
+        {
+            let mut state = self.0.state.borrow_mut();
+            let Some(popup) = state.popup.as_mut() else {
+                return;
+            };
+            popup.options.anchor_rect = anchor_rect;
+        }
+        self.0.place_popup();
     }
 
     fn scale_factor(&self) -> f32 {
@@ -1585,7 +2184,21 @@ impl PlatformWindow for X11Window {
     }
 
     fn is_active(&self) -> bool {
-        self.0.state.borrow().active
+        let state = self.0.state.borrow();
+        if state.active {
+            return true;
+        }
+        // Or one of its popups has the keyboard.
+        let Some(client) = state.client.get_client() else {
+            return false;
+        };
+        let popups: Vec<xproto::Window> = state.popups.iter().copied().collect();
+        drop(state);
+        popups.into_iter().any(|popup| {
+            client
+                .get_window(popup)
+                .is_some_and(|popup| popup.state.borrow().active)
+        })
     }
 
     fn visibility(&self) -> WindowVisibility {
@@ -1649,6 +2262,26 @@ impl PlatformWindow for X11Window {
                 || "X11 MapWindow failed.",
                 self.0.xcb.map_window(self.0.x_window),
             )?;
+
+            let state = self.0.state.borrow();
+            if let Some(popup) = state.popup.as_ref()
+                && matches!(popup.focus, PopupFocus::AwaitingTimestamp)
+            {
+                // The PropertyNotify this causes carries a server timestamp later than the input
+                // that opened the popup, which may have gone to another client (a native child
+                // window), so this process has no recent event time of its own to focus with.
+                check_reply(
+                    || "X11 ChangeProperty for a popup's focus timestamp failed.",
+                    self.0.xcb.change_property8(
+                        xproto::PropMode::APPEND,
+                        self.0.x_window,
+                        state.atoms._GPUI_TIMESTAMP,
+                        xproto::AtomEnum::STRING,
+                        &[],
+                    ),
+                )?;
+                xcb_flush(&self.0.xcb);
+            }
         }
         Ok(())
     }
@@ -1987,6 +2620,9 @@ impl PlatformWindow for X11Window {
 
         // https://github.com/rust-windowing/winit/blob/master/src/platform_impl/linux/x11/util/hint.rs#L53-L87
         let hints_data: [u32; 5] = match decorations {
+            // A popup has no frame whichever is asked for: a title bar would move it off
+            // its anchor and offer to move it by hand.
+            _ if state.popup.is_some() => MOTIF_NO_DECORATIONS,
             WindowDecorations::Server => [1 << 1, 0, 1, 0, 0],
             WindowDecorations::Client => [1 << 1, 0, 0, 0, 0],
         };

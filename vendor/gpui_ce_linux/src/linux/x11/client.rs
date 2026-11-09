@@ -62,8 +62,8 @@ use gpui::{
     AnyWindowHandle, Bounds, ClipboardItem, CursorStyle, FileDropEvent, FrameRequestSource,
     Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, Pixels, PlatformDisplay,
     PlatformFrameSignal, PlatformInput, PlatformKeyboardLayout, PlatformWindow, Point,
-    RequestFrameOptions, ScrollDelta, Size, TouchPhase, WindowButtonLayout, WindowParams,
-    WindowVisibility, point, px,
+    RequestFrameOptions, ScrollDelta, Size, TouchPhase, WindowButtonLayout, WindowKind,
+    WindowParams, WindowVisibility, point, px,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
 
@@ -873,6 +873,27 @@ impl X11Client {
         }
     }
 
+    /// Reports `window`'s activity, and its popup parent's, once the events in hand have been
+    /// handled: focus leaving a window for its own popup arrives as a FocusOut and a FocusIn,
+    /// and only where it ended up says whether the window is still the one in front.
+    fn report_focus_later(&self, window: &X11WindowStatePtr) {
+        let window = window.clone();
+        let (handle, this) = {
+            let state = self.0.borrow();
+            (state.loop_handle.clone(), state.this.clone())
+        };
+        handle.insert_idle(move |_| {
+            let Some(client) = this.get_client() else {
+                return;
+            };
+            let focused = client.0.borrow().keyboard_focused_window;
+            window.report_activation(focused);
+            if let Some(parent) = window.popup_parent() {
+                parent.report_activation(focused);
+            }
+        });
+    }
+
     pub(crate) fn get_window(&self, win: xproto::Window) -> Option<X11WindowStatePtr> {
         let state = self.0.borrow();
         state
@@ -896,6 +917,7 @@ impl X11Client {
                     window_ref.is_mapped = true;
                 }
                 handle_visibility_changed(state, event.window);
+                self.get_window(event.window)?.focus_popup_if_pending();
             }
             Event::VisibilityNotify(event) => {
                 let mut state = self.0.borrow_mut();
@@ -903,6 +925,7 @@ impl X11Client {
                     window_ref.last_visibility = event.state;
                 }
                 handle_visibility_changed(state, event.window);
+                self.get_window(event.window)?.focus_popup_if_pending();
             }
             Event::ClientMessage(event) => {
                 let window = self.get_window(event.window)?;
@@ -1051,6 +1074,9 @@ impl X11Client {
                     .set_bounds(bounds)
                     .context("X11: Failed to set window bounds")
                     .log_err();
+                // Under a reparenting window manager a move of the frame reaches the client
+                // only as a synthetic ConfigureNotify, which still lands here.
+                window.reposition_popups();
             }
             Event::PropertyNotify(event) => {
                 let window = self.get_window(event.window)?;
@@ -1061,7 +1087,7 @@ impl X11Client {
             }
             Event::FocusIn(event) => {
                 let window = self.get_window(event.event)?;
-                window.set_active(true);
+                self.report_focus_later(&window);
                 let mut state = self.0.borrow_mut();
                 state.keyboard_focused_window = Some(event.event);
                 if let Some(handler) = state.xim_handler.as_mut() {
@@ -1072,7 +1098,7 @@ impl X11Client {
             }
             Event::FocusOut(event) => {
                 let window = self.get_window(event.event)?;
-                window.set_active(false);
+                self.report_focus_later(&window);
                 let mut state = self.0.borrow_mut();
                 // Set last scroll values to `None` so that a large delta isn't created if scrolling is done outside the window (the valuator is global)
                 reset_all_pointer_device_scroll_positions(&mut state.pointer_device_states);
@@ -1698,10 +1724,27 @@ impl X11Client {
         params: WindowParams,
     ) -> anyhow::Result<Box<dyn PlatformWindow>> {
         let mut state = self.0.borrow_mut();
-        let parent_window = state
-            .keyboard_focused_window
-            .and_then(|focused_window| state.windows.get(&focused_window))
-            .map(|w| w.window.clone());
+        let parent_window = if let WindowKind::AnchoredPopup(options) = &params.kind {
+            let parent = state
+                .windows
+                .values()
+                .find(|window_ref| {
+                    // Only open windows are in the map: one leaves it as it closes.
+                    window_ref
+                        .window
+                        .state
+                        .try_borrow()
+                        .is_ok_and(|window| window.handle == options.parent)
+                })
+                .map(|window_ref| window_ref.window.clone())
+                .context("X11: the parent of an anchored popup is not an open window")?;
+            Some(parent)
+        } else {
+            state
+                .keyboard_focused_window
+                .and_then(|focused_window| state.windows.get(&focused_window))
+                .map(|w| w.window.clone())
+        };
         let x_window = state
             .xcb_connection
             .generate_id()
