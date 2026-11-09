@@ -58,8 +58,8 @@ use std::time::Instant;
 use gpui::popup::{PopupAnchor, PopupConstraintAdjustment, PopupGravity, PopupOptions};
 use gpui::{
     AnyWindowHandle, App, AppContext as _, Bounds, Context, Entity, MouseButton, Pixels, Render,
-    SharedString, Size, Subscription, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowHandle, WindowKind, WindowOptions, div, point, prelude::*, px, size,
+    SharedString, Size, Subscription, Window, WindowBounds, WindowHandle, WindowKind,
+    WindowOptions, div, point, prelude::*, px, size,
 };
 
 use crate::controls::WidgetContext;
@@ -168,7 +168,7 @@ pub fn open_command_bar<V: ControlHost>(
 ) -> gpui::Result<()> {
     if let Some(open) = command_bar(this.control_state(), id) {
         let reopened = open.update(cx, |bar, bar_window, cx| {
-            bar_window.activate_window();
+            bar_window.activate();
             let focus = bar.query.read(cx).focus_handle.clone();
             bar_window.focus(&focus, cx);
         });
@@ -236,7 +236,7 @@ pub fn open_command_bar<V: ControlHost>(
                     };
                     if inside {
                         if !window.is_window_active() {
-                            window.activate_window();
+                            window.activate();
                         }
                         if let Some(focus) = &return_focus {
                             window.focus(focus, cx);
@@ -333,7 +333,13 @@ fn popup_window(
         is_resizable: false,
         is_minimizable: false,
         display_id,
-        window_background: WindowBackgroundAppearance::Transparent,
+        // The panel draws its own rounded fill; the scrim its own tint.
+        #[cfg(target_os = "macos")]
+        macos_window_background: gpui::MacosWindowBackground::Transparent,
+        #[cfg(target_os = "windows")]
+        windows_window_background: gpui::WindowsWindowBackground::Transparent,
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        linux_window_background: gpui::LinuxWindowBackground::Transparent,
         ..Default::default()
     }
 }
