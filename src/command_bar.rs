@@ -168,14 +168,18 @@ pub fn open_command_bar<V: ControlHost>(
 ) -> gpui::Result<()> {
     if let Some(open) = command_bar(this.control_state(), id) {
         let reopened = open.update(cx, |bar, bar_window, cx| {
+            if bar.ended {
+                return false;
+            }
             bar_window.activate();
             let focus = bar.query.read(cx).focus_handle.clone();
             bar_window.focus(&focus, cx);
+            true
         });
-        if reopened.is_ok() {
+        if matches!(reopened, Ok(true)) {
             return Ok(());
         }
-        forget(this.control_state_mut(), id);
+        forget(this.control_state_mut(), open);
     }
 
     let parent = window.window_handle();
@@ -210,6 +214,7 @@ pub fn open_command_bar<V: ControlHost>(
     };
     let finish: Finish = {
         let host = host.clone();
+        let slot = bar_slot.clone();
         let on_done: std::cell::RefCell<Option<Done<V>>> =
             std::cell::RefCell::new(Some(Box::new(on_done)));
         Rc::new(move |outcome: CommandBarOutcome, cx: &mut App| {
@@ -218,6 +223,7 @@ pub fn open_command_bar<V: ControlHost>(
             };
             let host = host.clone();
             let return_focus = return_focus.clone();
+            let slot = slot.clone();
             // Deferred: the bar's window is gone by now, and the host runs
             // outside whatever update closed it.
             cx.defer(move |cx| {
@@ -228,6 +234,10 @@ pub fn open_command_bar<V: ControlHost>(
                 if let Some(scrim) = scrim {
                     let _ = scrim.update(cx, |_, window, _| window.remove_window());
                 }
+                // An unsuccessful open has no session or completion to report.
+                let Some(closed) = slot.get() else {
+                    return;
+                };
                 let _ = parent.update(cx, |_, window, cx| {
                     let Some(host) = host.upgrade() else {
                         return;
@@ -236,16 +246,18 @@ pub fn open_command_bar<V: ControlHost>(
                         CommandBarOutcome::Chosen(_) => true,
                         CommandBarOutcome::Dismissed(why) => why.closed_from_inside(),
                     };
-                    if inside {
-                        if !window.is_window_active() {
-                            window.activate();
-                        }
-                        if let Some(focus) = &return_focus {
-                            window.focus(focus, cx);
-                        }
-                    }
                     host.update(cx, |host, cx| {
-                        forget(host.control_state_mut(), id);
+                        forget(host.control_state_mut(), closed);
+                        // A replacement bar may already own the keyboard by the
+                        // time this deferred completion reaches the host.
+                        if inside && host.control_state().command_bars.is_empty() {
+                            if !window.is_window_active() {
+                                window.activate();
+                            }
+                            if let Some(focus) = &return_focus {
+                                window.focus(focus, cx);
+                            }
+                        }
                         on_done(host, outcome, window, cx);
                         cx.notify();
                     });
@@ -289,10 +301,7 @@ pub fn open_command_bar<V: ControlHost>(
     };
     bar_slot.set(Some(bar));
 
-    let resized = cx.observe_window_bounds(window, move |host, window, cx| {
-        let Some(bar) = command_bar(host.control_state(), id) else {
-            return;
-        };
+    let resized = cx.observe_window_bounds(window, move |_, window, cx| {
         let viewport = window.viewport_size();
         if let Some(scrim) = scrim {
             let _ = scrim.update(cx, |_, scrim_window, _| scrim_window.resize(viewport));
@@ -452,8 +461,10 @@ fn command_bar(state: &ControlState, id: ComboId) -> Option<WindowHandle<Command
         .map(|session| session.window)
 }
 
-fn forget(state: &mut ControlState, id: ComboId) {
-    state.command_bars.retain(|session| session.id != id);
+fn forget(state: &mut ControlState, closed: WindowHandle<CommandBarWindow>) {
+    state
+        .command_bars
+        .retain(|session| session.window.window_id() != closed.window_id());
 }
 
 type Finish = Rc<dyn Fn(CommandBarOutcome, &mut App)>;
@@ -661,6 +672,31 @@ impl Render for CommandBarWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stale_completion_preserves_the_replacement_and_its_resize_subscription() {
+        let old = WindowHandle::new(gpui::WindowId::from(1));
+        let replacement = WindowHandle::new(gpui::WindowId::from(2));
+        let cancelled = Rc::new(Cell::new(false));
+        let mut state = ControlState::default();
+        state.command_bars.push(Session {
+            id: "commands",
+            window: replacement,
+            _resized: Subscription::new({
+                let cancelled = cancelled.clone();
+                move || cancelled.set(true)
+            }),
+        });
+        forget(&mut state, old);
+        assert_eq!(
+            command_bar(&state, "commands").unwrap().window_id(),
+            replacement.window_id()
+        );
+        assert!(!cancelled.get());
+        forget(&mut state, replacement);
+        assert!(!is_command_bar_open(&state, "commands"));
+        assert!(cancelled.get());
+    }
 
     #[test]
     fn unchanged_queries_reuse_rows_and_command_changes_invalidate_them() {
