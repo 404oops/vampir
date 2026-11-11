@@ -51,7 +51,7 @@ Only the roles in `Palette`. If a control needs a colour that is not there, eith
 
 Choose the app's hue and saturation in code to fit its purpose and visual identity. This is part of the developer's or coding agent's design work; it should not require asking the end user to choose a palette. A restrained editing surface and an expressive creative tool can use different colour strengths while sharing the same widgets. Expose theme pickers only when appearance customization is a product feature. The gallery's App theme section demonstrates the available controls for evaluation.
 
-Saturation scales palette chroma: `0.0` is greyscale across every role, `DEFAULT_SATURATION` (`1.0`) is the original restrained palette, and `MAX_SATURATION` (`4.0`) is more vivid. Hue changes the colour family; saturation changes its strength. Keep text legible against the fills it labels at every supported setting, and retain non-colour cues for meaning in a greyscale theme.
+Saturation scales palette chroma: `0.0` is greyscale across every role, `DEFAULT_SATURATION` (`1.0`) is the original restrained palette, and `MAX_SATURATION` (`3.0`) is more vivid. Above one, control chroma grows gently while backgrounds gain more colour, including light panel surfaces. Hue changes the colour family; saturation changes its strength. Keep text legible against the fills it labels at every supported setting, and retain non-colour cues for meaning in a greyscale theme.
 
 **Both schemes always.** A light-mode-only or dark-mode-only path is a bug; the `is_dark` flag exists so one code path covers both.
 

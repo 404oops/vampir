@@ -74,7 +74,7 @@ Every `ControlState` carries a theme: hue, saturation, and a colour scheme that 
 let palette = Palette::from_hue_and_saturation(210.0, 0.55, /* dark */ true);
 ```
 
-Saturation runs from zero (greyscale) through one (the original colour strength) to four (the vividness limit), in both light and dark schemes. `Palette::from_hue` keeps saturation one, and `Palette::neutral` is greyscale. Add theme pickers only when appearance customization is part of the product; see [Hosting › Themes](docs/hosting.md#themes) for app defaults and optional controls.
+Saturation runs from zero (greyscale) through one (the original colour strength) to three (the vividness limit), in both light and dark schemes. `Palette::from_hue` keeps saturation one, and `Palette::neutral` is greyscale. Add theme pickers only when appearance customization is part of the product; see [Hosting › Themes](docs/hosting.md#themes) for app defaults and optional controls.
 
 ## Try the gallery
 

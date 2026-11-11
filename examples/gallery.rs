@@ -1830,7 +1830,7 @@ impl Gallery {
                                             WidgetContext::new(palette, self, cx),
                                         )),
                                 )
-                                .child(caption(palette, "0% grey · 100% standard · 400% vivid")),
+                                .child(caption(palette, "0% grey · 100% standard · 300% vivid")),
                         )),
                     )
                     .child(
