@@ -671,6 +671,13 @@ pub trait Platform: 'static {
         _ = callback;
     }
 
+    /// Whether the desktop blends windows over one another, so a window with a translucent
+    /// background shows what is behind it. False on an X11 screen with no compositing manager,
+    /// where the transparent parts of a window come out opaque.
+    fn windows_are_composited(&self) -> bool {
+        true
+    }
+
     /// Returns the name of the display server or compositor, such as `"Wayland"`, `"X11"` or `"Headless"`.
     ///
     /// Returns an empty string by default.

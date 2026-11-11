@@ -682,6 +682,10 @@ impl Platform for LinuxPlatform {
         self.connection.borrow().compositor_name()
     }
 
+    fn windows_are_composited(&self) -> bool {
+        self.connection.borrow().windows_are_composited()
+    }
+
     fn graphical_environment(&self) -> Option<GraphicalEnvironment> {
         self.connection.borrow().graphical_environment()
     }

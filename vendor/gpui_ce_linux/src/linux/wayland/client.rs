@@ -1549,6 +1549,10 @@ impl WaylandConnection {
         "Wayland"
     }
 
+    pub(crate) fn windows_are_composited(&self) -> bool {
+        true
+    }
+
     pub(crate) fn window_identifier(
         &self,
     ) -> impl Future<Output = Option<WindowIdentifier>> + Send + 'static {

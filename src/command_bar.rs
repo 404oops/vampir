@@ -117,6 +117,8 @@ pub struct CommandBarOptions {
     /// Darken the host window's content, native view and all, while the bar
     /// is open, the way the in-window palette's scrim does. Off by default:
     /// a bar over live content is often there to act on what is showing.
+    /// Ignored where the desktop cannot blend one window over another (an
+    /// X11 screen with no compositing manager): the scrim would be opaque.
     pub dim: bool,
 }
 
@@ -196,7 +198,7 @@ pub fn open_command_bar<V: ControlHost>(
     // keyboard, so a press on it leaves the bar active long enough to hear
     // the press.
     let bar_slot: Rc<Cell<Option<WindowHandle<CommandBarWindow>>>> = Rc::default();
-    let scrim = if options.dim {
+    let scrim = if options.dim && cx.windows_are_composited() {
         let slot = bar_slot.clone();
         Some(cx.open_window(
             popup_window(
@@ -649,7 +651,13 @@ impl Render for CommandBarWindow {
             ease_out_cubic(progress(opened_at, self.controls.scaled(COMBO_REVEAL)))
         });
         let fill = palette_fill(palette);
-        let element = keyboard::handle_keys(div().id("vampir-command-bar"), self, cx)
+        let mut root = div().id("vampir-command-bar");
+        if !cx.windows_are_composited() {
+            // Nothing blends this window over the host, so what it leaves clear — the
+            // corners outside the panel's radius, the panel while it fades — would be black.
+            root = root.bg(fill);
+        }
+        let element = keyboard::handle_keys(root, self, cx)
             .size_full()
             .text_color(palette.text_primary)
             .font(crate::ui_font_face())

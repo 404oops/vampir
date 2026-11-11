@@ -1,17 +1,18 @@
 # Local changes to the vendored GPUI-CE
 
-Three changes to GPUI-CE 0.3.0.
+Four changes to GPUI-CE 0.3.0.
 
 - **Anchored popups**, in four crates: `WindowKind::AnchoredPopup`, which GPUI-CE defines and only its Wayland backend implements, works on macOS, Windows and X11. The toolkit's command bar (`src/command_bar.rs`) is a popup of this kind: a window owned by the host's, above it and no other application's, over a live native view the toolkit cannot draw over from inside the host window.
 - **Native child windows on Windows**: a native child window a host embeds shows and paints ([below](#native-child-windows-on-windows)).
 - **The macOS launch callback runs without the platform's lock.** 0.3.0 calls it inside `if let Some(callback) = platform.0.lock().finish_launching.take()`, and under the 2024 edition that guard lives to the end of the block, so the first thing a launch does through the platform — open a window, set the menus — waits on the lock forever. gpui-ce's main branch already takes the callback out first.
+- **`App::windows_are_composited`** (`Platform::windows_are_composited`, true by default): whether the desktop blends one window over another. False on an X11 screen where nothing owns the `_NET_WM_CM_Sn` selection, where the clear parts of a window come out opaque. The command bar leaves its scrim out there and fills its own corners.
 
 Each commit touching `vendor/` after the one that adds it is one of these, and says what it does in full.
 
 ## The contract every backend keeps
 
 - **Owned.** The popup is owned by the window `PopupOptions::parent` names: a child window (AppKit), an owned window (Win32), a transient (X11). A parent that is not open is an error, never an unowned window.
-- **Stacked above its parent only.** Never globally on top: no raised AppKit window level, no `WS_EX_TOPMOST`, no `_NET_WM_STATE_ABOVE`. A popup shown later is in front of one shown earlier.
+- **Stacked above its parent only.** Never globally on top: no raised AppKit window level, no `WS_EX_TOPMOST`, no `_NET_WM_STATE_ABOVE`. A popup shown later is in front of one shown earlier. On X11 an override-redirect window is above every managed one while it is open, so a popup there relies on closing when its parent stops being the active window, as the command bar and its scrim do.
 - **Placed by `gpui::popup::place_popup`.** One function in `gpui-ce` (`src/platform/popup.rs`) resolves the anchor, gravity, offset and the flip, slide and resize constraints against the parent's content area and the work area of its display. Each backend converts its own coordinates in and out, at the parent's scale. Tested in `tests/popup_placement.rs`.
 - **Follows its parent.** A parent move places its popups again. `Window::set_popup_anchor` (new; a no-op on other kinds and backends) re-anchors one when its anchor moves without the parent moving, as on a resize. `resize` keeps the anchor.
 - **Closes with its parent.** Each popup's own close callback runs once.
@@ -23,11 +24,11 @@ Each commit touching `vendor/` after the one that adds it is one of these, and s
 
 | | macOS | Windows | X11 |
 |---|---|---|---|
-| Window | Activating `NSPanel`, normal level, `addChildWindow:ordered:` | `WS_POPUP` tool window, owner = parent `HWND` | Transient `DIALOG` (not modal), undecorated; override-redirect when `focus: false` |
+| Window | Activating `NSPanel`, normal level, `addChildWindow:ordered:` | `WS_POPUP` tool window, owner = parent `HWND` | Override-redirect `POPUP_MENU`, transient for the parent; never has the X input focus, the parent passes it its keystrokes |
 | Follows parent | AppKit moves child windows; `windowDidMove` re-applies constraints | Owner's `WM_MOVE` / `WM_DPICHANGED` | Parent's `ConfigureNotify` |
 | Minimised parent | Ordered out with it (AppKit) | Hidden with it (Win32) | Closed when the parent becomes iconic |
-| Parent's active look | Popup never becomes main | `WM_NCACTIVATE` kept active for its own popups | GPUI-drawn title bars follow `is_active`; the window manager may draw its own frame inactive |
-| No-focus popup | `canBecomeKeyWindow` is NO | `WS_EX_NOACTIVATE`, `MA_NOACTIVATE` | Override-redirect, `WM_HINTS` input off |
+| Parent's active look | Popup never becomes main | `WM_NCACTIVATE` kept active for its own popups | The parent keeps the X input focus, so the window manager keeps drawing it active |
+| No-focus popup | `canBecomeKeyWindow` is NO | `WS_EX_NOACTIVATE`, `MA_NOACTIVATE` | The same window, without the keystrokes |
 
 ## Native child windows on Windows
 
@@ -43,4 +44,5 @@ GPUI's window is `WS_EX_NOREDIRECTIONBITMAP`, so a plain child window has no sur
 
 - **macOS, 0.3.0:** on screen, in the gallery's Native view page, over an `NSTextView` and a spinning `NSProgressIndicator`: opening, typing, choosing, Escape (the caret back in the text view), a click on the parent, the scrim and a click on it, and the parent keeping its active title bar, in both schemes.
 - **Windows, 0.2.2:** on screen on Windows 11 (x86_64-pc-windows-gnu; scale 1.0, and the bar's placement, size, choosing and typing at 2.0, and through a live change of the display from 2.0 to 1.0 with the window open), in the gallery's Native view page, over a layered `EDIT` control: opening, typing, choosing, Escape, a click on the parent, a click on the native view, another application coming forward, the scrim and a click on it, moving and resizing the parent with the bar open, minimising it, and the parent keeping its active caption. Not yet across monitors of different DPIs.
-- **Windows, 0.3.0, and X11:** type-checked and linted from macOS, and built and tested by CI. Not yet run on screen. `tools/check-windows.sh` and `tools/check-linux.sh` run the check, or the lints with `clippy` as the first argument: zig stands in for the C and resource compilers, the Windows renderer's shaders are allowed to be missing, and nothing is linked.
+- **X11, 0.3.0:** on screen under GNOME Shell 48.7 (mutter) on Debian 13 (aarch64, virtio GPU, scale 1), in the gallery's Native view page, over the colour-cycling child window, in both schemes: opening by shortcut and by button, typing, the arrow keys, choosing, Escape (the gallery's shortcuts work again without a click), a click on the parent, another application coming forward, the scrim and a click on it, the parent keeping its active title bar, dragging the parent (the bar closes as deactivated) and closing it with the bar open. The same sequence in Xephyr under xfwm4 4.20 (composited: the scrim tints), and under openbox, IceWM and i3 with floating windows (not composited: no scrim, a press outside the bar closes it as deactivated), and under openbox with picom (the scrim tints). Not yet: minimising, workspaces, HiDPI, an input method.
+- **Windows, 0.3.0:** type-checked and linted from macOS, and built and tested by CI, as X11 is. Not yet run on screen. `tools/check-windows.sh` and `tools/check-linux.sh` run the check, or the lints with `clippy` as the first argument: zig stands in for the C and resource compilers, the Windows renderer's shaders are allowed to be missing, and nothing is linked.

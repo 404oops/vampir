@@ -1722,6 +1722,32 @@ impl X11Client {
         "X11"
     }
 
+    /// Asked each time rather than remembered from startup: a compositing manager can start
+    /// or stop under a running application.
+    ///
+    /// EWMH: a compositing manager owns the `_NET_WM_CM_Sn` selection of screen `n`.
+    /// `check_compositor_present` is not this question: it is also true under any window
+    /// manager that sets `_NET_SUPPORTING_WM_CHECK`, composited or not.
+    pub(crate) fn windows_are_composited(&self) -> bool {
+        let state = self.0.borrow();
+        let selection = format!("_NET_WM_CM_S{}", state.x_root_index);
+        get_reply(
+            || format!("Failed to intern {selection}"),
+            state
+                .xcb_connection
+                .intern_atom(false, selection.as_bytes()),
+        )
+        .and_then(|atom| {
+            get_reply(
+                || format!("Failed to get the owner of {selection}"),
+                state.xcb_connection.get_selection_owner(atom.atom),
+            )
+        })
+        .map(|reply| reply.owner != x11rb::NONE)
+        .log_with_level(Level::Debug)
+        .unwrap_or(false)
+    }
+
     pub(crate) fn with_common<R>(&self, f: impl FnOnce(&mut LinuxCommon) -> R) -> R {
         let common = self.0.borrow().common.clone();
         f(&mut common.borrow_mut())

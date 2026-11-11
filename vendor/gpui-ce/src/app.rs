@@ -2389,6 +2389,12 @@ impl App {
         self.platform.app_path()
     }
 
+    /// Whether the desktop blends windows over one another, so a window with a translucent
+    /// background shows what is behind it. False on an X11 screen with no compositing manager.
+    pub fn windows_are_composited(&self) -> bool {
+        self.platform.windows_are_composited()
+    }
+
     /// On Linux, returns the name of the compositor in use. On the web, returns `"Web"`.
     ///
     /// Returns an empty string on other platforms.

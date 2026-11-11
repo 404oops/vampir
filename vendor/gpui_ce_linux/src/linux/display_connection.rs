@@ -104,6 +104,10 @@ impl DisplayConnection {
         dispatch!(self, connection => connection.compositor_name(), headless => "headless")
     }
 
+    pub(crate) fn windows_are_composited(&self) -> bool {
+        dispatch!(self, connection => connection.windows_are_composited(), headless => true)
+    }
+
     /// Whether a window is open.
     pub(crate) fn has_windows(&self) -> bool {
         dispatch!(self, connection => connection.has_windows(), headless(connection) => connection.has_windows())
