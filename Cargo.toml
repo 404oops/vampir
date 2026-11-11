@@ -100,6 +100,14 @@ x11rb = "0.13"
 name = "gallery"
 path = "examples/gallery.rs"
 
+# Here rather than only on CI's command line, so an editor shows them too.
+# CI turns every warning into an error, so a lint goes in this list only
+# once the crate is clean of it on all three platforms.
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+missing_errors_doc = "warn"
+
 [profile.release]
 lto = "thin"
 

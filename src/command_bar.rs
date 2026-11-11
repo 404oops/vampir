@@ -154,6 +154,8 @@ fn bar_width(viewport: gpui::Size<gpui::Pixels>) -> f32 {
 /// [`command_palette`](crate::command_palette); `on_done` hears how it
 /// ended — see the [module documentation](self) for when.
 ///
+/// # Errors
+///
 /// Fails when the GPUI backend cannot open a window owned by another.
 #[allow(clippy::too_many_arguments)]
 pub fn open_command_bar<V: ControlHost>(
@@ -213,7 +215,6 @@ pub fn open_command_bar<V: ControlHost>(
         None
     };
     let finish: Finish = {
-        let host = host.clone();
         let slot = bar_slot.clone();
         let on_done: std::cell::RefCell<Option<Done<V>>> =
             std::cell::RefCell::new(Some(Box::new(on_done)));

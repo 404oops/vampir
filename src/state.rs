@@ -1063,15 +1063,17 @@ impl ControlState {
     fn set_list_highlight(&self, list: Tag, index: usize, to: u64, moved: bool) {
         let frame = self.frame.get();
         let mut records = self.records.borrow_mut();
-        let entry = records.entry(Kind::List.slot(list)).or_insert(Entry {
-            touched: frame,
-            record: Record::List {
-                highlight: index,
-                query: Tag::new("").0,
-                item: to,
-                chosen: moved,
-            },
-        });
+        let entry = records
+            .entry(Kind::List.slot(list))
+            .or_insert_with(|| Entry {
+                touched: frame,
+                record: Record::List {
+                    highlight: index,
+                    query: Tag::new("").0,
+                    item: to,
+                    chosen: moved,
+                },
+            });
         entry.touched = frame;
         if let Record::List {
             highlight,

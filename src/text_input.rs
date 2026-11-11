@@ -978,8 +978,8 @@ impl EntityInputHandler for TextInput {
         let range = range_utf16
             .as_ref()
             .map(|range_utf16| self.range_from_utf16(range_utf16))
-            .or(self.marked_range.clone())
-            .unwrap_or(self.selected_range.clone());
+            .or_else(|| self.marked_range.clone())
+            .unwrap_or_else(|| self.selected_range.clone());
 
         // Committing an IME composition shouldn't undo to the half-composed
         // state; the pre-composition snapshot was taken when marking began.
@@ -1008,8 +1008,8 @@ impl EntityInputHandler for TextInput {
         let range = range_utf16
             .as_ref()
             .map(|range_utf16| self.range_from_utf16(range_utf16))
-            .or(self.marked_range.clone())
-            .unwrap_or(self.selected_range.clone());
+            .or_else(|| self.marked_range.clone())
+            .unwrap_or_else(|| self.selected_range.clone());
 
         // Snapshot once per composition, before the first marked edit.
         if self.marked_range.is_none() {

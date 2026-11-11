@@ -579,7 +579,6 @@ pub fn tab_bar_layout<V: ControlHost>(
     // strip moved. At either end it lets the event go to the page.
     let wheel_from: Rc<Cell<Option<f32>>> = Rc::default();
     let well_probe = {
-        let weak = weak.clone();
         let scroll = scroll.clone();
         let wheel_from = wheel_from.clone();
         canvas(

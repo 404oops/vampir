@@ -610,7 +610,7 @@ fn result_rows<V: ControlHost>(
     results: &[SearchResult],
     highlighted: usize,
     ctx: WidgetContext<'_, '_, '_, V>,
-    on_activate: Activate<V>,
+    on_activate: &Activate<V>,
 ) -> (Vec<AnyElement>, Vec<Range<f32>>) {
     let WidgetContext { palette, view, cx } = ctx;
     let state = view.control_state();
@@ -681,7 +681,7 @@ fn visible_result_rows<V: ControlHost>(
     visible: Range<usize>,
     highlighted: usize,
     ctx: WidgetContext<'_, '_, '_, V>,
-    on_activate: Activate<V>,
+    on_activate: &Activate<V>,
 ) -> Vec<AnyElement> {
     let WidgetContext { palette, view, cx } = ctx;
     let state = view.control_state();
@@ -903,7 +903,8 @@ pub fn command_list<V: ControlHost>(
     // borrowed for as long as the list lived and stop the caller building
     // anything else with it.
     let results: Vec<SearchResult> = matches.iter().map(command_result).collect();
-    let (rows, _) = result_rows(id, "", &results, highlighted, ctx, Rc::new(on_activate));
+    let on_activate: Activate<V> = Rc::new(on_activate);
+    let (rows, _) = result_rows(id, "", &results, highlighted, ctx, &on_activate);
     // Clipped, so a row sliding up from where it was emerges from the list's
     // edge instead of crossing whatever sits below it.
     div()
@@ -1090,7 +1091,7 @@ pub(crate) fn result_list<V: ControlHost>(
         visible,
         highlighted,
         ctx,
-        on_activate,
+        &on_activate,
     );
     ResultList {
         elements,
