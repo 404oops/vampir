@@ -10,6 +10,10 @@
 //! toolkit's. What is left here is the gallery's own data, its pages, and
 //! the menu bar and shortcuts a real application owns.
 
+// Windows opens a console beside any program that does not say it is a GUI
+// one. A host copied from here should not bring a terminal with it.
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use gpui::{
     App, Bounds, Context, Entity, KeyBinding, Menu, MenuItem as OsMenuItem, Point, ScrollHandle,
     SharedString, SystemMenuType, TitlebarOptions, Window, WindowBounds, WindowOptions, actions,
