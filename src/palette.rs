@@ -11,8 +11,8 @@ use crate::color::{TRANSPARENT, WHITE, argb, oklch_to_color};
 
 /// The toolkit's original pastel chroma, unchanged by the saturation gain.
 pub const DEFAULT_SATURATION: f64 = 1.0;
-/// Twice the original chroma; colors outside sRGB are clipped into its gamut.
-pub const MAX_SATURATION: f64 = 2.0;
+/// Four times the original chroma; colors outside sRGB are clipped into its gamut.
+pub const MAX_SATURATION: f64 = 4.0;
 
 pub(crate) fn normalized_saturation(saturation: f64) -> f64 {
     if saturation.is_nan() {
@@ -96,8 +96,8 @@ impl Palette {
 
     /// The palette with a gain on every role's OKLCH chroma, including
     /// destructive colors: `0` is grayscale, `1` the original pastels, and
-    /// `2` vivid. Lightness stays the same before sRGB gamut clipping.
-    /// Values outside `0..=2` are clamped; NaN uses [`DEFAULT_SATURATION`].
+    /// `4` the vividness limit. Lightness stays the same before sRGB gamut clipping.
+    /// Values outside `0..=4` are clamped; NaN uses [`DEFAULT_SATURATION`].
     pub fn from_hue_and_saturation(hue: f64, saturation: f64, dark: bool) -> Self {
         let saturation = normalized_saturation(saturation);
         let color = |l: f64, c: f64, h: f64| oklch_to_color(l, c * saturation, h);
@@ -299,7 +299,7 @@ mod tests {
                     Palette::from_hue(hue, dark),
                     Palette::from_hue_and_saturation(hue, DEFAULT_SATURATION, dark)
                 );
-                for saturation in [0.5, 1.0, 2.0] {
+                for saturation in [0.5, 1.0, 2.0, 3.0, MAX_SATURATION] {
                     let palette = Palette::from_hue_and_saturation(hue, saturation, dark);
                     let lightness = if dark { 0.78 } else { 0.62 };
                     assert_eq!(
@@ -318,7 +318,9 @@ mod tests {
             (f64::NEG_INFINITY, 0.0),
             (-1.0, 0.0),
             (0.5, 0.5),
-            (3.0, MAX_SATURATION),
+            (3.0, 3.0),
+            (4.0, 4.0),
+            (5.0, MAX_SATURATION),
             (f64::INFINITY, MAX_SATURATION),
         ] {
             assert_eq!(normalized_saturation(input), expected);

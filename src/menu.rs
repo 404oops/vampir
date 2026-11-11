@@ -1435,7 +1435,7 @@ mod tests {
     #[test]
     fn highlighted_menu_text_and_marks_use_the_fills_label_role() {
         for hue in (0..360).step_by(30) {
-            for saturation in [0.0, 1.0, 2.0] {
+            for saturation in [0.0, 1.0, 2.0, crate::MAX_SATURATION] {
                 for dark in [false, true] {
                     let palette =
                         crate::Palette::from_hue_and_saturation(hue as f64, saturation, dark);

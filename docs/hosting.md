@@ -109,7 +109,7 @@ Every `ControlState` carries a `Theme`: a hue, a saturation, and a `Scheme` that
 
 Choose the app's hue and saturation in code as part of its design, based on its purpose and existing visual identity. A quiet editing tool might use a restrained saturation; an expressive creative tool might use more. These are defaults for the developer or coding agent to choose, without requiring the end user to configure a theme. Add theme controls only when customization serves the product. The gallery's App theme controls on the Colour page demonstrate the APIs for evaluation.
 
-Saturation is a multiplier from `0.0` to `MAX_SATURATION` (`2.0`): zero makes every palette role grey, `DEFAULT_SATURATION` (`1.0`) preserves the toolkit's original colour strength, and two is more vivid. It applies to the whole palette, including surfaces and semantic colours. Values outside the range are clamped; NaN uses the default. `Palette::from_hue(hue, dark)` retains saturation one; `Palette::from_hue_and_saturation(hue, saturation, dark)` sets it explicitly, and `Palette::neutral(dark)` is greyscale.
+Saturation is a multiplier from `0.0` to `MAX_SATURATION` (`4.0`): zero makes every palette role grey, `DEFAULT_SATURATION` (`1.0`) preserves the toolkit's original colour strength, and four is the vividness limit. It applies to the whole palette, including surfaces and semantic colours. Values outside the range are clamped; NaN uses the default. `Palette::from_hue(hue, dark)` retains saturation one; `Palette::from_hue_and_saturation(hue, saturation, dark)` sets it explicitly, and `Palette::neutral(dark)` is greyscale.
 
 Follow the desktop's scheme with `self.controls.observe_appearance(window, cx)` in the view's constructor. `Scheme::System` means the desktop's choice; `Light` and `Dark` are explicit overrides if the product needs them. Configure the app's colours before the first render:
 
@@ -119,7 +119,7 @@ self.controls.theme.saturation = 0.55;
 self.controls.observe_appearance(window, cx);
 ```
 
-If the app offers theme customization, `scheme_picker`, `hue_picker` and `saturation_picker` bind directly to `ControlState::theme`; the toolkit handles their drags. The generic `saturation_slider` takes a saturation in `0.0..=2.0` and reports a normalized `0.0..=1.0` track position through `ControlHost::track_dragged`, like other sliders. Convert that position with `Theme::saturation_from_track(at.x)` before storing it.
+If the app offers theme customization, `scheme_picker`, `hue_picker` and `saturation_picker` bind directly to `ControlState::theme`; the toolkit handles their drags. The generic `saturation_slider` takes a saturation in `0.0..=4.0` and reports a normalized `0.0..=1.0` track position through `ControlHost::track_dragged`, like other sliders. Convert that position with `Theme::saturation_from_track(at.x)` before storing it.
 
 The window's own ground is `palette.backdrop`, lit with `vampir::ground(palette.backdrop)` on the root; `scroll_area` fades scrolling content into it at the right height. `.font(vampir::ui_font_face())` on the root sets text in the system's interface face, with the platform's symbol faces behind it: GPUI-CE's text system falls back only to a few text faces, and draws a stand-in for a symbol none of them has, such as ▣ or ✕ in a menu icon. `ui_font()` is the face's name alone.
 

@@ -108,7 +108,7 @@ The tree stays the host's, and `flatten_tree` walks it into `TreeRow`s each fram
 
 ![The colour page, with an Oklch chroma and lightness pad](colour.png)
 
-`hue_slider`, `saturation_slider`, `color_pad` (chroma across, lightness up), `swatch_grid`, `hue_wheel`. The hue, pad, swatches and wheel use `Oklch`; the saturation slider uses the palette's `0.0..=2.0` chroma multiplier. Zero is grey, one is the original colour strength, and two is more vivid. Its drag reports a normalized track position; convert with `Theme::saturation_from_track` when storing the value.
+`hue_slider`, `saturation_slider`, `color_pad` (chroma across, lightness up), `swatch_grid`, `hue_wheel`. The hue, pad, swatches and wheel use `Oklch`; the saturation slider uses the palette's `0.0..=4.0` chroma multiplier. Zero is grey, one is the original colour strength, and four is the vividness limit. Its drag reports a normalized track position; convert with `Theme::saturation_from_track` when storing the value.
 
 ## Shortcuts — `vampir::shortcut`
 
