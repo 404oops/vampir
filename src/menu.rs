@@ -903,13 +903,22 @@ fn sizing_row<I>(item: &MenuItem<I>, icons: bool) -> Option<gpui::AnyElement> {
     })
 }
 
-/// Whether a click on a row should count. A row click must belong to this
-/// opening and to a level that has finished arriving; see
-/// `ControlState::menu_takes_click`. A click counted
-/// past one is the second half of a double-click whose first half changed
-/// the level, so the row under it now was never aimed at either.
-fn takes_click(state: &ControlState, opened_at: Instant, click_count: usize) -> bool {
-    click_count <= 1 && state.menu_takes_click(opened_at)
+#[derive(Clone, Copy)]
+enum RowClick {
+    Navigate,
+    Activate,
+}
+
+// A stationary pointer can produce click counts above one across several
+// intentional back/forward steps. Only actions need protection from a late
+// double-click running the command that slid under the pointer.
+fn takes_click(
+    state: &ControlState,
+    opened_at: Instant,
+    click_count: usize,
+    kind: RowClick,
+) -> bool {
+    (matches!(kind, RowClick::Navigate) || click_count <= 1) && state.menu_takes_click(opened_at)
 }
 
 /// The pointer lights the row it is over for the keyboard too. A disabled
@@ -1010,7 +1019,12 @@ fn render_back<V: ControlHost>(
             }
         }))
         .on_click(cx.listener(move |this, event: &ClickEvent, _window, cx| {
-            if takes_click(this.control_state(), opened_at, event.click_count()) {
+            if takes_click(
+                this.control_state(),
+                opened_at,
+                event.click_count(),
+                RowClick::Navigate,
+            ) {
                 this.control_state_mut().back_menu();
                 cx.notify();
             }
@@ -1124,8 +1138,12 @@ fn render_item<V: ControlHost, I: Clone + 'static>(
                 .when(*enabled, |el| {
                     el.cursor_pointer().on_click(cx.listener(
                         move |this, event: &ClickEvent, _window, cx| {
-                            if takes_click(this.control_state(), opened_at, event.click_count())
-                                && let Some(at) = reachable_at
+                            if takes_click(
+                                this.control_state(),
+                                opened_at,
+                                event.click_count(),
+                                RowClick::Navigate,
+                            ) && let Some(at) = reachable_at
                             {
                                 this.control_state_mut()
                                     .enter_menu(index, at, identity, false);
@@ -1187,7 +1205,12 @@ fn render_item<V: ControlHost, I: Clone + 'static>(
                     let on_activate = on_activate.clone();
                     el.cursor_pointer().on_click(cx.listener(
                         move |this, event: &ClickEvent, window, cx| {
-                            if takes_click(this.control_state(), opened_at, event.click_count()) {
+                            if takes_click(
+                                this.control_state(),
+                                opened_at,
+                                event.click_count(),
+                                RowClick::Activate,
+                            ) {
                                 activate(this, id.clone(), opened_at, window, cx, &on_activate);
                                 cx.notify();
                             }
@@ -1371,9 +1394,9 @@ pub use crate::state::OpenMenu as ContextMenu;
 #[cfg(test)]
 mod tests {
     use super::{
-        MenuBranch, MenuCommand, MenuIcon, MenuItem, every_row, fit_to_window, menu_command,
-        menu_commands, menu_height, menu_row_labels, reachable_indices, settle_levels,
-        step_highlight, submenu_identity, takes_click, visible_level,
+        MenuBranch, MenuCommand, MenuIcon, MenuItem, RowClick, every_row, fit_to_window,
+        menu_command, menu_commands, menu_height, menu_row_labels, reachable_indices,
+        settle_levels, step_highlight, submenu_identity, takes_click, visible_level,
     };
     use crate::ControlState;
     use crate::keyboard::Key;
@@ -1688,22 +1711,30 @@ mod tests {
         assert_eq!(menu_height(&long, false), super::MENU_MAX_HEIGHT);
     }
 
-    /// The second click of a double-click is refused however late it comes,
-    /// and any click is refused while a level is still arriving.
+    /// Navigation accepts stationary repeated clicks after settling; actions
+    /// still reject the tail of a double-click. Moving levels accept neither.
     #[test]
-    fn row_clicks_need_a_single_click_on_a_settled_level() {
+    fn repeated_navigation_settles_without_requiring_pointer_movement() {
         let mut state = ControlState::new();
         state.open_menu("row", gpui::point(gpui::px(0.0), gpui::px(0.0)), "");
         let opening = state.menu_opened_at().expect("open");
-        assert!(takes_click(&state, opening, 1));
-        assert!(!takes_click(&state, opening, 2));
+        assert!(takes_click(&state, opening, 1, RowClick::Activate));
+        assert!(!takes_click(&state, opening, 2, RowClick::Activate));
 
         state.enter_menu(1, 1, 7, false);
-        assert!(!takes_click(&state, opening, 1));
+        assert!(!takes_click(&state, opening, 1, RowClick::Activate));
+        assert!(!takes_click(&state, opening, 2, RowClick::Navigate));
         state.set_time_scale(0.001);
         std::thread::sleep(std::time::Duration::from_millis(2));
-        assert!(takes_click(&state, opening, 1));
-        assert!(!takes_click(&state, opening, 2));
+        assert!(takes_click(&state, opening, 1, RowClick::Activate));
+        assert!(!takes_click(&state, opening, 2, RowClick::Activate));
+        assert!(takes_click(&state, opening, 2, RowClick::Navigate));
+        assert!(state.back_menu());
+        assert!(!takes_click(&state, opening, 3, RowClick::Navigate));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert!(takes_click(&state, opening, 3, RowClick::Navigate));
+        state.close_menu();
+        assert!(!takes_click(&state, opening, 4, RowClick::Navigate));
     }
 
     /// The panel's height is worked out from the same constants the rows
