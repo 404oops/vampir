@@ -78,6 +78,7 @@ x11rb::atom_manager! {
         _NET_WM_WINDOW_TYPE,
         _NET_WM_WINDOW_TYPE_NOTIFICATION,
         _NET_WM_WINDOW_TYPE_DIALOG,
+        _NET_WM_WINDOW_TYPE_POPUP_MENU,
         _NET_WM_STATE_MODAL,
         _NET_WM_SYNC,
         _NET_SUPPORTED,
@@ -239,11 +240,12 @@ fn find_visuals(xcb: &XCBConnection, screen_index: usize) -> VisualSet {
 
 /// What a [`WindowKind::AnchoredPopup`] keeps between placements.
 ///
-/// The popup is an ordinary managed top-level, transient for its parent, that this backend
-/// positions itself: at creation, whenever the parent moves (the parent's ConfigureNotify), when
-/// the anchor changes and when it is resized. `PopupOptions::grab` has no effect on X11: the
-/// popup takes the keyboard like any focused window, and dismissing it on an outside click is
-/// up to the caller.
+/// The popup is an override-redirect top-level, as a menu is, that this backend positions
+/// itself: at creation, whenever the parent moves (the parent's ConfigureNotify), when the
+/// anchor changes and when it is resized. It never has the X input focus: the parent keeps
+/// it and stays the active window, and the client sends the parent's keystrokes to the popup
+/// that asked for the keyboard until a press on the parent takes it back.
+/// `PopupOptions::grab` has no effect on X11.
 struct PopupState {
     options: PopupOptions,
     parent: X11WindowStatePtr,
@@ -475,6 +477,9 @@ pub struct X11WindowState {
     /// The anchored popups this window is the parent of. Unlike `children` they do not block
     /// input; they follow this window and close with it.
     popups: FxHashSet<xproto::Window>,
+    /// The popup of this window that keystrokes go to while this window has the X input
+    /// focus.
+    keyboard_popup: Option<xproto::Window>,
     /// The keyboard focus last reported to GPUI, so that focus moving between this window and
     /// its own popups is not reported as it going inactive and straight back.
     reported_active: Option<bool>,
@@ -742,13 +747,11 @@ impl X11WindowState {
             // https://stackoverflow.com/questions/43218127/x11-xlib-xcb-creating-a-window-requires-border-pixel-if-specifying-colormap-wh
             .border_pixel(visual_set.black_pixel)
             .colormap(colormap)
-            // A popup that never takes the keyboard — a scrim between a parent and a focused
-            // popup — is left to itself: managed, a click on it could get it raised over the
-            // popup it sits under, or focused. It closes with its parent, and the toolkit closes
-            // it when the focused popup goes, so it is never left above other applications.
-            .override_redirect(
-                (params.kind == WindowKind::PopUp || (popup.is_some() && !focus_on_map)) as u32,
-            )
+            // An anchored popup is override-redirect, as a menu is: the window manager neither
+            // focuses, raises nor animates it, so the parent stays the active window under it
+            // and the popups keep the order they were mapped in, a scrim under the popup opened
+            // after it. A managed popup takes the focus, and the parent is drawn inactive.
+            .override_redirect((params.kind == WindowKind::PopUp || popup.is_some()) as u32)
             .event_mask(
                 xproto::EventMask::EXPOSURE
                     | xproto::EventMask::STRUCTURE_NOTIFY
@@ -904,10 +907,9 @@ impl X11WindowState {
             }
 
             if let Some((_, parent)) = &popup {
-                // A managed window rather than override-redirect, so the window manager gives
-                // it the keyboard and an input method can attach to it; transient for the
-                // parent named in the options, never the focused window, which is nobody's
-                // when a native child window of the parent holds the keyboard.
+                // The window manager does not manage an override-redirect window; these say
+                // what it is to a compositor and to tools that read them. Transient for the
+                // parent named in the options, never the focused window.
                 check_reply(
                     || "X11 ChangeProperty32 setting WM_TRANSIENT_FOR for a popup failed.",
                     xcb.change_property32(
@@ -918,11 +920,6 @@ impl X11WindowState {
                         &[parent.x_window],
                     ),
                 )?;
-                // DIALOG rather than UTILITY: every common window manager focuses a dialog
-                // transient for the active window when it maps, while some (xfwm4, openbox)
-                // treat utility windows as palettes that do not take focus. Being transient
-                // keeps it above its parent without _NET_WM_STATE_ABOVE, which would put it
-                // above every other application too.
                 check_reply(
                     || "X11 ChangeProperty32 setting window type for a popup failed.",
                     xcb.change_property32(
@@ -930,7 +927,7 @@ impl X11WindowState {
                         x_window,
                         atoms._NET_WM_WINDOW_TYPE,
                         xproto::AtomEnum::ATOM,
-                        &[atoms._NET_WM_WINDOW_TYPE_DIALOG],
+                        &[atoms._NET_WM_WINDOW_TYPE_POPUP_MENU],
                     ),
                 )?;
                 check_reply(
@@ -958,8 +955,11 @@ impl X11WindowState {
                         bytemuck::cast_slice::<u32, u8>(&MOTIF_NO_DECORATIONS),
                     ),
                 )?;
+                // Never the X input focus, even for a popup that takes the keyboard: its
+                // parent keeps the focus and this backend hands the popup the keystrokes, the
+                // way a menu gets them.
                 let mut wm_hints = WmHints::new();
-                wm_hints.input = Some(focus_on_map);
+                wm_hints.input = Some(false);
                 check_reply(
                     || "X11 ChangeProperty for WM_HINTS on a popup failed.",
                     wm_hints.set(xcb, x_window),
@@ -1175,6 +1175,7 @@ impl X11WindowState {
                 children: FxHashSet::default(),
                 popup,
                 popups: FxHashSet::default(),
+                keyboard_popup: None,
                 reported_active: None,
                 client,
                 executor,
@@ -1238,7 +1239,12 @@ impl Drop for X11Window {
 
         if let Some(popup) = state.popup.as_ref() {
             let parent = &popup.parent;
-            parent.state.borrow_mut().popups.remove(&self.0.x_window);
+            let mut parent_state = parent.state.borrow_mut();
+            parent_state.popups.remove(&self.0.x_window);
+            if parent_state.keyboard_popup == Some(self.0.x_window) {
+                parent_state.keyboard_popup = None;
+            }
+            drop(parent_state);
             // Hand the keyboard to the parent rather than leave it to the revert-to of a
             // destroyed window, which some window managers resolve to whatever is under the
             // pointer or to nothing at all. A native child of the parent that held the
@@ -1690,10 +1696,11 @@ impl X11WindowStatePtr {
     /// viewable window. Called on the timestamp's PropertyNotify, on MapNotify and on
     /// VisibilityNotify, since which comes last depends on the window manager.
     ///
-    /// _NET_ACTIVE_WINDOW (source 1, an application) is the request a window manager with
-    /// focus stealing prevention weighs; SetInputFocus with the same fresh timestamp follows,
-    /// for window managers without EWMH or that refused. FocusIn then takes the usual path,
-    /// which points the input method at this window.
+    /// The X input focus goes to the parent, or stays with it, and the client sends the
+    /// parent's keystrokes here. _NET_ACTIVE_WINDOW (source 1, an application) is the request
+    /// a window manager with focus stealing prevention weighs; SetInputFocus with the same
+    /// fresh timestamp follows, for window managers without EWMH or that refused, and for a
+    /// native child window of the parent that holds the keyboard.
     pub(crate) fn focus_popup_if_pending(&self) {
         let state = self.state.borrow();
         let Some(popup) = state.popup.as_ref() else {
@@ -1705,6 +1712,7 @@ impl X11WindowStatePtr {
         let parent = popup.parent.x_window;
         let root = state.x_root_window;
         let active_window = state.atoms._NET_ACTIVE_WINDOW;
+        let client = state.client.get_client();
         drop(state);
 
         let viewable = get_reply(
@@ -1717,8 +1725,14 @@ impl X11WindowStatePtr {
             return;
         }
 
-        let message =
-            ClientMessageEvent::new(32, self.x_window, active_window, [1, time, parent, 0, 0]);
+        if let Some(popup) = self.state.borrow().popup.as_ref() {
+            popup.parent.state.borrow_mut().keyboard_popup = Some(self.x_window);
+        }
+        if let Some(client) = client {
+            client.give_keyboard_to_popup(self, parent);
+        }
+
+        let message = ClientMessageEvent::new(32, parent, active_window, [1, time, 0, 0, 0]);
         check_reply(
             || "X11 SendEvent of _NET_ACTIVE_WINDOW for a popup failed.",
             self.xcb.send_event(
@@ -1732,7 +1746,7 @@ impl X11WindowStatePtr {
         // Unchecked: if the window stopped being viewable since the query, the BadMatch is
         // an error event the event loop drops, and the window manager's answer stands.
         self.xcb
-            .set_input_focus(xproto::InputFocus::POINTER_ROOT, self.x_window, time)
+            .set_input_focus(xproto::InputFocus::POINTER_ROOT, parent, time)
             .log_err();
         xcb_flush(&self.xcb);
 
@@ -1906,6 +1920,16 @@ impl X11WindowStatePtr {
             active
         };
         self.set_active(active);
+    }
+
+    /// The popup of this window that has the keyboard, if one does.
+    pub(crate) fn keyboard_popup(&self) -> Option<xproto::Window> {
+        self.state.borrow().keyboard_popup
+    }
+
+    /// Takes the keyboard back from this window's popup, returning the popup that had it.
+    pub(crate) fn take_keyboard_popup(&self) -> Option<xproto::Window> {
+        self.state.borrow_mut().keyboard_popup.take()
     }
 
     /// The parent of this window, if it is an anchored popup.

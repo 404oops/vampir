@@ -210,7 +210,12 @@ pub struct X11ClientState {
     pub(crate) atoms: XcbAtoms,
     pub(crate) windows: HashMap<xproto::Window, WindowRef>,
     pub(crate) mouse_focused_window: Option<xproto::Window>,
+    /// The window keystrokes go to: the window with the X input focus, or the popup of it
+    /// that asked for the keyboard.
     pub(crate) keyboard_focused_window: Option<xproto::Window>,
+    /// The window with the X input focus. A popup never has it: its parent keeps it, so the
+    /// window manager keeps drawing the parent as the active window.
+    pub(crate) x_focused_window: Option<xproto::Window>,
     pub(crate) xkb: xkbc::State,
     keyboard_layout: LinuxKeyboardLayout,
     pub(crate) ximc: Option<X11rbClient<Rc<XCBConnection>>>,
@@ -266,8 +271,12 @@ impl X11ClientStatePtr {
         if state.mouse_focused_window == Some(x_window) {
             state.mouse_focused_window = None;
         }
+        if state.x_focused_window == Some(x_window) {
+            state.x_focused_window = None;
+        }
         if state.keyboard_focused_window == Some(x_window) {
-            state.keyboard_focused_window = None;
+            // A popup that had the keyboard hands it back to the window it borrowed it from.
+            state.keyboard_focused_window = state.x_focused_window;
         }
         if state.cursor_hidden_window == Some(x_window) {
             state.cursor_hidden_window = None;
@@ -533,6 +542,7 @@ impl X11Connection {
                 windows: HashMap::default(),
                 mouse_focused_window: None,
                 keyboard_focused_window: None,
+                x_focused_window: None,
                 xkb: xkb_state,
                 keyboard_layout,
                 ximc,
@@ -894,6 +904,44 @@ impl X11Client {
         });
     }
 
+    /// The window that has the keyboard when `focused` has the X input focus: its popup that
+    /// asked for the keyboard, or `focused` itself.
+    fn keyboard_window(&self, focused: xproto::Window) -> Option<X11WindowStatePtr> {
+        let window = self.get_window(focused)?;
+        Some(
+            window
+                .keyboard_popup()
+                .and_then(|popup| self.get_window(popup))
+                .unwrap_or(window),
+        )
+    }
+
+    /// The window a keystroke delivered to `event_window` is for: the popup that has the
+    /// keyboard, when `event_window` is the parent holding the X input focus for it.
+    fn key_window(&self, event_window: xproto::Window) -> Option<X11WindowStatePtr> {
+        let target = {
+            let state = self.0.borrow();
+            match state.keyboard_focused_window {
+                Some(focused) if state.x_focused_window == Some(event_window) => focused,
+                _ => event_window,
+            }
+        };
+        self.get_window(target)
+    }
+
+    /// Sends `parent`'s keystrokes to `popup` from now on, if `parent` has the X input focus.
+    /// If it does not, the FocusIn that gives it to `parent` does this.
+    pub(crate) fn give_keyboard_to_popup(&self, popup: &X11WindowStatePtr, parent: xproto::Window) {
+        {
+            let mut state = self.0.borrow_mut();
+            if state.x_focused_window != Some(parent) {
+                return;
+            }
+            state.keyboard_focused_window = Some(popup.x_window);
+        }
+        self.report_focus_later(popup);
+    }
+
     pub(crate) fn get_window(&self, win: xproto::Window) -> Option<X11WindowStatePtr> {
         let state = self.0.borrow();
         state
@@ -1086,10 +1134,11 @@ impl X11Client {
                     .log_err();
             }
             Event::FocusIn(event) => {
-                let window = self.get_window(event.event)?;
+                let window = self.keyboard_window(event.event)?;
                 self.report_focus_later(&window);
                 let mut state = self.0.borrow_mut();
-                state.keyboard_focused_window = Some(event.event);
+                state.x_focused_window = Some(event.event);
+                state.keyboard_focused_window = Some(window.x_window);
                 if let Some(handler) = state.xim_handler.as_mut() {
                     handler.window = event.event;
                 }
@@ -1097,9 +1146,10 @@ impl X11Client {
                 self.enable_ime();
             }
             Event::FocusOut(event) => {
-                let window = self.get_window(event.event)?;
+                let window = self.keyboard_window(event.event)?;
                 self.report_focus_later(&window);
                 let mut state = self.0.borrow_mut();
+                state.x_focused_window = None;
                 // Set last scroll values to `None` so that a large delta isn't created if scrolling is done outside the window (the valuator is global)
                 reset_all_pointer_device_scroll_positions(&mut state.pointer_device_states);
                 state.keyboard_focused_window = None;
@@ -1171,7 +1221,7 @@ impl X11Client {
                 }
             }
             Event::KeyPress(event) => {
-                let window = self.get_window(event.event)?;
+                let window = self.key_window(event.event)?;
                 let mut state = self.0.borrow_mut();
 
                 let modifiers = modifiers_from_state(event.state);
@@ -1235,7 +1285,7 @@ impl X11Client {
                 }));
             }
             Event::KeyRelease(event) => {
-                let window = self.get_window(event.event)?;
+                let window = self.key_window(event.event)?;
                 let mut state = self.0.borrow_mut();
 
                 let modifiers = modifiers_from_state(event.state);
@@ -1258,6 +1308,18 @@ impl X11Client {
             }
             Event::XinputButtonPress(event) => {
                 let window = self.get_window(event.event)?;
+                // A press on a window takes the keyboard back from its popup, as a press
+                // outside a menu does. The popup hears it as going inactive.
+                if let Some(popup) = window.take_keyboard_popup() {
+                    let mut state = self.0.borrow_mut();
+                    if state.keyboard_focused_window == Some(popup) {
+                        state.keyboard_focused_window = state.x_focused_window;
+                    }
+                    drop(state);
+                    if let Some(popup) = self.get_window(popup) {
+                        self.report_focus_later(&popup);
+                    }
+                }
                 let mut state = self.0.borrow_mut();
 
                 let modifiers = modifiers_from_xinput_info(event.mods);
