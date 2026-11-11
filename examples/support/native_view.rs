@@ -374,6 +374,10 @@ mod imp {
     };
     use x11rb::rust_connection::RustConnection;
 
+    // GPUI's window has a 32-bit visual and the child copies it, so a pixel without the alpha
+    // byte is fully transparent to a compositor: the desktop would show through the view.
+    const OPAQUE: u32 = 0xff00_0000;
+
     pub(super) struct View {
         connection: RustConnection,
         window: u32,
@@ -404,7 +408,7 @@ mod imp {
                     0,
                     WindowClass::INPUT_OUTPUT,
                     x11rb::COPY_FROM_PARENT,
-                    &CreateWindowAux::new().background_pixel(0x2d6cdf),
+                    &CreateWindowAux::new().background_pixel(OPAQUE | 0x2d6cdf),
                 )
                 .ok()?;
             connection.flush().ok()?;
@@ -422,7 +426,8 @@ mod imp {
                         let changed = connection
                             .change_window_attributes(
                                 child,
-                                &ChangeWindowAttributesAux::new().background_pixel(*colour),
+                                &ChangeWindowAttributesAux::new()
+                                    .background_pixel(OPAQUE | *colour),
                             )
                             .and_then(|_| connection.clear_area(true, child, 0, 0, 0, 0))
                             .and_then(|_| connection.flush());
