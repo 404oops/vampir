@@ -958,6 +958,10 @@ impl X11Client {
                     window_ref.is_mapped = false;
                 }
                 handle_visibility_changed(state, event.window);
+                // However the window manager hid it — minimised, or left behind on another
+                // workspace, which not every window manager marks as IconicState — its popups
+                // are override-redirect and would stay on screen over nothing.
+                self.get_window(event.window)?.close_popups();
             }
             Event::MapNotify(event) => {
                 let mut state = self.0.borrow_mut();

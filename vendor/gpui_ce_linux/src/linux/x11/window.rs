@@ -1461,9 +1461,10 @@ impl X11WindowStatePtr {
             drop(state);
             self.popup_timestamp(event.time);
         } else if event.atom == state.atoms.WM_STATE && !state.popups.is_empty() {
-            // ICCCM: every window manager sets WM_STATE, and IconicState (3) is the window
-            // minimized. Whether a window manager also hides the transients of a minimized
-            // window varies, so close them here instead of leaving a popup over nothing.
+            // ICCCM: every window manager sets WM_STATE. IconicState (3) is the window
+            // minimized, and some window managers (i3) set WithdrawnState (0) on a window of a
+            // workspace that is not showing, without unmapping it. The popups are not the
+            // window manager's to hide, so close them here instead of leaving one over nothing.
             let reply = get_reply(
                 || "X11 GetProperty for WM_STATE failed.",
                 self.xcb.get_property(
@@ -1476,12 +1477,12 @@ impl X11WindowStatePtr {
                 ),
             )?;
             drop(state);
-            const ICONIC_STATE: u32 = 3;
-            let iconic = reply
+            const NORMAL_STATE: u32 = 1;
+            let hidden = reply
                 .value32()
                 .and_then(|mut values| values.next())
-                .is_some_and(|value| value == ICONIC_STATE);
-            if iconic {
+                .is_some_and(|value| value != NORMAL_STATE);
+            if hidden {
                 self.close_popups();
             }
         }
