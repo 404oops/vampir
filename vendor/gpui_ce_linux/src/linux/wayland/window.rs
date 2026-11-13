@@ -990,6 +990,16 @@ impl WaylandWindowStatePtr {
         )
     }
 
+    /// Whether this window is an anchored popup of `parent`.
+    pub(crate) fn is_popup_of(&self, parent: &Self) -> bool {
+        let state = self.state.borrow();
+        matches!(state.surface_state, WaylandSurfaceState::Popup(_))
+            && state
+                .parent
+                .as_ref()
+                .is_some_and(|own_parent| own_parent.ptr_eq(parent))
+    }
+
     pub fn ptr_eq(&self, other: &Self) -> bool {
         Rc::ptr_eq(&self.state, &other.state)
     }

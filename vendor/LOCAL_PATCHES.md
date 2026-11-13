@@ -1,11 +1,12 @@
 # Local changes to the vendored GPUI-CE
 
-Four changes to GPUI-CE 0.3.0.
+Five changes to GPUI-CE 0.3.0.
 
 - **Anchored popups**, in four crates: `WindowKind::AnchoredPopup`, which GPUI-CE defines and only its Wayland backend implements, works on macOS, Windows and X11. The toolkit's command bar (`src/command_bar.rs`) is a popup of this kind: a window owned by the host's, above it and no other application's, over a live native view the toolkit cannot draw over from inside the host window.
 - **Native child windows on Windows**: a native child window a host embeds shows and paints ([below](#native-child-windows-on-windows)).
 - **The macOS launch callback runs without the platform's lock.** 0.3.0 calls it inside `if let Some(callback) = platform.0.lock().finish_launching.take()`, and under the 2024 edition that guard lives to the end of the block, so the first thing a launch does through the platform — open a window, set the menus — waits on the lock forever. gpui-ce's main branch already takes the callback out first.
 - **`App::windows_are_composited`** (`Platform::windows_are_composited`, true by default): whether the desktop blends one window over another. False on an X11 screen where nothing owns the `_NET_WM_CM_Sn` selection, where the clear parts of a window come out opaque. The command bar leaves its scrim out there and fills its own corners.
+- **A press on a Wayland window tells its popup it has gone inactive.** A grabbing `xdg_popup` keeps the compositor's keyboard focus through a press elsewhere in its own application, so the popup never heard that the keyboard had been taken back. The command bar asks for a grab under Wayland, the only way a popup gets the keyboard there, and closes on that.
 
 Each commit touching `vendor/` after the one that adds it is one of these, and says what it does in full.
 

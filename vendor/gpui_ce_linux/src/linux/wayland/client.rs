@@ -2590,6 +2590,19 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 }
                 match button_state {
                     wl_pointer::ButtonState::Pressed => {
+                        // A press on a window takes the keyboard back from its popup, as a
+                        // press outside a menu does. A grabbing popup keeps the compositor's
+                        // keyboard focus through a press elsewhere in its own application, so
+                        // the popup is told here that it has gone inactive.
+                        if let (Some(pressed), Some(focused)) = (
+                            state.mouse_focused_window.clone(),
+                            state.keyboard_focused_window.clone(),
+                        ) && focused.is_popup_of(&pressed)
+                        {
+                            drop(state);
+                            focused.set_focused(false);
+                            state = client.borrow_mut();
+                        }
                         if let Some(window) = state.keyboard_focused_window.clone() {
                             if state.composing && state.text_input.is_some() {
                                 drop(state);
