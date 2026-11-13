@@ -1647,7 +1647,9 @@ impl X11Client {
     }
 
     fn xim_handle_commit(&self, window: xproto::Window, text: String) -> Option<()> {
-        let Some(window) = self.get_window(window) else {
+        // The input method's window is the one with the X input focus; what it composes is
+        // for the popup of that window that has the keyboard, as its keystrokes are.
+        let Some(window) = self.key_window(window) else {
             log::error!("bug: Failed to get window for XIM commit");
             return None;
         };
@@ -1659,7 +1661,7 @@ impl X11Client {
     }
 
     fn xim_handle_preedit(&self, window: xproto::Window, text: String) -> Option<()> {
-        let Some(window) = self.get_window(window) else {
+        let Some(window) = self.key_window(window) else {
             log::error!("bug: Failed to get window for XIM preedit");
             return None;
         };

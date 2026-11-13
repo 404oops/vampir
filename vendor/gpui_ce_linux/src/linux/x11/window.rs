@@ -1851,18 +1851,43 @@ impl X11WindowStatePtr {
     }
 
     pub fn get_ime_area(&self) -> Option<Bounds<ScaledPixels>> {
-        let mut state = self.state.borrow_mut();
-        let scale_factor = state.scale_factor;
-        let mut bounds: Option<Bounds<Pixels>> = None;
-        if let Some(mut input_handler) = state.input_handler.take() {
-            drop(state);
-            if let Some(selection) = input_handler.selected_text_range(true) {
-                bounds = input_handler.bounds_for_range(selection.range);
-            }
+        let (scale_factor, input_handler) = {
             let mut state = self.state.borrow_mut();
-            state.input_handler = Some(input_handler);
+            (state.scale_factor, state.input_handler.take())
         };
-        bounds.map(|b| b.scale(scale_factor))
+        let mut input_handler = input_handler?;
+        let bounds = input_handler
+            .selected_text_range(true)
+            .and_then(|selection| input_handler.bounds_for_range(selection.range));
+        self.state.borrow_mut().input_handler = Some(input_handler);
+        let offset = self.offset_in_popup_parent();
+        bounds.map(|b| b.scale(scale_factor) + offset.scale(scale_factor))
+    }
+
+    /// Where this window's origin is in its popup parent, or zero for a window that is not an
+    /// anchored popup. The input method's client window is the parent, which holds the X input
+    /// focus for the popup, so a caret position in the popup is given to it from the parent's
+    /// origin.
+    pub(crate) fn offset_in_popup_parent(&self) -> Point<Pixels> {
+        let state = self.state.borrow();
+        let Some(popup) = state.popup.as_ref() else {
+            return Point::default();
+        };
+        let scale_factor = state.scale_factor;
+        let parent = popup.parent.x_window;
+        drop(state);
+        get_reply(
+            || "X11 TranslateCoordinates for a popup in its parent failed.",
+            self.xcb.translate_coordinates(self.x_window, parent, 0, 0),
+        )
+        .log_err()
+        .map(|origin| {
+            Point::new(
+                px(f32::from(origin.dst_x) / scale_factor),
+                px(f32::from(origin.dst_y) / scale_factor),
+            )
+        })
+        .unwrap_or_default()
     }
 
     pub fn set_bounds(&self, bounds: Bounds<i32>) -> anyhow::Result<()> {
@@ -2692,7 +2717,7 @@ impl PlatformWindow for X11Window {
         let state = self.0.state.borrow();
         let client = state.client.clone();
         drop(state);
-        client.update_ime_position(bounds);
+        client.update_ime_position(bounds + self.0.offset_in_popup_parent());
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {

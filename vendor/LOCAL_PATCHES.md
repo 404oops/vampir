@@ -24,7 +24,7 @@ Each commit touching `vendor/` after the one that adds it is one of these, and s
 
 | | macOS | Windows | X11 |
 |---|---|---|---|
-| Window | Activating `NSPanel`, normal level, `addChildWindow:ordered:` | `WS_POPUP` tool window, owner = parent `HWND` | Override-redirect `POPUP_MENU`, transient for the parent; never has the X input focus, the parent passes it its keystrokes |
+| Window | Activating `NSPanel`, normal level, `addChildWindow:ordered:` | `WS_POPUP` tool window, owner = parent `HWND` | Override-redirect `POPUP_MENU`, transient for the parent; never has the X input focus, the parent passes it its keystrokes and what an input method composes, with the caret given to the input method from the parent's origin |
 | Follows parent | AppKit moves child windows; `windowDidMove` re-applies constraints | Owner's `WM_MOVE` / `WM_DPICHANGED` | Parent's `ConfigureNotify` |
 | Minimised parent | Ordered out with it (AppKit) | Hidden with it (Win32) | Closed when the parent is unmapped or its `WM_STATE` stops being normal: minimised, or on a workspace that is not showing |
 | Parent's active look | Popup never becomes main | `WM_NCACTIVATE` kept active for its own popups | The parent keeps the X input focus, so the window manager keeps drawing it active |
