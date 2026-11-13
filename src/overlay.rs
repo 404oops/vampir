@@ -1,6 +1,7 @@
 //! Things that float above the view: tooltips and a command palette, and
 //! the search field with results that the palette is built from.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
@@ -288,13 +289,20 @@ pub fn fuzzy_score(query: &str, candidate: &str) -> Option<i32> {
     if query.chars().all(char::is_whitespace) {
         return Some(0);
     }
+    fuzzy_score_normalized(&query.to_lowercase(), candidate)
+}
+
+fn fuzzy_score_normalized(query: &str, candidate: &str) -> Option<i32> {
+    if query.chars().all(char::is_whitespace) {
+        return Some(0);
+    }
     let candidate_lower = candidate.to_lowercase();
     let mut haystack = candidate_lower.chars().enumerate();
     let mut score = 0i32;
     let mut last_index: Option<usize> = None;
     let mut previous = None;
 
-    for needle in query.to_lowercase().chars() {
+    for needle in query.chars() {
         if needle.is_whitespace() {
             continue;
         }
@@ -325,19 +333,46 @@ pub fn fuzzy_score(query: &str, candidate: &str) -> Option<i32> {
 /// Commands matching a query, best first. Ties keep their original order,
 /// so a host's own ranking survives where the score cannot separate two.
 pub fn fuzzy_filter(query: &str, commands: &[Command]) -> Vec<Command> {
-    let mut scored: Vec<(i32, usize, Command)> = commands
+    matching_commands(query, commands)
+        .map(Clone::clone)
+        .collect()
+}
+
+// Keep filtering borrowed until the caller chooses its final representation:
+// the command bar needs SearchResults, not an intermediate owned command list.
+fn matching_commands<'a>(
+    query: &str,
+    commands: &'a [Command],
+) -> impl Iterator<Item = &'a Command> {
+    let empty = query.chars().all(char::is_whitespace);
+    let mut scored: Vec<(i32, usize, &Command)> = if empty {
+        Vec::new()
+    } else {
+        let query = query.to_lowercase();
+        commands
+            .iter()
+            .enumerate()
+            .filter_map(|(index, command)| {
+                let haystack = match &command.group {
+                    Some(group) => Cow::Owned(format!("{group} {}", command.label)),
+                    None => Cow::Borrowed(command.label.as_ref()),
+                };
+                fuzzy_score_normalized(&query, &haystack).map(|score| (score, index, command))
+            })
+            .collect()
+    };
+    // The original index makes this ordering total while preserving ties.
+    scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let original = if empty { commands } else { &[] };
+    original
         .iter()
-        .enumerate()
-        .filter_map(|(index, command)| {
-            let haystack = match &command.group {
-                Some(group) => format!("{group} {}", command.label),
-                None => command.label.to_string(),
-            };
-            fuzzy_score(query, &haystack).map(|score| (score, index, command.clone()))
-        })
-        .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    scored.into_iter().map(|(_, _, command)| command).collect()
+        .chain(scored.into_iter().map(|(_, _, command)| command))
+}
+
+pub(crate) fn command_results(query: &str, commands: &[Command]) -> Vec<SearchResult> {
+    matching_commands(query, commands)
+        .map(command_result)
+        .collect()
 }
 
 /// Results matching a query, best first within each section, for a host
@@ -353,27 +388,41 @@ pub fn fuzzy_filter(query: &str, commands: &[Command]) -> Vec<Command> {
 /// empty query keeps source order within each section and puts sections in
 /// their first-seen order.
 pub fn rank_results(query: &str, results: &[SearchResult]) -> Vec<SearchResult> {
+    let empty = query.chars().all(char::is_whitespace);
+    let query = query.to_lowercase();
     // Scored on the label alone: it is what the person reads and
     // abbreviates, and the score's length penalty would otherwise let a
     // long detail line push a result down. A result that matches only
     // through its detail or section still qualifies, after every result
     // whose label matched, in the order it came.
-    let rank = |result: &SearchResult| -> Option<Option<i32>> {
-        if let Some(score) = fuzzy_score(query, &result.label) {
+    let mut searchable = String::new();
+    let mut rank = |result: &SearchResult| -> Option<Option<i32>> {
+        if let Some(score) = fuzzy_score_normalized(&query, &result.label) {
             return Some(Some(score));
         }
-        let mut text = result.label.to_string();
-        for part in [&result.detail, &result.section].into_iter().flatten() {
-            text.push(' ');
-            text.push_str(part);
+        if result.detail.is_none() && result.section.is_none() {
+            return None;
         }
-        fuzzy_score(query, &text).map(|_| None)
+        let capacity = result.label.len()
+            + [&result.detail, &result.section]
+                .into_iter()
+                .flatten()
+                .map(|part| part.len() + 1)
+                .sum::<usize>();
+        searchable.clear();
+        searchable.reserve(capacity);
+        searchable.push_str(&result.label);
+        for part in [&result.detail, &result.section].into_iter().flatten() {
+            searchable.push(' ');
+            searchable.push_str(part);
+        }
+        fuzzy_score_normalized(&query, &searchable).map(|_| None)
     };
     type Run<'a> = Vec<(Option<i32>, &'a SearchResult)>;
     let mut sections: Vec<(Option<&str>, Run)> = Vec::new();
     let mut positions: HashMap<Option<&str>, usize> = HashMap::new();
     for result in results {
-        let Some(rank) = rank(result) else {
+        let Some(rank) = (if empty { Some(Some(0)) } else { rank(result) }) else {
             continue;
         };
         let section = result.section.as_deref();
@@ -384,11 +433,14 @@ pub fn rank_results(query: &str, results: &[SearchResult]) -> Vec<SearchResult> 
         });
         sections[index].1.push((rank, result));
     }
-    // Stable sorts, so ties keep the order the sources were assembled in.
-    for (_, run) in &mut sections {
-        run.sort_by_key(|(rank, _)| std::cmp::Reverse(*rank));
+    // Empty queries already have source order. Stable sorts keep that order
+    // for ties when a nonempty query actually needs ranking.
+    if !empty {
+        for (_, run) in &mut sections {
+            run.sort_by_key(|(rank, _)| std::cmp::Reverse(*rank));
+        }
+        sections.sort_by_key(|(_, run)| std::cmp::Reverse(run[0].0));
     }
-    sections.sort_by_key(|(_, run)| std::cmp::Reverse(run[0].0));
     sections
         .into_iter()
         .flat_map(|(_, run)| run)
@@ -412,57 +464,57 @@ enum Line {
 /// picks out "in" but not the middle of "morning", and scattered letters
 /// that happen to come in the right order are not a match at all.
 fn matched_ranges(text: &str, query: &str, line: Line) -> Vec<Range<usize>> {
+    if query.trim().is_empty() {
+        return Vec::new();
+    }
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     let same = |a: char, b: char| a.to_lowercase().eq(b.to_lowercase());
-    let mut ranges = Vec::new();
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    let byte_at = |index: usize| chars.get(index).map_or(text.len(), |ch| ch.0);
     for word in query.split_whitespace() {
         let needle: Vec<char> = word.chars().collect();
         let starts_word = |start: usize| start == 0 || !chars[start - 1].1.is_alphanumeric();
-        let whole = (0..=chars.len().saturating_sub(needle.len()))
-            .find(|&start| {
-                start + needle.len() <= chars.len()
-                    && (line == Line::Label || starts_word(start))
-                    && needle
-                        .iter()
-                        .enumerate()
-                        .all(|(offset, &ch)| same(chars[start + offset].1, ch))
-            })
-            .map(|start| (start..start + needle.len()).collect::<Vec<_>>());
-        let positions = whole.or_else(|| {
-            if line == Line::Detail {
-                return None;
-            }
-            let mut found = Vec::new();
+        let whole = (0..=chars.len().saturating_sub(needle.len())).find(|&start| {
+            start + needle.len() <= chars.len()
+                && (line == Line::Label || starts_word(start))
+                && needle
+                    .iter()
+                    .enumerate()
+                    .all(|(offset, &ch)| same(chars[start + offset].1, ch))
+        });
+        if let Some(start) = whole {
+            ranges.push(byte_at(start)..byte_at(start + needle.len()));
+        } else if line == Line::Label {
+            // A failed abbreviation must not leave its matched prefix highlighted.
+            let checkpoint = ranges.len();
             let mut from = 0;
             for &ch in &needle {
-                let index = (from..chars.len()).find(|&i| same(chars[i].1, ch))?;
-                found.push(index);
+                let Some(index) = (from..chars.len()).find(|&i| same(chars[i].1, ch)) else {
+                    ranges.truncate(checkpoint);
+                    break;
+                };
+                ranges.push(byte_at(index)..byte_at(index + 1));
                 from = index + 1;
             }
-            Some(found)
-        });
-        for index in positions.into_iter().flatten() {
-            let start = chars[index].0;
-            let end = chars.get(index + 1).map_or(text.len(), |next| next.0);
-            ranges.push(start..end);
         }
     }
-    ranges.sort_by_key(|range| range.start);
-    let mut merged: Vec<Range<usize>> = Vec::new();
-    for range in ranges {
-        if let Some(last) = merged.last_mut()
-            && range.start <= last.end
-        {
-            last.end = last.end.max(range.end);
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut merged = 0;
+    for index in 0..ranges.len() {
+        let range = ranges[index].clone();
+        if merged > 0 && range.start <= ranges[merged - 1].end {
+            ranges[merged - 1].end = ranges[merged - 1].end.max(range.end);
         } else {
-            merged.push(range);
+            ranges[merged] = range;
+            merged += 1;
         }
     }
-    merged
+    ranges.truncate(merged);
+    ranges
 }
 
 fn emphasised(text: &SharedString, query: &str, line: Line) -> StyledText {
-    StyledText::new(text.to_string()).with_highlights(
+    StyledText::new(text.clone()).with_highlights(
         matched_ranges(text, query, line)
             .into_iter()
             .map(|range| (range, FontWeight::SEMIBOLD.into())),
@@ -482,7 +534,7 @@ const ROW_SPACING: f32 = 8.0;
 /// The tallest an inline result list grows before it scrolls.
 const INLINE_RESULT_MAX_HEIGHT: f32 = 300.0;
 /// The same for the list in a palette, which has the window to itself.
-const PALETTE_RESULT_MAX_HEIGHT: f32 = 340.0;
+pub(crate) const PALETTE_RESULT_MAX_HEIGHT: f32 = 340.0;
 
 struct RowPlacement {
     /// Whether a section heading goes above this row.
@@ -558,7 +610,7 @@ fn result_rows<V: ControlHost>(
     results: &[SearchResult],
     highlighted: usize,
     ctx: WidgetContext<'_, '_, '_, V>,
-    on_activate: Activate<V>,
+    on_activate: &Activate<V>,
 ) -> (Vec<AnyElement>, Vec<Range<f32>>) {
     let WidgetContext { palette, view, cx } = ctx;
     let state = view.control_state();
@@ -629,7 +681,7 @@ fn visible_result_rows<V: ControlHost>(
     visible: Range<usize>,
     highlighted: usize,
     ctx: WidgetContext<'_, '_, '_, V>,
-    on_activate: Activate<V>,
+    on_activate: &Activate<V>,
 ) -> Vec<AnyElement> {
     let WidgetContext { palette, view, cx } = ctx;
     let state = view.control_state();
@@ -851,7 +903,8 @@ pub fn command_list<V: ControlHost>(
     // borrowed for as long as the list lived and stop the caller building
     // anything else with it.
     let results: Vec<SearchResult> = matches.iter().map(command_result).collect();
-    let (rows, _) = result_rows(id, "", &results, highlighted, ctx, Rc::new(on_activate));
+    let on_activate: Activate<V> = Rc::new(on_activate);
+    let (rows, _) = result_rows(id, "", &results, highlighted, ctx, &on_activate);
     // Clipped, so a row sliding up from where it was emerges from the list's
     // edge instead of crossing whatever sits below it.
     div()
@@ -862,14 +915,17 @@ pub fn command_list<V: ControlHost>(
         .children(rows)
 }
 
-type Activate<V> = Rc<dyn Fn(&mut V, SharedString, &mut Window, &mut Context<V>)>;
+/// What a palette panel does on Escape.
+pub(crate) type Dismissed<V> = Rc<dyn Fn(&mut V, &mut Window, &mut Context<V>)>;
+
+pub(crate) type Activate<V> = Rc<dyn Fn(&mut V, SharedString, &mut Window, &mut Context<V>)>;
 
 /// A search field with the rows that match it underneath, and the keys
 /// between the two: Up and Down move the highlight, Enter picks it.
 ///
 /// The host owns the query input and the items; this filters the items by
 /// the query with [`fuzzy_filter`], keeps the keyboard's row in
-/// [`ControlState`](crate::ControlState) under `id`, and reports the picked
+/// [`ControlState`] under `id`, and reports the picked
 /// `Command::id` — from a click and from Enter alike. The keys arrive as the
 /// field's own actions: a single-line field has no use for Up, Down or an
 /// Enter it has nothing to submit to, so it passes them on, and they are
@@ -886,7 +942,7 @@ pub fn search_list<V: ControlHost>(
 ) -> Div {
     let palette = ctx.palette;
     let on_activate: Activate<V> = Rc::new(on_activate);
-    let text = query.read(ctx.cx).text();
+    let text = query.read(ctx.cx).shared_text();
     let matches = fuzzy_filter(&text, items);
     let ids: Rc<[SharedString]> = matches.iter().map(|command| command.id.clone()).collect();
     let (highlighted, _) = ctx.view.control_state().follow_list(id, &text, &ids);
@@ -927,7 +983,7 @@ pub fn search_list<V: ControlHost>(
 /// [`scroll_fades`](crate::scroll_fades); the list's viewport is
 /// [`ControlState::scroll`](crate::ControlState::scroll)`((id, "list"))`,
 /// whose bounds say where those edges are. `id` identifies the list in
-/// [`ControlState`](crate::ControlState), as for [`search_list`].
+/// [`ControlState`], as for [`search_list`].
 #[allow(clippy::too_many_arguments)]
 pub fn ranked_search_list<V: ControlHost>(
     id: &'static str,
@@ -940,7 +996,7 @@ pub fn ranked_search_list<V: ControlHost>(
     on_activate: impl Fn(&mut V, SharedString, &mut Window, &mut Context<V>) + 'static,
 ) -> Div {
     let palette = ctx.palette;
-    let text = query.read(ctx.cx).text();
+    let text = query.read(ctx.cx).shared_text();
     let on_activate: Activate<V> = Rc::new(on_activate);
     let list = result_list(
         id,
@@ -979,7 +1035,7 @@ pub fn ranked_search_list<V: ControlHost>(
 
 /// A scrolling result list's rows, with what its keys need to move through
 /// them.
-struct ResultList {
+pub(crate) struct ResultList {
     elements: Vec<AnyElement>,
     ids: Rc<[SharedString]>,
     navigation: Rc<ResultNavigation>,
@@ -988,7 +1044,7 @@ struct ResultList {
 /// Draws a scrolling result list, keeping the keyboard's row on its result
 /// as the results change and the list's scroll in step with the row.
 #[allow(clippy::too_many_arguments)]
-fn result_list<V: ControlHost>(
+pub(crate) fn result_list<V: ControlHost>(
     id: &'static str,
     query: &str,
     emphasis: &str,
@@ -1035,7 +1091,7 @@ fn result_list<V: ControlHost>(
         visible,
         highlighted,
         ctx,
-        on_activate,
+        &on_activate,
     );
     ResultList {
         elements,
@@ -1259,7 +1315,7 @@ fn list_keys<V: ControlHost, E: InteractiveElement>(
 }
 
 /// When palette `id` opened, if it is the one open.
-fn palette_opened_at(state: &ControlState, id: ComboId) -> Option<Instant> {
+pub(crate) fn palette_opened_at(state: &ControlState, id: ComboId) -> Option<Instant> {
     state
         .palette_overlay
         .as_ref()
@@ -1300,11 +1356,8 @@ pub fn command_palette<V: ControlHost>(
     on_activate: impl Fn(&mut V, SharedString, &mut Window, &mut Context<V>) + 'static,
 ) -> Option<impl IntoElement> {
     let opened_at = palette_opened_at(ctx.view.control_state(), id)?;
-    let text = query.read(ctx.cx).text();
-    let matches: Vec<SearchResult> = fuzzy_filter(&text, commands)
-        .iter()
-        .map(command_result)
-        .collect();
+    let text = query.read(ctx.cx).shared_text();
+    let matches = command_results(&text, commands);
     let on_activate = closing_palette(on_activate);
     let list = result_list(
         id,
@@ -1341,7 +1394,7 @@ pub fn ranked_command_palette<V: ControlHost>(
     on_activate: impl Fn(&mut V, SharedString, &mut Window, &mut Context<V>) + 'static,
 ) -> Option<impl IntoElement> {
     let opened_at = palette_opened_at(ctx.view.control_state(), id)?;
-    let text = query.read(ctx.cx).text();
+    let text = query.read(ctx.cx).shared_text();
     let on_activate = closing_palette(on_activate);
     let list = result_list(
         id,
@@ -1378,54 +1431,36 @@ fn palette_with_results<V: ControlHost>(
     on_activate: Activate<V>,
 ) -> impl IntoElement {
     let WidgetContext { palette, view, cx } = ctx;
-    let state = view.control_state();
-    let dark = palette.is_dark;
     // The panel arrives the way a menu does: the same reveal, a short drift
     // down into place.
-    let reveal = ease_out_cubic(progress(opened_at, state.scaled(COMBO_REVEAL)));
-    let fill = if dark {
-        palette.soft_fill
-    } else {
-        palette.field_surface
-    };
-    let panel = div()
-        // A little above centre: the list grows downward, and a palette
-        // pinned to the middle ends up low on the screen as soon as it has
-        // results.
-        .mt(gpui::relative(0.16))
-        .relative()
-        .top(px(-6.0 * (1.0 - reveal)))
-        .opacity(reveal)
-        .w(px(520.0))
-        .max_w(gpui::relative(0.9))
-        .flex()
-        .flex_col()
-        .gap(px(6.0))
-        .p(px(8.0))
-        .rounded(px(10.0))
-        .bg(fill)
-        .border_1()
-        .border_color(lighting::rim(fill, dark))
-        .shadow(lighting::panel(dark))
-        .occlude()
-        // Once `bind_keys` has run, Escape arrives as this action and never
-        // as a key. The query field has the keyboard, and this is the first
-        // thing above it.
-        .on_action(cx.listener(move |this, _: &Dismiss, window, cx| {
+    let reveal = ease_out_cubic(progress(
+        opened_at,
+        view.control_state().scaled(COMBO_REVEAL),
+    ));
+    let panel = palette_panel(
+        id,
+        query,
+        list,
+        empty_message,
+        WidgetContext { palette, view, cx },
+        window,
+        on_activate,
+        Rc::new(|this: &mut V, window: &mut Window, cx: &mut Context<V>| {
             this.control_state_mut().close_palette(window, cx);
-            cx.notify();
-        }))
-        .child(search_field(id, query, palette, window, cx))
-        .child(result_viewport(
-            id,
-            list.elements,
-            &list.navigation,
-            empty_message,
-            (fill, fill),
-            palette,
-            state,
-        ));
-    let panel = list_keys(panel, id, list.ids, Some(list.navigation), cx, on_activate);
+        }),
+    )
+    // A little above centre: the list grows downward, and a palette pinned
+    // to the middle ends up low on the screen as soon as it has results.
+    .mt(gpui::relative(0.16))
+    .relative()
+    .top(px(-6.0 * (1.0 - reveal)))
+    .opacity(reveal)
+    .w(px(PALETTE_WIDTH))
+    .max_w(gpui::relative(0.9))
+    .rounded(px(10.0))
+    .border_1()
+    .border_color(lighting::rim(palette_fill(palette), palette.is_dark))
+    .shadow(lighting::panel(palette.is_dark));
     deferred(
         div()
             .id(ElementId::Name(format!("{id}-scrim").into()))
@@ -1448,7 +1483,82 @@ fn palette_with_results<V: ControlHost>(
             )
             .child(panel),
     )
-    .with_priority(180)
+    .priority(180)
+}
+
+/// How wide a command palette is, in a window or over one.
+pub(crate) const PALETTE_WIDTH: f32 = 520.0;
+/// The padding and gap around and between the palette's query field and
+/// its list, which a window sized to the palette has to add up.
+pub(crate) const PALETTE_PADDING: f32 = 8.0;
+const PALETTE_GAP: f32 = 6.0;
+
+/// The palette's surface: the field colour in the light scheme, where the
+/// panel lifts off the page by its shadow, and the soft fill in the dark one.
+pub(crate) fn palette_fill(palette: Palette) -> Rgba {
+    if palette.is_dark {
+        palette.soft_fill
+    } else {
+        palette.field_surface
+    }
+}
+
+/// The height of a palette panel holding `list`, padding included: what a
+/// window sized to the panel needs.
+#[cfg(feature = "command-bar-window")]
+pub(crate) fn palette_panel_height(list: &ResultList) -> f32 {
+    let rows = if list.navigation.rows.is_empty() {
+        COMMAND_ROW_HEIGHT
+    } else {
+        list.navigation.viewport_height()
+    };
+    2.0 * PALETTE_PADDING + crate::controls::CONTROL_HEIGHT + PALETTE_GAP + rows
+}
+
+/// The panel every command palette is made of: the query field over the
+/// result list, with the list's keys, and Escape answered by `on_dismiss`.
+/// The overlay places it over a scrim; the command bar window fills itself
+/// with it. One implementation, so the two cannot drift on keys, focus or
+/// results.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn palette_panel<V: ControlHost>(
+    id: ComboId,
+    query: &Entity<TextInput>,
+    list: ResultList,
+    empty_message: &'static str,
+    ctx: WidgetContext<'_, '_, '_, V>,
+    window: &Window,
+    on_activate: Activate<V>,
+    on_dismiss: Dismissed<V>,
+) -> Div {
+    let WidgetContext { palette, view, cx } = ctx;
+    let state = view.control_state();
+    let fill = palette_fill(palette);
+    let panel = div()
+        .flex()
+        .flex_col()
+        .gap(px(PALETTE_GAP))
+        .p(px(PALETTE_PADDING))
+        .bg(fill)
+        .occlude()
+        // Once `bind_keys` has run, Escape arrives as this action and never
+        // as a key. The query field has the keyboard, and this is the first
+        // thing above it.
+        .on_action(cx.listener(move |this, _: &Dismiss, window, cx| {
+            on_dismiss(this, window, cx);
+            cx.notify();
+        }))
+        .child(search_field(id, query, palette, window, cx))
+        .child(result_viewport(
+            id,
+            list.elements,
+            &list.navigation,
+            empty_message,
+            (fill, fill),
+            palette,
+            state,
+        ));
+    list_keys(panel, id, list.ids, Some(list.navigation), cx, on_activate)
 }
 
 #[cfg(test)]
@@ -1833,3 +1943,11 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "emphasis_bench.rs"]
+mod emphasis_bench;
+
+#[cfg(test)]
+#[path = "search_bench.rs"]
+mod search_bench;

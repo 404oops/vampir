@@ -548,6 +548,10 @@ pub struct ControlState {
 
     /// The open command palette, if any.
     pub palette_overlay: Option<OpenPalette>,
+    /// The command bars this host has open in windows of their own. See
+    /// [`crate::command_bar`].
+    #[cfg(feature = "command-bar-window")]
+    pub(crate) command_bars: Vec<crate::command_bar::Session>,
     /// The shortcut recorder waiting for a key chord, if any.
     pub recording: Option<ComboId>,
     pub(crate) recording_keys: Option<[gpui::Subscription; 2]>,
@@ -590,6 +594,8 @@ impl ControlState {
             dialog_return_focus: None,
             dialog_trap: RefCell::new(None),
             palette_overlay: None,
+            #[cfg(feature = "command-bar-window")]
+            command_bars: Vec::new(),
             recording: None,
             recording_keys: None,
             recording_activation: None,
@@ -1057,15 +1063,17 @@ impl ControlState {
     fn set_list_highlight(&self, list: Tag, index: usize, to: u64, moved: bool) {
         let frame = self.frame.get();
         let mut records = self.records.borrow_mut();
-        let entry = records.entry(Kind::List.slot(list)).or_insert(Entry {
-            touched: frame,
-            record: Record::List {
-                highlight: index,
-                query: Tag::new("").0,
-                item: to,
-                chosen: moved,
-            },
-        });
+        let entry = records
+            .entry(Kind::List.slot(list))
+            .or_insert_with(|| Entry {
+                touched: frame,
+                record: Record::List {
+                    highlight: index,
+                    query: Tag::new("").0,
+                    item: to,
+                    chosen: moved,
+                },
+            });
         entry.touched = frame;
         if let Record::List {
             highlight,

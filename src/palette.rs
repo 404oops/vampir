@@ -11,8 +11,8 @@ use crate::color::{TRANSPARENT, WHITE, argb, oklch_to_color};
 
 /// The toolkit's original pastel chroma, unchanged by the saturation gain.
 pub const DEFAULT_SATURATION: f64 = 1.0;
-/// Twice the original chroma; colors outside sRGB are clipped into its gamut.
-pub const MAX_SATURATION: f64 = 2.0;
+/// The upper theme intensity; surfaces and controls use different chroma gains.
+pub const MAX_SATURATION: f64 = 3.0;
 
 pub(crate) fn normalized_saturation(saturation: f64) -> f64 {
     if saturation.is_nan() {
@@ -94,13 +94,31 @@ impl Palette {
         Self::from_hue_and_saturation(hue, DEFAULT_SATURATION, dark)
     }
 
-    /// The palette with a gain on every role's OKLCH chroma, including
+    /// The palette with a gain on the roles' OKLCH chroma, including
     /// destructive colors: `0` is grayscale, `1` the original pastels, and
-    /// `2` vivid. Lightness stays the same before sRGB gamut clipping.
-    /// Values outside `0..=2` are clamped; NaN uses [`DEFAULT_SATURATION`].
+    /// `3` the vividness limit. Above one, controls gain colour gently while
+    /// background surfaces gain more, including a tint on light panels.
+    /// Values outside `0..=3` are clamped; NaN uses [`DEFAULT_SATURATION`].
     pub fn from_hue_and_saturation(hue: f64, saturation: f64, dark: bool) -> Self {
         let saturation = normalized_saturation(saturation);
-        let color = |l: f64, c: f64, h: f64| oklch_to_color(l, c * saturation, h);
+        // Here rather than only where a colour is made: the roles offset the
+        // hue, and a hue that is not a number has to be one hue for all of them.
+        let hue = if hue.is_finite() { hue } else { 0.0 };
+        // Strong fills reach the sRGB boundary quickly; spend the extra
+        // intensity on the quieter surfaces instead of clipping every button.
+        let control_gain = saturation.min(1.0) + (saturation - 1.0).max(0.0) * 0.35;
+        let surface_gain = saturation.min(1.0) + (saturation - 1.0).max(0.0) * 1.25;
+        let color = |l: f64, c: f64, h: f64| oklch_to_color(l, c * control_gain, h);
+        let surface = |l: f64, c: f64, h: f64| oklch_to_color(l, c * surface_gain, h);
+        let light_surface = if saturation > 1.0 {
+            oklch_to_color(
+                1.0 - 0.012 * (saturation - 1.0),
+                0.012 * (saturation - 1.0),
+                hue - 2.0,
+            )
+        } else {
+            WHITE
+        };
         let pastel = |l: f64, c: f64, dh: f64| color(l, c.clamp(0.0, 0.16), hue + dh);
         let pick =
             |dark_color: Rgba, light_color: Rgba| if dark { dark_color } else { light_color };
@@ -116,16 +134,16 @@ impl Palette {
         Self {
             is_dark: dark,
             accent,
-            backdrop: pick(color(0.285, 0.012, hue), color(0.955, 0.012, hue)),
+            backdrop: pick(surface(0.285, 0.012, hue), surface(0.955, 0.012, hue)),
 
             text_primary,
             text_secondary: pick(pastel(0.86, 0.015, 0.0), pastel(0.36, 0.015, 0.0)),
 
-            field_surface: pick(pastel(0.20, 0.014, -2.0), WHITE),
+            field_surface: pick(surface(0.20, 0.014, hue - 2.0), light_surface),
             field_border: pick(pastel(0.35, 0.016, 0.0), pastel(0.87, 0.014, 0.0)),
             field_border_strong: pick(color(0.48, 0.060, hue), pastel(0.72, 0.065, 0.0)),
 
-            area_surface: pick(pastel(0.26, 0.016, -2.0), WHITE),
+            area_surface: pick(surface(0.26, 0.016, hue - 2.0), light_surface),
             area_border: pick(border, pastel(0.84, 0.018, 0.0)),
 
             row_hover: pick(pastel(0.28, 0.025, -2.0), pastel(0.87, 0.018, -2.0)),
@@ -299,12 +317,16 @@ mod tests {
                     Palette::from_hue(hue, dark),
                     Palette::from_hue_and_saturation(hue, DEFAULT_SATURATION, dark)
                 );
-                for saturation in [0.5, 1.0, 2.0] {
+                for saturation in [0.5, 1.0, 2.0, MAX_SATURATION] {
                     let palette = Palette::from_hue_and_saturation(hue, saturation, dark);
                     let lightness = if dark { 0.78 } else { 0.62 };
                     assert_eq!(
                         palette.accent,
-                        oklch_to_color(lightness, 0.105 * saturation, hue)
+                        oklch_to_color(
+                            lightness,
+                            0.105 * (saturation.min(1.0) + (saturation - 1.0).max(0.0) * 0.35),
+                            hue
+                        )
                     );
                 }
             }
@@ -318,7 +340,9 @@ mod tests {
             (f64::NEG_INFINITY, 0.0),
             (-1.0, 0.0),
             (0.5, 0.5),
-            (3.0, MAX_SATURATION),
+            (3.0, 3.0),
+            (4.0, MAX_SATURATION),
+            (5.0, MAX_SATURATION),
             (f64::INFINITY, MAX_SATURATION),
         ] {
             assert_eq!(normalized_saturation(input), expected);
@@ -327,6 +351,55 @@ mod tests {
                     Palette::from_hue_and_saturation(268.0, input, dark),
                     Palette::from_hue_and_saturation(268.0, expected, dark)
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn a_hue_that_is_not_a_number_falls_back_to_zero() {
+        for dark in [false, true] {
+            for hue in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                assert_eq!(
+                    Palette::from_hue_and_saturation(hue, MAX_SATURATION, dark),
+                    Palette::from_hue_and_saturation(0.0, MAX_SATURATION, dark)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn surface_tint_arrives_continuously_above_standard_intensity() {
+        for dark in [false, true] {
+            let standard = Palette::from_hue(268.0, dark);
+            let increased = Palette::from_hue_and_saturation(268.0, 1.000001, dark);
+            for (before, after) in roles(standard).into_iter().zip(roles(increased)) {
+                for (before, after) in channels(before).into_iter().zip(channels(after)) {
+                    assert!((before - after).abs() < 0.0001);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vivid_backgrounds_are_tinted_and_keep_body_text_readable() {
+        for hue in (0..360).step_by(15) {
+            for dark in [false, true] {
+                let palette = Palette::from_hue_and_saturation(hue as f64, MAX_SATURATION, dark);
+                for background in [
+                    palette.backdrop,
+                    palette.field_surface,
+                    palette.area_surface,
+                ] {
+                    let [r, g, b, _] = channels(background);
+                    assert!(r != g || g != b, "hue {hue} dark {dark}: neutral surface");
+                    let background = relative_luminance(background);
+                    for text in [palette.text_primary, palette.text_secondary] {
+                        let foreground = relative_luminance(text);
+                        let contrast = (foreground.max(background) + 0.05)
+                            / (foreground.min(background) + 0.05);
+                        assert!(contrast >= 4.5, "hue {hue} dark {dark}: {contrast}");
+                    }
+                }
             }
         }
     }

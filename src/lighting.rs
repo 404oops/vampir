@@ -108,14 +108,14 @@ pub fn rim(fill: Rgba, dark: bool) -> Rgba {
 pub fn raised(dark: bool) -> Vec<BoxShadow> {
     let mut shadows = vec![
         BoxShadow {
-            color: white(if dark { 0.08 } else { 0.55 }),
+            color: white(if dark { 0.08 } else { 0.55 }).into(),
             offset: point(px(0.0), px(1.0)),
             blur_radius: px(0.0),
             spread_radius: px(0.0),
             inset: true,
         },
         BoxShadow {
-            color: black(if dark { 0.22 } else { 0.1 }),
+            color: black(if dark { 0.22 } else { 0.1 }).into(),
             offset: point(px(0.0), px(1.0)),
             blur_radius: px(2.0),
             spread_radius: px(0.0),
@@ -124,7 +124,7 @@ pub fn raised(dark: bool) -> Vec<BoxShadow> {
     ];
     if !dark {
         shadows.push(BoxShadow {
-            color: black(0.05),
+            color: black(0.05).into(),
             offset: point(px(0.0), px(-1.0)),
             blur_radius: px(0.0),
             spread_radius: px(0.0),
@@ -137,7 +137,7 @@ pub fn raised(dark: bool) -> Vec<BoxShadow> {
 /// Recessed well (fields, tracks): a soft shadow inside the top edge.
 pub fn recessed(dark: bool) -> Vec<BoxShadow> {
     vec![BoxShadow {
-        color: black(if dark { 0.3 } else { 0.1 }),
+        color: black(if dark { 0.3 } else { 0.1 }).into(),
         offset: point(px(0.0), px(1.5)),
         blur_radius: px(2.5),
         spread_radius: px(0.0),
@@ -149,14 +149,14 @@ pub fn recessed(dark: bool) -> Vec<BoxShadow> {
 pub fn panel(dark: bool) -> Vec<BoxShadow> {
     vec![
         BoxShadow {
-            color: white(if dark { 0.05 } else { 0.7 }),
+            color: white(if dark { 0.05 } else { 0.7 }).into(),
             offset: point(px(0.0), px(1.0)),
             blur_radius: px(0.0),
             spread_radius: px(0.0),
             inset: true,
         },
         BoxShadow {
-            color: black(if dark { 0.25 } else { 0.09 }),
+            color: black(if dark { 0.25 } else { 0.09 }).into(),
             offset: point(px(0.0), px(2.0)),
             blur_radius: px(10.0),
             spread_radius: px(0.0),
@@ -169,7 +169,7 @@ pub fn panel(dark: bool) -> Vec<BoxShadow> {
 pub fn faded(mut shadows: Vec<BoxShadow>, t: f32) -> Vec<BoxShadow> {
     let t = t.clamp(0.0, 1.0);
     for shadow in &mut shadows {
-        shadow.color.alpha *= t;
+        shadow.color = shadow.color.opacity(t);
     }
     shadows
 }
@@ -177,7 +177,7 @@ pub fn faded(mut shadows: Vec<BoxShadow>, t: f32) -> Vec<BoxShadow> {
 /// Coloured glow around an element (current node, focused field).
 pub fn glow(color: Rgba, alpha: f32, radius: f32) -> BoxShadow {
     BoxShadow {
-        color: to_hsla(crate::color::with_alpha(color, alpha)),
+        color: to_hsla(crate::color::with_alpha(color, alpha)).into(),
         offset: point(px(0.0), px(0.0)),
         blur_radius: px(radius),
         spread_radius: px(radius * 0.25),

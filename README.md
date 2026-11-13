@@ -26,13 +26,13 @@ Vampir builds on [gpui-ce](https://github.com/gpui-ce/gpui-ce), the community ed
 ```toml
 [dependencies]
 vampir = "0.2"
-gpui = { package = "gpui-ce", version = "0.2" }
+gpui = { package = "gpui-ce", version = "0.3" }
 ```
 
 Renaming the package to `gpui` lets your code, Vampir's and every GPUI example read the same way. The window and event loop live in the platform crate, which an application adds too:
 
 ```toml
-gpui_ce_platform = { version = "0.1", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
+gpui_ce_platform = { version = "0.3", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
 ```
 
 `runtime_shaders` builds the Metal shaders when the app starts, so a Mac with only the command line tools can run it; `wayland` and `x11` are the Linux backends and are harmless elsewhere.
@@ -74,7 +74,7 @@ Every `ControlState` carries a theme: hue, saturation, and a colour scheme that 
 let palette = Palette::from_hue_and_saturation(210.0, 0.55, /* dark */ true);
 ```
 
-Saturation runs from zero (greyscale) through one (the original colour strength) to two (more vivid), in both light and dark schemes. `Palette::from_hue` keeps saturation one, and `Palette::neutral` is greyscale. Add theme pickers only when appearance customization is part of the product; see [Hosting › Themes](docs/hosting.md#themes) for app defaults and optional controls.
+Saturation runs from zero (greyscale) through one (the original colour strength) to three (the vividness limit), in both light and dark schemes. `Palette::from_hue` keeps saturation one, and `Palette::neutral` is greyscale. Add theme pickers only when appearance customization is part of the product; see [Hosting › Themes](docs/hosting.md#themes) for app defaults and optional controls.
 
 ## Try the gallery
 
@@ -109,7 +109,7 @@ The gallery supports both colour schemes:
 
 **Containers** — `tab_bar` and `tab_bar_layout` (natural, uniform-width horizontal, or vertical tabs; drag to reorder and optional close buttons) with `reorder`, `split_handle` + `split_area`, `collapsible`, `dialog`, `card` with `card_at`, `labelled`, `row` / `column`, `scroll_area`, `arriving`.
 
-**Menus and overlays** — `context_menu` with nested `MenuItem::submenu` levels, `menu_button`, `menu_target`, `Tooltip`, `command_palette` and `search_list` with `fuzzy_filter` / `fuzzy_score`, and `ranked_command_palette` / `ranked_search_list` for host-ranked `SearchResult`s with sections, details and leading visuals, and `rank_results` to rank them.
+**Menus and overlays** — `context_menu` over one `MenuItem` tree with nested `submenu` levels, icons and typed ids, `menu_button`, `menu_target`, `Tooltip`, `command_palette` and `open_command_bar` (the same palette in a window above a live native view) and `search_list` with `fuzzy_filter` / `fuzzy_score`, and `ranked_command_palette` / `ranked_search_list` for host-ranked `SearchResult`s with sections, details and leading visuals, and `rank_results` to rank them.
 
 **Data** — `tree_row` with `flatten_tree`, `selectable_list` with host-owned `ListSelection`, `table_header` and `table_row` with `Column` and `SortDirection`.
 
@@ -121,7 +121,7 @@ The gallery supports both colour schemes:
 
 **Lighting** — `lit`, `raised`, `recessed`, `panel`, `rim`, `glow`, `shade`, `ground`. These helpers keep gradients and shadows consistent across controls.
 
-**The host's root** — `root`, `handle_keys`, `handle_mouse`, `bind_keys`, `edit_menu`, `ui_font`.
+**The host's root** — `root`, `handle_keys`, `handle_mouse`, `bind_keys`, `edit_menu`, `ui_font_face`.
 
 ## The app icon
 

@@ -32,7 +32,7 @@ Every control animates its changes of state — the switch slides, the tick draw
 
 ## Containers — `vampir::containers`
 
-`tab_bar` (natural-width horizontal tabs, drag to reorder, optional close buttons, and a raised pill that slides to the active tab), `tab_bar_layout` with `TabBarLayout::{Horizontal, HorizontalUniform { width }, Vertical}`, `split_handle` + `split_area`, `collapsible` (unfolds to its measured height), `dialog` + `DialogButton`.
+`tab_bar` (natural-width horizontal tabs, drag to reorder, optional close buttons, and a raised pill that slides to the active tab), `tab_bar_layout` with `TabBarLayout::{Horizontal, HorizontalUniform { width }, Vertical}`, `split_handle` + `split_area`, `collapsible` (unfolds to its measured height), and `dialog` + `DialogButton`.
 
 `HorizontalUniform` keeps each tab at the same width (clamped to 96–320), elides long labels, and scrolls sideways when the strip is full. Its close buttons stay at the same position within each tab as siblings close. `Vertical` fills the width its host gives it and scrolls down when its height is constrained. In every layout, tabs fade out into the well at an edge with more past it rather than being cut off there. Both layouts keep the same select, close and drag callbacks as `tab_bar`; arrow keys follow the layout's direction and bring the newly selected tab into view. A `Tab` is identified by its label unless `Tab::id` says otherwise, and everything the bar remembers about a tab follows that identity through a reorder. The gallery's Data page renders both dense horizontal and vertical bars over the same host-owned tabs.
 
@@ -48,7 +48,7 @@ The page itself is laid out with the same vocabulary: `card` is the lit panel wi
 
 ## Menus — `vampir::menu`
 
-`context_menu` renders the open menu; `MenuItem::action(..).shortcut(..).checked(..).danger().disabled()` builds action rows, `MenuItem::submenu(label, items)` nests a menu to any depth, and `MenuItem::header` and `MenuItem::separator` break rows up. A submenu can also be disabled. Open the menu from wherever the press happened:
+`context_menu` renders the open menu; `MenuItem::action(id, label).shortcut(..).checked(..).danger().disabled()` builds action rows, `MenuItem::submenu(label, items)` nests a menu to any depth, and `MenuItem::header` and `MenuItem::separator` break rows up. Checkmarks sit at the trailing edge after any shortcut, keeping checked and unchecked labels aligned. A submenu can also be disabled, and `enabled(bool)` sets either from a value. An action's `id` is what comes back when it is chosen: a `&'static str` by default, or the host's own command type — `MenuItem<Option<Command>>` is a menu whose rows carry what they do, with `None` for a row that only says something — so there is no table to keep in step with the rows. Any action or submenu can carry an icon with `.icon(..)`: a `MenuIcon` is whatever the host draws at a size in a colour, converted once from the host's icon type with `impl From<Icon> for MenuIcon`, and a level with an icon anywhere in it keeps a trailing icon column so its labels line up. Open the menu from wherever the press happened:
 
 ```rust
 .on_mouse_down(MouseButton::Right, cx.listener(|this, event: &MouseDownEvent, _w, cx| {
@@ -75,6 +75,10 @@ These are in-window menus drawn by the toolkit. The macOS menu bar is a differen
 ![The command palette open over the fields page](overlays.png)
 
 `Tooltip::text` / `Tooltip::with_shortcut` plug into GPUI's own `.tooltip(..)`, which already owns the hover delay and the placement; `Hint` is what one says, for a control such as `icon_button` that carries its own.
+
+![The command bar above the Native view page's live NSTextView, filtering for "to"](command-bar.png)
+
+`open_command_bar` is the palette in a window of its own above the host window, for a host with a live native view over its content that would hide the in-window palette; `CommandBarOptions::dim` darkens the host window behind it, except on an X11 screen with no compositing manager and under Wayland, where no scrim can be shown. The gallery's Native view page shows it over a real native view. See [hosting](hosting.md#over-a-native-view).
 
 `command_palette` is opened with `ControlState::open_palette`, or `toggle_palette` from whatever shortcut the host gives it, and renders nothing otherwise. The host owns the query `TextInput` and the `Command`s; the palette filters them with `fuzzy_filter` as the query is typed, moves the highlight with Up and Down, runs the highlighted command on Enter or a clicked one, and closes on Escape or the scrim — handing the keyboard back where it was before the command runs.
 
@@ -104,7 +108,7 @@ The tree stays the host's, and `flatten_tree` walks it into `TreeRow`s each fram
 
 ![The colour page, with an Oklch chroma and lightness pad](colour.png)
 
-`hue_slider`, `saturation_slider`, `color_pad` (chroma across, lightness up), `swatch_grid`, `hue_wheel`. The hue, pad, swatches and wheel use `Oklch`; the saturation slider uses the palette's `0.0..=2.0` chroma multiplier. Zero is grey, one is the original colour strength, and two is more vivid. Its drag reports a normalized track position; convert with `Theme::saturation_from_track` when storing the value.
+`hue_slider`, `saturation_slider`, `color_pad` (chroma across, lightness up), `swatch_grid`, `hue_wheel`. The hue, pad, swatches and wheel use `Oklch`; the saturation slider uses the palette's `0.0..=3.0` theme intensity. Zero is grey, one is the original colour strength, and three is the vividness limit. Its drag reports a normalized track position; convert with `Theme::saturation_from_track` when storing the value.
 
 ## Shortcuts — `vampir::shortcut`
 
@@ -118,7 +122,7 @@ Every `ControlState` carries a `Theme` — hue, saturation, and a `Scheme` of `S
 
 ![Text fields, a rich-text area and a shortcut recorder](fields.png)
 
-`TextInput` is a full input: selection, IME composition, undo, clipboard, multi-line wrapping. It is the one thing in the crate that is an entity rather than a function, because a text cursor genuinely is state.
+`TextInput` is a full input: selection, IME composition, undo, clipboard, multi-line wrapping. It is the one thing in the crate that is an entity rather than a function, because a text cursor genuinely is state. Read with `shared_text()` when retaining the immutable text across context updates: it clones a shared string without copying its bytes. `text()` returns an owned `String` when one is needed.
 
 `InputStyle::from_palette(palette, size)` is the style to start from; an input styled that way is kept in step with the palette by whichever field holds it, so a host never re-styles its inputs by hand.
 
@@ -142,4 +146,4 @@ input.update(cx, |input, cx| {
 
 ## Type — `vampir::typography`
 
-`ui_font()` is the system's interface face under the name each platform knows it by, for `.font_family` on the root. `TEXT_SIZE`, `SMALL_TEXT_SIZE` and `TITLE_TEXT_SIZE` are the three sizes the toolkit sets text in.
+`ui_font_face()` is the system's interface face under the name each platform knows it by, with the faces that platform keeps its symbols in (`symbol_fonts()`) behind it, for `.font` on the root. `ui_font()` is the face's name alone. `TEXT_SIZE`, `SMALL_TEXT_SIZE` and `TITLE_TEXT_SIZE` are the three sizes the toolkit sets text in.

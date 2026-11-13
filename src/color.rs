@@ -83,6 +83,9 @@ pub(crate) struct OklchHue {
 
 impl OklchHue {
     pub(crate) fn new(degrees: f64) -> Self {
+        // NaN and the infinities have no remainder, and their sine would
+        // carry NaN into every channel of every colour derived from them.
+        let degrees = if degrees.is_finite() { degrees } else { 0.0 };
         let radians = (degrees % 360.0) * std::f64::consts::PI / 180.0;
         Self {
             cos: radians.cos(),

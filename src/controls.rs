@@ -462,7 +462,7 @@ pub fn spinbox<V: ControlHost>(
     let typed_from = edit_input.clone();
     let inc = commit;
 
-    type Step<V> = Box<dyn Fn(&mut V, &mut Window, &mut Context<V>) + 'static>;
+    type Step<V> = Rc<dyn Fn(&mut V, &mut Window, &mut Context<V>) + 'static>;
     let step_button = |id: ElementId,
                        glyph: &'static str,
                        active: bool,
@@ -482,7 +482,6 @@ pub fn spinbox<V: ControlHost>(
             // A stepper at its limit stays visible but stops responding:
             // removing it would shift the other one under the pointer.
             .when(enabled && active, move |el| {
-                let handler = Rc::new(handler);
                 let key_handler = handler.clone();
                 el.relative()
                     .cursor_pointer()
@@ -549,7 +548,7 @@ pub fn spinbox<V: ControlHost>(
             // number the host does not have.
             .on_action(cx.listener(
                 move |this, _: &crate::text_input::Enter, window, cx| {
-                    let text = typed_from.read(cx).text();
+                    let text = typed_from.read(cx).shared_text();
                     match text.trim().parse::<i32>() {
                         Ok(entered) => typed(this, entered.clamp(min, max), window, cx),
                         Err(_) => typed_from.update(cx, |input, cx| {
@@ -565,7 +564,7 @@ pub fn spinbox<V: ControlHost>(
             "\u{2212}",
             value > min,
             cx,
-            Box::new(move |this, window, cx| {
+            Rc::new(move |this, window, cx| {
                 dec(this, (value - 1).max(min), window, cx);
             }),
         ))
@@ -582,7 +581,7 @@ pub fn spinbox<V: ControlHost>(
             "+",
             value < max,
             cx,
-            Box::new(move |this, window, cx| {
+            Rc::new(move |this, window, cx| {
                 inc(this, (value + 1).min(max), window, cx);
             }),
         ))
@@ -1060,7 +1059,7 @@ pub fn combo<V: ControlHost>(
                                 )),
                         ),
                 )
-                .with_priority(100),
+                .priority(100),
             )
         })
 }
@@ -2331,8 +2330,6 @@ pub fn search_field<V: ControlHost>(
                     .items_center()
                     .justify_center()
                     .cursor_pointer()
-                    .text_size(px(11.0))
-                    .text_color(palette.text_secondary)
                     .hover(move |style| style.bg(palette.row_hover))
                     .on_click(cx.listener(move |_host, _event, window, cx| {
                         clear_input.update(cx, |input, cx| {
@@ -2341,9 +2338,31 @@ pub fn search_field<V: ControlHost>(
                         });
                         cx.notify();
                     }))
-                    .child("\u{2715}"),
+                    .child(cross_glyph(7.0, palette.text_secondary)),
             )
         })
+}
+
+/// A close or clear cross `size` points across, drawn rather than set in
+/// type: U+2715 is in no interface face, and a text system that cannot find
+/// a fallback for it draws a stand-in instead.
+pub(crate) fn cross_glyph(size: f32, color: gpui::Rgba) -> impl IntoElement {
+    canvas(
+        |_bounds, _window, _cx| {},
+        move |bounds, _state, window, _cx| {
+            let (x, y) = (bounds.origin.x, bounds.origin.y);
+            let mut builder = PathBuilder::stroke(px(1.2));
+            builder.move_to(point(x, y));
+            builder.line_to(point(x + px(size), y + px(size)));
+            builder.move_to(point(x + px(size), y));
+            builder.line_to(point(x, y + px(size)));
+            if let Ok(path) = builder.build() {
+                window.paint_path(path, color);
+            }
+        },
+    )
+    .w(px(size))
+    .h(px(size))
 }
 
 // ---- Spinner and badges -----------------------------------------------------

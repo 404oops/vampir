@@ -168,7 +168,7 @@ impl Theme {
         (f64::from(at) * 360.0).clamp(0.0, 359.9)
     }
 
-    /// Reads a 0..=1 track position as saturation: 0 is grey, the middle is
+    /// Reads a 0..=1 track position as saturation: 0 is grey, a third is
     /// the default intensity and the far end is [`MAX_SATURATION`].
     pub fn saturation_from_track(at: f32) -> f64 {
         normalized_saturation(f64::from(at) * MAX_SATURATION)
@@ -295,7 +295,8 @@ mod tests {
     fn saturation_tracks_map_the_full_range_and_normalize_invalid_positions() {
         for (position, expected) in [
             (0.0, 0.0),
-            (0.5, DEFAULT_SATURATION),
+            (0.25, 0.75),
+            (0.5, 1.5),
             (1.0, MAX_SATURATION),
             (-1.0, 0.0),
             (2.0, MAX_SATURATION),

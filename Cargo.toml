@@ -11,7 +11,7 @@ documentation = "https://docs.rs/vampir"
 readme = "README.md"
 keywords = ["gpui", "gui", "widgets", "ui", "toolkit"]
 categories = ["gui"]
-exclude = ["docs/", ".github/", "tools/"]
+exclude = ["docs/", ".github/", "tools/", "vendor/"]
 
 [features]
 default = ["app-icon"]
@@ -21,11 +21,18 @@ default = ["app-icon"]
 #   vampir = { version = "0.2", default-features = false }
 app-icon = ["dep:image", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
 
+# The command palette in a window of its own, above a host window whose
+# content a live native view covers (`open_command_bar`). It needs the
+# anchored popup windows that only the GPUI-CE vendored in this repository
+# implements (vendor/LOCAL_PATCHES.md), so it is off by default and a host
+# turning it on patches GPUI-CE the way this repository's own manifest does.
+command-bar-window = []
+
 [dependencies]
 # gpui-ce is the community edition of Zed's GPUI (Apache-2.0): the same API,
 # synced from Zed and published to crates.io, which is what lets this crate be
 # published too. Imported as `gpui` so the code reads as GPUI code.
-gpui = { package = "gpui-ce", version = "0.2.2" }
+gpui = { package = "gpui-ce", version = "0.3.0" }
 unicode-segmentation = "1"
 
 # Only for `app-icon`, and only on the platform that wants them. Both are
@@ -51,16 +58,64 @@ image = { version = "0.25", optional = true, default-features = false, features 
 # backend lives here. `runtime_shaders` compiles the Metal shaders when the
 # app starts instead of at build time, so a machine with only the command line
 # tools — no full Xcode — can build the gallery.
-gpui_ce_platform = { version = "0.1.0", features = [
+gpui_ce_platform = { version = "0.3.0", features = [
     "font-kit",
     "runtime_shaders",
     "wayland",
     "x11",
 ] }
 
+# The gallery's Native view page embeds a real native child view, made
+# with the same platform crates GPUI's backends already build.
+raw-window-handle = "0.6"
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = [
+    "NSControl",
+    "NSGraphics",
+    "NSProgressIndicator",
+    "NSResponder",
+    "NSScrollView",
+    "NSText",
+    "NSTextView",
+    "NSView",
+    "NSWindow",
+] }
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSGeometry", "NSString"] }
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dev-dependencies]
+x11rb = "0.13"
+
 [[example]]
 name = "gallery"
 path = "examples/gallery.rs"
 
+# Here rather than only on CI's command line, so an editor shows them too.
+# CI turns every warning into an error, so a lint goes in this list only
+# once the crate is clean of it on all three platforms.
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+missing_errors_doc = "warn"
+
 [profile.release]
 lto = "thin"
+
+# GPUI-CE with the backend changes the command bar window needs: see
+# vendor/README.md. Never published: `vendor/` is excluded above, and a
+# `[patch]` section only ever applies to the workspace that declares it.
+[patch.crates-io]
+gpui-ce = { path = "vendor/gpui-ce" }
+gpui_ce_macos = { path = "vendor/gpui_ce_macos" }
+gpui_ce_windows = { path = "vendor/gpui_ce_windows" }
+gpui_ce_linux = { path = "vendor/gpui_ce_linux" }

@@ -10,6 +10,10 @@
 //! toolkit's. What is left here is the gallery's own data, its pages, and
 //! the menu bar and shortcuts a real application owns.
 
+// Windows opens a console beside any program that does not say it is a GUI
+// one. A host copied from here should not bring a terminal with it.
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use gpui::{
     App, Bounds, Context, Entity, KeyBinding, Menu, MenuItem as OsMenuItem, Point, ScrollHandle,
     SharedString, SystemMenuType, TitlebarOptions, Window, WindowBounds, WindowOptions, actions,
@@ -17,21 +21,26 @@ use gpui::{
 };
 use gpui_ce_platform::application;
 
+#[path = "support/native_view.rs"]
+mod native_view;
+use native_view::NativeView;
+
 #[cfg(feature = "app-icon")]
 use vampir::AppIcon;
 use vampir::{
     BadgeTone, ButtonVariant, CARD_LIFT, CONTROL_HEIGHT, ChipSelection, Choice, Chord, Column,
     ComboId, Command, ControlHost, ControlState, DialogButton, Hint, InputStyle, ListSelection,
-    MAX_CHROMA, MenuItem, Oklch, Palette, Scheme, ScrollAxis, SearchResult, SelectionIntent,
-    SliderTrack, SortDirection, Span, TEXT_SIZE, TITLE_TEXT_SIZE, Tab, TabBarLayout, TextInput,
-    Theme, TreeRow, WidgetContext, arriving, badge, bind_keys, button, caption, card, card_at,
-    checkbox, chip_group, collapsible, color_pad, column, combo, command_palette, context_menu,
-    dialog, edit_menu, fading_text, flatten_tree, glyph, ground, hue_picker, hue_slider, hue_wheel,
-    icon_button, labelled, lit, lit_stops, menu_button, menu_target, progress_bar, radio_group,
-    rank_results, ranked_command_palette, ranked_search_list, reorder, row, saturation_picker,
-    scheme_picker, scroll_area, search_list, segmented, selectable_list, separator,
-    shortcut_recorder, slider, spinbox, spinner, split_area, split_handle, swatch_grid, switch,
-    tab_bar, tab_bar_layout, table_header, table_row, text_area, text_field, tree_row, ui_font,
+    MAX_CHROMA, MenuItem, Oklch, Palette, SMALL_TEXT_SIZE, Scheme, ScrollAxis, SearchResult,
+    SelectionIntent, SliderTrack, SortDirection, Span, TEXT_SIZE, TITLE_TEXT_SIZE, Tab,
+    TabBarLayout, TextInput, Theme, TreeRow, WidgetContext, arriving, badge, bind_keys, button,
+    caption, card, card_at, checkbox, chip_group, collapsible, color_pad, column, combo,
+    command_palette, context_menu, dialog, edit_menu, fading_text, flatten_tree, glyph, ground,
+    hue_picker, hue_slider, hue_wheel, icon_button, labelled, lit, lit_stops, menu_button,
+    menu_target, progress_bar, radio_group, rank_results, ranked_command_palette,
+    ranked_search_list, reorder, row, saturation_picker, scheme_picker, scroll_area, search_list,
+    segmented, selectable_list, separator, shortcut_recorder, slider, spinbox, spinner, split_area,
+    split_handle, swatch_grid, switch, tab_bar, tab_bar_layout, table_header, table_row, text_area,
+    text_field, tree_row, ui_font_face,
 };
 
 // The gallery is also the smallest complete *macOS* host, so it carries the
@@ -57,6 +66,8 @@ actions!(
         ShowFields,
         ShowData,
         ShowColour,
+        ShowNative,
+        OpenCommandBar,
         MinimizeWindow,
         ZoomWindow,
         CloseWindow,
@@ -71,6 +82,7 @@ enum Page {
     Fields,
     Data,
     Colour,
+    Native,
 }
 
 impl Page {
@@ -80,6 +92,7 @@ impl Page {
             Page::Fields => "Fields",
             Page::Data => "Data",
             Page::Colour => "Colour",
+            Page::Native => "Native view",
         }
     }
 }
@@ -230,6 +243,11 @@ struct Gallery {
     // The command palette's query and what it searches.
     palette_query: Entity<TextInput>,
     commands: Vec<Command>,
+    /// The Native view page's real native child view, made once with the
+    /// window and placed (or hidden) every frame.
+    native: Option<std::rc::Rc<NativeView>>,
+    /// Whether the command bar darkens this window while it is open.
+    dim_command_bar: bool,
 }
 
 impl ControlHost for Gallery {
@@ -341,7 +359,15 @@ impl Gallery {
         Self {
             controls,
             scroll: ScrollHandle::new(),
-            pages: vec![Page::Controls, Page::Fields, Page::Data, Page::Colour],
+            pages: vec![
+                Page::Controls,
+                Page::Fields,
+                Page::Data,
+                Page::Colour,
+                Page::Native,
+            ],
+            native: NativeView::new(window).map(std::rc::Rc::new),
+            dim_command_bar: false,
             page: 0,
             switched: true,
             checks: [true, false],
@@ -675,132 +701,147 @@ impl Render for Gallery {
             Page::Fields => self.page_fields(palette, window, cx),
             Page::Data => self.page_data(palette, window, cx),
             Page::Colour => self.page_colour(palette, cx),
+            Page::Native => self.page_native(palette, window, cx),
         };
+        // A native view is composited over everything GPUI draws, so off its
+        // page it has to be hidden rather than merely not drawn.
+        if page != Page::Native
+            && let Some(native) = &self.native
+        {
+            native.place(None, window);
+        }
         // Keyed by the page, not the tab's position, so reordering the tabs
         // is not a page change.
         let body = arriving("page", page as u64, &self.controls, body);
         let ranked_palette_results = if self.controls.is_palette_open("ranked-commands") {
-            self.ranked_results(&self.ranked_palette_query.read(cx).text())
+            self.ranked_results(&self.ranked_palette_query.read(cx).shared_text())
         } else {
             Vec::new()
         };
 
         // The toolkit's handlers first — Tab, Shift-Tab, Escape, the drags,
         // the mouse taking over — and the gallery's own actions after them.
-        let root = vampir::root(div().id("root"), self, cx)
-            .size_full()
-            .flex()
-            .flex_col()
-            .font_family(ui_font())
-            .text_size(px(TEXT_SIZE))
-            .bg(ground(palette.backdrop))
-            .text_color(palette.text_primary)
-            .on_action(cx.listener(Self::toggle_palette))
-            .on_action(cx.listener(Self::toggle_ranked_palette))
-            .on_action(cx.listener(Self::use_system_scheme))
-            .on_action(cx.listener(Self::use_light))
-            .on_action(cx.listener(Self::use_dark))
-            .on_action(cx.listener(Self::minimize))
-            .on_action(cx.listener(Self::zoom))
-            .on_action(cx.listener(Self::close_window))
-            .on_action(cx.listener(|this, _: &ShowControls, window, cx| {
-                this.show_page(Page::Controls, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &ShowFields, window, cx| {
-                this.show_page(Page::Fields, window, cx)
-            }))
-            .on_action(
-                cx.listener(|this, _: &ShowData, window, cx| {
+        let root =
+            vampir::root(div().id("root"), self, cx)
+                .size_full()
+                .flex()
+                .flex_col()
+                .font(ui_font_face())
+                .text_size(px(TEXT_SIZE))
+                .bg(ground(palette.backdrop))
+                .text_color(palette.text_primary)
+                .on_action(cx.listener(Self::toggle_palette))
+                .on_action(cx.listener(Self::toggle_ranked_palette))
+                .on_action(cx.listener(Self::use_system_scheme))
+                .on_action(cx.listener(Self::use_light))
+                .on_action(cx.listener(Self::use_dark))
+                .on_action(cx.listener(Self::minimize))
+                .on_action(cx.listener(Self::zoom))
+                .on_action(cx.listener(Self::close_window))
+                .on_action(cx.listener(|this, _: &ShowControls, window, cx| {
+                    this.show_page(Page::Controls, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ShowFields, window, cx| {
+                    this.show_page(Page::Fields, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ShowData, window, cx| {
                     this.show_page(Page::Data, window, cx)
-                }),
-            )
-            .on_action(cx.listener(|this, _: &ShowColour, window, cx| {
-                this.show_page(Page::Colour, window, cx)
-            }))
-            .child(self.header(palette, cx))
-            .child(
-                scroll_area(
-                    "page",
-                    &self.scroll,
-                    ScrollAxis::Vertical,
+                }))
+                .on_action(cx.listener(|this, _: &ShowColour, window, cx| {
+                    this.show_page(Page::Colour, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ShowNative, window, cx| {
+                    this.show_page(Page::Native, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &OpenCommandBar, window, cx| {
+                    this.open_command_bar(window, cx)
+                }))
+                .child(self.header(palette, cx))
+                .child(
+                    scroll_area(
+                        "page",
+                        &self.scroll,
+                        ScrollAxis::Vertical,
+                        WidgetContext::new(palette, self, cx),
+                        window,
+                        div().p(px(20.0)).child(body),
+                    )
+                    .flex_1(),
+                )
+                .child(self.footer(palette))
+                .children(self.render_dialog(palette, cx))
+                .children(command_palette(
+                    "commands",
+                    &self.palette_query,
+                    &self.commands,
                     WidgetContext::new(palette, self, cx),
                     window,
-                    div().p(px(20.0)).child(body),
-                )
-                .flex_1(),
-            )
-            .child(self.footer(palette))
-            .children(self.render_dialog(palette, cx))
-            .children(command_palette(
-                "commands",
-                &self.palette_query,
-                &self.commands,
-                WidgetContext::new(palette, self, cx),
-                window,
-                |this, id, _window, cx| this.run_command(id, cx),
-            ))
-            .children(ranked_command_palette(
-                "ranked-commands",
-                &self.ranked_palette_query,
-                &ranked_palette_results,
-                WidgetContext::new(palette, self, cx),
-                window,
-                |this, id, _window, cx| this.note(format!("Opened {id}"), cx),
-            ))
-            .children(context_menu(
-                "row",
-                &self.row_menu(),
-                palette,
-                self,
-                cx,
-                |this, action, _window, cx| {
-                    let target = this.controls.menu_target().unwrap_or("").to_string();
-                    let description = match action {
-                        "move-documents" => "Move to Documents",
-                        "move-images" => "Move to Images",
-                        "duplicate" => "Duplicate",
-                        _ => action,
-                    };
-                    this.note(format!("{description} → {target}"), cx);
-                },
-            ))
-            .children(context_menu(
-                "view-menu",
-                &self.view_menu(),
-                palette,
-                self,
-                cx,
-                |this, action, window, cx| {
-                    match action {
-                        "system" => {
-                            this.set_scheme(Scheme::System, cx);
-                            this.note("Following system appearance", cx);
+                    |this, id, _window, cx| this.run_command(id, cx),
+                ))
+                .children(ranked_command_palette(
+                    "ranked-commands",
+                    &self.ranked_palette_query,
+                    &ranked_palette_results,
+                    WidgetContext::new(palette, self, cx),
+                    window,
+                    |this, id, _window, cx| this.note(format!("Opened {id}"), cx),
+                ))
+                .children(context_menu(
+                    "row",
+                    &self.row_menu(),
+                    palette,
+                    self,
+                    cx,
+                    |this, action, _window, cx| {
+                        let target = this.controls.menu_target().unwrap_or("").to_string();
+                        let description = match action {
+                            "move-documents" => "Move to Documents",
+                            "move-images" => "Move to Images",
+                            "duplicate" => "Duplicate",
+                            _ => action,
+                        };
+                        this.note(format!("{description} → {target}"), cx);
+                    },
+                ))
+                .children(context_menu(
+                    "view-menu",
+                    &self.view_menu(),
+                    palette,
+                    self,
+                    cx,
+                    |this, action, window, cx| {
+                        match action {
+                            "system" => {
+                                this.set_scheme(Scheme::System, cx);
+                                this.note("Following system appearance", cx);
+                            }
+                            "light" => {
+                                this.set_scheme(Scheme::Light, cx);
+                                this.note("Light appearance", cx);
+                            }
+                            "dark" => {
+                                this.set_scheme(Scheme::Dark, cx);
+                                this.note("Dark appearance", cx);
+                            }
+                            "violet" => {
+                                this.controls.theme.hue = 268.0;
+                                this.note("Violet accent", cx);
+                            }
+                            "teal" => {
+                                this.controls.theme.hue = 186.0;
+                                this.note("Teal accent", cx);
+                            }
+                            "palette" => this.controls.open_palette(
+                                "commands",
+                                &this.palette_query,
+                                window,
+                                cx,
+                            ),
+                            _ => {}
                         }
-                        "light" => {
-                            this.set_scheme(Scheme::Light, cx);
-                            this.note("Light appearance", cx);
-                        }
-                        "dark" => {
-                            this.set_scheme(Scheme::Dark, cx);
-                            this.note("Dark appearance", cx);
-                        }
-                        "violet" => {
-                            this.controls.theme.hue = 268.0;
-                            this.note("Violet accent", cx);
-                        }
-                        "teal" => {
-                            this.controls.theme.hue = 186.0;
-                            this.note("Teal accent", cx);
-                        }
-                        "palette" => {
-                            this.controls
-                                .open_palette("commands", &this.palette_query, window, cx)
-                        }
-                        _ => {}
-                    }
-                    cx.notify();
-                },
-            ));
+                        cx.notify();
+                    },
+                ));
         // A control notices a transition as it renders, including the
         // footer and overlays, so ask for another frame after all of them.
         if self.controls.animating() {
@@ -863,13 +904,16 @@ impl Gallery {
             .child(separator(false, palette))
             .child(
                 row()
+                    .text_size(px(SMALL_TEXT_SIZE))
+                    .text_color(palette.text_secondary)
                     .px(px(20.0))
                     .py(px(10.0))
-                    .child(caption(palette, "Last action"))
-                    .child(
-                        fading_text("last-action", self.last_action.clone(), &self.controls)
-                            .text_color(palette.text_secondary),
-                    )
+                    .child("Last action")
+                    .child(fading_text(
+                        "last-action",
+                        self.last_action.clone(),
+                        &self.controls,
+                    ))
                     .child(div().flex_1())
                     // Says so when the gallery is running slowed down, so a
                     // screenshot taken that way cannot pass for the real thing.
@@ -1164,7 +1208,7 @@ impl Gallery {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let ranked_query = self.ranked_query.read(cx).text();
+        let ranked_query = self.ranked_query.read(cx).shared_text();
         let ranked_results = self.ranked_results(&ranked_query);
         // The card is a gradient, so each of the list's edge fades takes the
         // card's colour at that edge, from where both painted last frame.
@@ -1569,6 +1613,107 @@ impl Gallery {
             .into_any_element()
     }
 
+    /// Opens the command bar in a window of its own above this one, which a
+    /// native view cannot hide, or brings the open one back.
+    #[cfg(feature = "command-bar-window")]
+    fn open_command_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let palette = self.controls.palette();
+        let commands = self.commands.clone();
+        let opened = vampir::open_command_bar(
+            self,
+            "native-bar",
+            commands,
+            palette,
+            vampir::CommandBarOptions {
+                dim: self.dim_command_bar,
+            },
+            window,
+            cx,
+            |this, outcome, _window, cx| match outcome {
+                vampir::CommandBarOutcome::Chosen(id) => this.run_command(id, cx),
+                vampir::CommandBarOutcome::Dismissed(why) => {
+                    this.note(format!("Command bar dismissed: {why:?}"), cx)
+                }
+            },
+        );
+        if let Err(error) = opened {
+            self.note(format!("No command bar here: {error}"), cx);
+        }
+    }
+
+    #[cfg(not(feature = "command-bar-window"))]
+    fn open_command_bar(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.note(
+            "The command bar window needs --features command-bar-window",
+            cx,
+        );
+    }
+
+    fn page_native(
+        &mut self,
+        palette: Palette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let native = self.native.clone();
+        let explanation = if native.is_some() {
+            "Below is a real native view, composited over this window: anything the toolkit draws there is hidden under it. The command bar opens in a window of its own, owned by this one, so it shows above the view while the view stays live underneath."
+        } else {
+            "This platform's window handle has no native child view to show here; the command bar still opens in a window of its own."
+        };
+        let surface = column()
+            .child(div().text_color(palette.text_secondary).child(explanation))
+            .child(
+                row()
+                    .child(button(
+                        "open-command-bar",
+                        "Open command bar",
+                        ButtonVariant::Primary,
+                        true,
+                        palette,
+                        cx,
+                        |this, window, cx| this.open_command_bar(window, cx),
+                    ))
+                    .child(switch(
+                        "dim-command-bar",
+                        self.dim_command_bar,
+                        Some("Dim the window behind it"),
+                        true,
+                        WidgetContext::new(palette, self, cx),
+                        |this, on, _window, cx| {
+                            this.dim_command_bar = on;
+                            cx.notify();
+                        },
+                    )),
+            )
+            .child(
+                div()
+                    .h(px(320.0))
+                    .w_full()
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(palette.field_border)
+                    .child(
+                        gpui::canvas(
+                            move |bounds, window, _cx| {
+                                // Only the part the page's viewport shows:
+                                // scrolled under the header, a native view
+                                // would cover it.
+                                let visible = bounds.intersect(&window.content_mask().bounds);
+                                let shown = (visible.size.height > px(1.0)).then_some(visible);
+                                if let Some(native) = &native {
+                                    native.place(shown, window);
+                                }
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .size_full(),
+                    ),
+            );
+        let _ = window;
+        card(palette, "A command bar above a live native view", surface).into_any_element()
+    }
+
     fn page_colour(&mut self, palette: Palette, cx: &mut Context<Self>) -> gpui::AnyElement {
         let wheel = hue_wheel(0.62, 0.11);
         let roles: [(&str, gpui::Rgba); 9] = [
@@ -1685,7 +1830,7 @@ impl Gallery {
                                             WidgetContext::new(palette, self, cx),
                                         )),
                                 )
-                                .child(caption(palette, "0% grey · 100% standard · 200% vivid")),
+                                .child(caption(palette, "0% grey · 100% standard · 300% vivid")),
                         )),
                     )
                     .child(
@@ -1719,17 +1864,35 @@ impl Gallery {
     }
 }
 
+/// A menu icon drawn from a glyph, for rows that carry one.
+fn glyph_icon(character: &'static str) -> vampir::MenuIcon {
+    vampir::MenuIcon::new(move |size, color| {
+        glyph(character)
+            .text_size(px(size * 0.85))
+            .text_color(color)
+            .into_any_element()
+    })
+}
+
 // ---- Overlays ---------------------------------------------------------------
 
 impl Gallery {
     fn row_menu(&self) -> Vec<MenuItem> {
         vec![
             MenuItem::header(self.controls.menu_target().unwrap_or("Item").to_string()),
-            MenuItem::action("open", "Open").shortcut("⏎"),
-            MenuItem::action("rename", "Rename").shortcut("F2"),
+            MenuItem::action("open", "Open")
+                .shortcut("⏎")
+                .icon(glyph_icon("▣")),
+            MenuItem::action("rename", "Rename")
+                .shortcut("F2")
+                .icon(glyph_icon("✎")),
             MenuItem::separator(),
-            MenuItem::action("pin", "Pin to top").checked(true),
-            MenuItem::action("reveal", "Show in folder").disabled(),
+            MenuItem::action("pin", "Pin to top")
+                .checked(true)
+                .icon(glyph_icon("★")),
+            MenuItem::action("reveal", "Show in folder")
+                .disabled()
+                .icon(glyph_icon("▤")),
             MenuItem::submenu(
                 "Organize",
                 vec![
@@ -1744,7 +1907,10 @@ impl Gallery {
                 ],
             ),
             MenuItem::separator(),
-            MenuItem::action("delete", "Delete").shortcut("⌫").danger(),
+            MenuItem::action("delete", "Delete")
+                .shortcut("⌫")
+                .danger()
+                .icon(glyph_icon("✕")),
         ]
     }
 
@@ -1844,6 +2010,9 @@ fn app_menus() -> Vec<Menu> {
             OsMenuItem::action("Fields", ShowFields),
             OsMenuItem::action("Data", ShowData),
             OsMenuItem::action("Colour", ShowColour),
+            OsMenuItem::action("Native view", ShowNative),
+            OsMenuItem::separator(),
+            OsMenuItem::action("Command bar", OpenCommandBar),
             OsMenuItem::separator(),
             OsMenuItem::action("System", UseSystemScheme),
             OsMenuItem::action("Light", UseLight),
@@ -1885,6 +2054,8 @@ fn main() {
             KeyBinding::new("secondary-2", ShowFields, None),
             KeyBinding::new("secondary-3", ShowData, None),
             KeyBinding::new("secondary-4", ShowColour, None),
+            KeyBinding::new("secondary-5", ShowNative, None),
+            KeyBinding::new("secondary-j", OpenCommandBar, None),
         ];
         if cfg!(target_os = "macos") {
             // Hiding is a macOS idea; the other desktops have neither the
