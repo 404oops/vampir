@@ -1,7 +1,7 @@
 //! Right-click context menus.
 //!
 //! A menu is opened from wherever the press happened, by putting it in the
-//! host's [`ControlState`](crate::ControlState), and rendered once near the root of the view.
+//! host's [`ControlState`], and rendered once near the root of the view.
 //! Which items it holds is the host's decision each frame, because that
 //! depends on what was clicked, which the state carries as an opaque target
 //! string.

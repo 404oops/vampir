@@ -925,7 +925,7 @@ pub(crate) type Activate<V> = Rc<dyn Fn(&mut V, SharedString, &mut Window, &mut 
 ///
 /// The host owns the query input and the items; this filters the items by
 /// the query with [`fuzzy_filter`], keeps the keyboard's row in
-/// [`ControlState`](crate::ControlState) under `id`, and reports the picked
+/// [`ControlState`] under `id`, and reports the picked
 /// `Command::id` — from a click and from Enter alike. The keys arrive as the
 /// field's own actions: a single-line field has no use for Up, Down or an
 /// Enter it has nothing to submit to, so it passes them on, and they are
@@ -983,7 +983,7 @@ pub fn search_list<V: ControlHost>(
 /// [`scroll_fades`](crate::scroll_fades); the list's viewport is
 /// [`ControlState::scroll`](crate::ControlState::scroll)`((id, "list"))`,
 /// whose bounds say where those edges are. `id` identifies the list in
-/// [`ControlState`](crate::ControlState), as for [`search_list`].
+/// [`ControlState`], as for [`search_list`].
 #[allow(clippy::too_many_arguments)]
 pub fn ranked_search_list<V: ControlHost>(
     id: &'static str,

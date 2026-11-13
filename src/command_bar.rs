@@ -10,7 +10,7 @@
 //! the palette's own; only the window around them is new.
 //!
 //! It needs a GPUI backend that implements
-//! [`WindowKind::AnchoredPopup`](gpui::WindowKind::AnchoredPopup): the
+//! [`WindowKind::AnchoredPopup`]: the
 //! vendored GPUI-CE in this repository does on macOS, Windows and X11. On a
 //! backend that does not, [`open_command_bar`] returns the backend's error
 //! rather than falling back to a palette the native view would cover.
@@ -46,7 +46,7 @@
 //!   front.
 //!
 //! Sessions belong to the host that opened them, in its
-//! [`ControlState`](crate::ControlState): two host windows can each have a
+//! [`ControlState`]: two host windows can each have a
 //! bar open, and one host's bar never closes another's.
 //!
 //! [`command_palette`]: crate::command_palette

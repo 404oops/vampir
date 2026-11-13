@@ -101,6 +101,9 @@ impl Palette {
     /// Values outside `0..=3` are clamped; NaN uses [`DEFAULT_SATURATION`].
     pub fn from_hue_and_saturation(hue: f64, saturation: f64, dark: bool) -> Self {
         let saturation = normalized_saturation(saturation);
+        // Here rather than only where a colour is made: the roles offset the
+        // hue, and a hue that is not a number has to be one hue for all of them.
+        let hue = if hue.is_finite() { hue } else { 0.0 };
         // Strong fills reach the sRGB boundary quickly; spend the extra
         // intensity on the quieter surfaces instead of clipping every button.
         let control_gain = saturation.min(1.0) + (saturation - 1.0).max(0.0) * 0.35;
@@ -347,6 +350,18 @@ mod tests {
                 assert_eq!(
                     Palette::from_hue_and_saturation(268.0, input, dark),
                     Palette::from_hue_and_saturation(268.0, expected, dark)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_hue_that_is_not_a_number_falls_back_to_zero() {
+        for dark in [false, true] {
+            for hue in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                assert_eq!(
+                    Palette::from_hue_and_saturation(hue, MAX_SATURATION, dark),
+                    Palette::from_hue_and_saturation(0.0, MAX_SATURATION, dark)
                 );
             }
         }
