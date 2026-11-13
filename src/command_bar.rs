@@ -32,7 +32,8 @@
 //! - With [`CommandBarOptions::dim`], a scrim darkens the host window's
 //!   content, native view included, while the bar is open, as the
 //!   in-window palette's does; a press on it dismisses the bar and goes no
-//!   further.
+//!   further. There is no scrim where one cannot be shown: on an X11 screen
+//!   with no compositing manager, and under Wayland.
 //! - It follows its parent when the parent moves, is re-anchored when the
 //!   parent is resized, and closes with the parent.
 //! - `on_done` runs at most once, after the window is gone and outside any
@@ -119,6 +120,9 @@ pub struct CommandBarOptions {
     /// a bar over live content is often there to act on what is showing.
     /// Ignored where the desktop cannot blend one window over another (an
     /// X11 screen with no compositing manager): the scrim would be opaque.
+    /// Ignored under Wayland too, where the bar holds the keyboard through a
+    /// popup grab and a compositor dismisses a grabbing popup that has
+    /// another popup of the same window beside it.
     pub dim: bool,
 }
 
@@ -198,7 +202,7 @@ pub fn open_command_bar<V: ControlHost>(
     // keyboard, so a press on it leaves the bar active long enough to hear
     // the press.
     let bar_slot: Rc<Cell<Option<WindowHandle<CommandBarWindow>>>> = Rc::default();
-    let scrim = if options.dim && cx.windows_are_composited() {
+    let scrim = if options.dim && can_dim(cx) {
         let slot = bar_slot.clone();
         Some(cx.open_window(
             popup_window(
@@ -323,6 +327,12 @@ pub fn open_command_bar<V: ControlHost>(
     Ok(())
 }
 
+/// Whether a scrim window can go under the bar on this desktop: see
+/// [`CommandBarOptions::dim`].
+fn can_dim(cx: &App) -> bool {
+    cx.windows_are_composited() && cx.compositor_name() != "Wayland"
+}
+
 /// The options for a window anchored to `parent`: undecorated, fixed, its
 /// background clear so what it draws can fade in.
 #[allow(clippy::too_many_arguments)]
@@ -351,7 +361,9 @@ fn popup_window(
             gravity,
             constraint_adjustment,
             offset: point(px(0.0), px(0.0)),
-            grab: false,
+            // Wayland gives a popup the keyboard only with a grab; the other backends ignore
+            // this and go by `focus`.
+            grab: focus,
         }),
         is_movable: false,
         is_resizable: false,

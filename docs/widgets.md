@@ -78,7 +78,7 @@ These are in-window menus drawn by the toolkit. The macOS menu bar is a differen
 
 ![The command bar above the Native view page's live NSTextView, filtering for "to"](command-bar.png)
 
-`open_command_bar` is the palette in a window of its own above the host window, for a host with a live native view over its content that would hide the in-window palette; `CommandBarOptions::dim` darkens the host window behind it. The gallery's Native view page shows it over a real native view. See [hosting](hosting.md#over-a-native-view).
+`open_command_bar` is the palette in a window of its own above the host window, for a host with a live native view over its content that would hide the in-window palette; `CommandBarOptions::dim` darkens the host window behind it, except on an X11 screen with no compositing manager and under Wayland, where no scrim can be shown. The gallery's Native view page shows it over a real native view. See [hosting](hosting.md#over-a-native-view).
 
 `command_palette` is opened with `ControlState::open_palette`, or `toggle_palette` from whatever shortcut the host gives it, and renders nothing otherwise. The host owns the query `TextInput` and the `Command`s; the palette filters them with `fuzzy_filter` as the query is typed, moves the highlight with Up and Down, runs the highlighted command on Enter or a clicked one, and closes on Escape or the scrim — handing the keyboard back where it was before the command runs.
 
