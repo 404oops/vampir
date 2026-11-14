@@ -19,8 +19,8 @@ use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, LayoutId, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Rgba, SharedString,
-    Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, prelude::*,
-    px, relative, size,
+    Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, point, prelude::*, px,
+    relative, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -204,8 +204,8 @@ pub struct TextInput {
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
-    last_lines: Rc<[gpui::WrappedLine]>,
-    shaped: Option<ShapedText>,
+    last_layout: Option<Rc<gpui::ShapedText>>,
+    shaped: Option<ShapeCache>,
     last_line_height: Pixels,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
@@ -243,7 +243,7 @@ impl TextInput {
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
-            last_lines: Rc::from([]),
+            last_layout: None,
             shaped: None,
             last_line_height: px(0.0),
             last_bounds: None,
@@ -301,6 +301,11 @@ impl TextInput {
         self.undo_stack.clear();
         self.redo_stack.clear();
         cx.notify();
+    }
+
+    /// Shares the current text without copying its bytes.
+    pub fn shared_text(&self) -> SharedString {
+        self.content.clone()
     }
 
     pub fn text(&self) -> String {
@@ -742,16 +747,26 @@ impl TextInput {
 
     /// Cursor position in text-local coordinates (top-left of glyph line).
     fn position_for_offset(&self, offset: usize) -> Option<Point<Pixels>> {
-        position_for_offset(&self.last_lines, self.last_line_height, offset)
+        self.last_layout
+            .as_ref()?
+            .visual_position_for_byte_index(offset, self.last_line_height)
     }
 
     /// Offset for a point in text-local coordinates.
     fn offset_for_position_local(&self, position: Point<Pixels>) -> usize {
+        let line_height = self.last_line_height;
+        let Some(layout) = &self.last_layout else {
+            return offset_for_position(&self.content, px(0.0), position, |_| 0);
+        };
         offset_for_position(
             &self.content,
-            &self.last_lines,
-            self.last_line_height,
+            layout.size(line_height).height,
             position,
+            |local| {
+                layout
+                    .closest_byte_index_for_pixel_point(local, line_height)
+                    .unwrap_or_else(|index| index)
+            },
         )
     }
 
@@ -832,54 +847,28 @@ fn word_range_at(text: &str, offset: usize) -> Range<usize> {
         .unwrap_or(0..0)
 }
 
-fn position_for_offset(
-    lines: &[gpui::WrappedLine],
-    line_height: Pixels,
-    offset: usize,
-) -> Option<Point<Pixels>> {
-    let mut y_offset = px(0.0);
-    let mut start = 0usize;
-    for line in lines {
-        let end = start + line.text.len();
-        if offset <= end {
-            let local = line.position_for_index(offset - start, line_height)?;
-            return Some(point(local.x, local.y + y_offset));
-        }
-        y_offset += line.size(line_height).height;
-        start = end + 1; // skip the '\n'
-    }
-    None
-}
-
+/// The content offset for a point in text-local coordinates, given the
+/// height of the text's layout and `hit`, the layout's own hit test. Above
+/// the text is its start and below it its end. The layout can still describe
+/// a placeholder or the edit before this one, so what `hit` answers is
+/// clamped to the content and to a character boundary in it.
 fn offset_for_position(
     content: &str,
-    lines: &[gpui::WrappedLine],
-    line_height: Pixels,
+    layout_height: Pixels,
     position: Point<Pixels>,
+    hit: impl FnOnce(Point<Pixels>) -> usize,
 ) -> usize {
     if content.is_empty() || position.y < px(0.0) {
         return 0;
     }
-    let mut y_offset = px(0.0);
-    let mut start = 0usize;
-    for line in lines {
-        let height = line.size(line_height).height;
-        if position.y < y_offset + height {
-            let local = point(position.x, position.y - y_offset);
-            let index = line
-                .closest_index_for_position(local, line_height)
-                .unwrap_or_else(|idx| idx);
-            // Layout can still describe a placeholder or the preceding edit.
-            let mut offset = (start + index.min(line.text.len())).min(content.len());
-            while !content.is_char_boundary(offset) {
-                offset -= 1;
-            }
-            return offset;
-        }
-        y_offset += height;
-        start += line.text.len() + 1;
+    if position.y >= layout_height {
+        return content.len();
     }
-    content.len()
+    let mut offset = hit(position).min(content.len());
+    while !content.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
 }
 
 fn horizontal_scroll_offset(
@@ -989,8 +978,8 @@ impl EntityInputHandler for TextInput {
         let range = range_utf16
             .as_ref()
             .map(|range_utf16| self.range_from_utf16(range_utf16))
-            .or(self.marked_range.clone())
-            .unwrap_or(self.selected_range.clone());
+            .or_else(|| self.marked_range.clone())
+            .unwrap_or_else(|| self.selected_range.clone());
 
         // Committing an IME composition shouldn't undo to the half-composed
         // state; the pre-composition snapshot was taken when marking began.
@@ -1019,8 +1008,8 @@ impl EntityInputHandler for TextInput {
         let range = range_utf16
             .as_ref()
             .map(|range_utf16| self.range_from_utf16(range_utf16))
-            .or(self.marked_range.clone())
-            .unwrap_or(self.selected_range.clone());
+            .or_else(|| self.marked_range.clone())
+            .unwrap_or_else(|| self.selected_range.clone());
 
         // Snapshot once per composition, before the first marked edit.
         if self.marked_range.is_none() {
@@ -1088,12 +1077,13 @@ struct TextElement {
     input: Entity<TextInput>,
 }
 
-// One layout per input, shared with paint and hit testing. GPUI caches glyph
-// layouts, but shape_text still copies every hard line and allocates its
-// decorations on every call, including repeated layout measurements.
-struct ShapedText {
+// One layout per input, shared with paint and hit testing. GPUI keeps a
+// document's layout between frames, but every shape_text call still hashes
+// the whole text and applies the runs' colours again, and layout measures a
+// multi-line field more than once a frame.
+struct ShapeCache {
     key: ShapeKey,
-    lines: Rc<[gpui::WrappedLine]>,
+    layout: Rc<gpui::ShapedText>,
 }
 
 #[derive(PartialEq)]
@@ -1129,7 +1119,7 @@ fn replacing_text(text: &str, range: Range<usize>, replacement: &str) -> String 
 }
 
 struct PrepaintState {
-    lines: Rc<[gpui::WrappedLine]>,
+    layout: Option<Rc<gpui::ShapedText>>,
     line_height: Pixels,
     cursor: Option<PaintQuad>,
 }
@@ -1148,7 +1138,7 @@ impl TextElement {
         wrap_width: Option<Pixels>,
         window: &mut Window,
         cx: &mut App,
-    ) -> (Rc<[gpui::WrappedLine]>, Pixels) {
+    ) -> (Option<Rc<gpui::ShapedText>>, Pixels) {
         let input = self.input.read(cx);
         let content = input.content.clone();
         let selected_range = input.selected_range.clone();
@@ -1193,22 +1183,25 @@ impl TextElement {
         if let Some(shaped) = &input.shaped
             && shaped.key == key
         {
-            return (shaped.lines.clone(), window.line_height());
+            return (Some(shaped.layout.clone()), window.line_height());
         }
 
         let runs = text_runs(&key);
-        let lines: Rc<[gpui::WrappedLine]> = window
-            .text_system()
-            .shape_text(key.text.clone(), font_size, &runs, key.wrap, None)
-            .map(|lines| Rc::from(lines.into_vec()))
-            .unwrap_or_else(|_| Rc::from([]));
+        let Ok(layout) =
+            window
+                .text_system()
+                .shape_text(key.text.clone(), font_size, &runs, key.wrap, None)
+        else {
+            return (None, window.line_height());
+        };
+        let layout = Rc::new(layout);
         self.input.update(cx, |input, _| {
-            input.shaped = Some(ShapedText {
+            input.shaped = Some(ShapeCache {
                 key,
-                lines: lines.clone(),
+                layout: layout.clone(),
             });
         });
-        (lines, window.line_height())
+        (Some(layout), window.line_height())
     }
 }
 
@@ -1390,11 +1383,9 @@ impl Element for TextElement {
                     let element = TextElement {
                         input: input.clone(),
                     };
-                    let (lines, line_height) = element.shape(width, window, cx);
-                    let height: Pixels = lines
-                        .iter()
-                        .map(|l| l.size(line_height).height)
-                        .fold(px(0.0), |a, b| a + b)
+                    let (layout, line_height) = element.shape(width, window, cx);
+                    let height = layout
+                        .map_or(px(0.0), |layout| layout.size(line_height).height)
                         .max(line_height);
                     size(width.unwrap_or(px(0.0)), height)
                 }
@@ -1415,7 +1406,7 @@ impl Element for TextElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        let (lines, line_height) = self.shape(Some(bounds.size.width), window, cx);
+        let (layout, line_height) = self.shape(Some(bounds.size.width), window, cx);
 
         // Cursor.
         let input = self.input.read(cx);
@@ -1430,7 +1421,9 @@ impl Element for TextElement {
         let cursor_pos = if content_empty {
             Some(point(px(0.0), px(0.0)))
         } else {
-            position_for_offset(&lines, line_height, cursor_offset)
+            layout.as_ref().and_then(|layout| {
+                layout.visual_position_for_byte_index(cursor_offset, line_height)
+            })
         };
 
         // Keep the caret visible in single-line fields by scrolling the text
@@ -1438,7 +1431,7 @@ impl Element for TextElement {
         if multi_line {
             scroll_offset = px(0.0);
         } else if let Some(pos) = cursor_pos {
-            let text_width = lines.first().map_or(px(0.0), |line| line.width());
+            let text_width = layout.as_ref().map_or(px(0.0), |layout| layout.width());
             scroll_offset =
                 horizontal_scroll_offset(scroll_offset, pos.x, text_width, bounds.size.width);
         }
@@ -1449,17 +1442,17 @@ impl Element for TextElement {
         if selected_range.is_empty()
             && let Some(pos) = cursor_pos
         {
-            cursor = Some(fill(
-                Bounds::new(
+            cursor = Some(
+                PaintQuad::new(Bounds::new(
                     point(bounds.left() + pos.x - scroll_offset, bounds.top() + pos.y),
                     size(px(1.5), line_height),
-                ),
-                cursor_color,
-            ));
+                ))
+                .background(cursor_color),
+            );
         }
 
         PrepaintState {
-            lines,
+            layout,
             line_height,
             cursor,
         }
@@ -1485,19 +1478,16 @@ impl Element for TextElement {
         let line_height = prepaint.line_height;
         let scroll_offset = self.input.read(cx).scroll_offset;
         // Clip: scrolled single-line text must not bleed past the field.
-        window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
-            let mut origin = point(bounds.origin.x - scroll_offset, bounds.origin.y);
-            for line in prepaint.lines.iter() {
-                let _ = line.paint_background(
-                    origin,
-                    line_height,
-                    gpui::TextAlign::Left,
-                    None,
-                    window,
-                    cx,
-                );
-                let _ = line.paint(origin, line_height, gpui::TextAlign::Left, None, window, cx);
-                origin.y += line.size(line_height).height;
+        let mask = gpui::ContentMask {
+            bounds,
+            fade_out: Default::default(),
+        };
+        window.with_content_mask(Some(mask), |window| {
+            if let Some(layout) = &prepaint.layout {
+                let origin = point(bounds.origin.x - scroll_offset, bounds.origin.y);
+                let align = gpui::TextAlign::Left;
+                let _ = layout.paint_background(origin, line_height, align, None, window, cx);
+                let _ = layout.paint(origin, line_height, align, None, window, cx);
             }
 
             if focus_handle.is_focused(window)
@@ -1507,9 +1497,9 @@ impl Element for TextElement {
             }
         });
 
-        let lines = prepaint.lines.clone();
+        let layout = prepaint.layout.clone();
         self.input.update(cx, |input, _cx| {
-            input.last_lines = lines;
+            input.last_layout = layout;
             input.last_line_height = line_height;
             input.last_bounds = Some(bounds);
         });
@@ -1577,7 +1567,6 @@ impl Focusable for TextInput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     fn shape_key(text: &str) -> ShapeKey {
         ShapeKey {
@@ -1695,41 +1684,6 @@ mod tests {
         }
     }
 
-    fn line(text: &str, wrap_at: Option<usize>) -> gpui::WrappedLine {
-        let glyphs: Vec<_> = text
-            .char_indices()
-            .enumerate()
-            .map(|(column, (index, _))| gpui::ShapedGlyph {
-                id: gpui::GlyphId(0),
-                position: point(px(column as f32 * 10.0), px(0.0)),
-                index,
-                is_emoji: false,
-            })
-            .collect();
-        let mut line = gpui::WrappedLine::default();
-        line.text = text.to_string().into();
-        *line = Arc::new(gpui::WrappedLineLayout {
-            unwrapped_layout: Arc::new(gpui::LineLayout {
-                width: px(glyphs.len() as f32 * 10.0),
-                len: text.len(),
-                runs: vec![gpui::ShapedRun {
-                    font_id: gpui::FontId(0),
-                    glyphs,
-                }],
-                ..Default::default()
-            }),
-            wrap_boundaries: wrap_at
-                .map(|glyph_ix| gpui::WrapBoundary {
-                    run_ix: 0,
-                    glyph_ix,
-                })
-                .into_iter()
-                .collect(),
-            wrap_width: wrap_at.map(|column| px(column as f32 * 10.0)),
-        });
-        line
-    }
-
     #[test]
     fn double_click_selects_the_word_whitespace_or_punctuation_under_it() {
         let text = "hello  world!";
@@ -1756,10 +1710,10 @@ mod tests {
 
     #[test]
     fn empty_input_never_selects_its_multiline_placeholder() {
-        let lines = [line("placeholder", Some(5)), line("second line", None)];
+        // The layout is the placeholder's, which a hit would land in.
         for y in [-20.0, 10.0, 30.0, 50.0, 100.0] {
             assert_eq!(
-                offset_for_position("", &lines, px(20.0), point(px(80.0), px(y))),
+                offset_for_position("", px(40.0), point(px(80.0), px(y)), |_| 7),
                 0
             );
         }
@@ -1767,44 +1721,27 @@ mod tests {
 
     #[test]
     fn hit_testing_clamps_stale_layout_to_valid_content_boundaries() {
-        let lines = [line("stale layout", None)];
-        assert_eq!(
-            offset_for_position("é", &lines, px(20.0), point(px(10.0), px(10.0))),
-            0
-        );
-        assert_eq!(
-            offset_for_position("é", &lines, px(20.0), point(px(80.0), px(10.0))),
-            2
-        );
+        // Inside "é", and past the end of it: a layout of the text before an edit.
+        let at = |hit| offset_for_position("é", px(20.0), point(px(10.0), px(10.0)), move |_| hit);
+        assert_eq!(at(1), 0);
+        assert_eq!(at(11), 2);
     }
 
     #[test]
-    fn hit_testing_and_caret_positions_account_for_wrapping_and_newlines() {
+    fn above_the_text_is_its_start_and_below_it_its_end() {
         let content = "abcdef\néz";
-        let lines = [line("abcdef", Some(3)), line("éz", None)];
+        let hit = |_| 4;
         assert_eq!(
-            offset_for_position(content, &lines, px(20.0), point(px(10.0), px(30.0))),
-            4
+            offset_for_position(content, px(60.0), point(px(80.0), px(-1.0)), hit),
+            0
         );
         assert_eq!(
-            offset_for_position(content, &lines, px(20.0), point(px(10.0), px(50.0))),
-            9
-        );
-        assert_eq!(
-            position_for_offset(&lines, px(20.0), 4),
-            Some(point(px(10.0), px(20.0)))
-        );
-        assert_eq!(
-            position_for_offset(&lines, px(20.0), 9),
-            Some(point(px(10.0), px(40.0)))
-        );
-        assert_eq!(
-            offset_for_position(content, &lines, px(20.0), point(px(0.0), px(80.0))),
+            offset_for_position(content, px(60.0), point(px(0.0), px(60.0)), hit),
             content.len()
         );
         assert_eq!(
-            offset_for_position(content, &lines, px(20.0), point(px(80.0), px(-1.0))),
-            0
+            offset_for_position(content, px(60.0), point(px(10.0), px(30.0)), hit),
+            4
         );
     }
 

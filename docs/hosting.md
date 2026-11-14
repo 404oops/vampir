@@ -44,7 +44,7 @@ impl Render for Editor {
         let body = self.body(palette, window, cx);
         let root = vampir::root(div().id("root"), self, cx)
             .size_full()
-            .font_family(vampir::ui_font())
+            .font(vampir::ui_font_face())
             .bg(vampir::ground(palette.backdrop))
             .child(body);
         if self.controls.animating() {
@@ -109,7 +109,7 @@ Every `ControlState` carries a `Theme`: a hue, a saturation, and a `Scheme` that
 
 Choose the app's hue and saturation in code as part of its design, based on its purpose and existing visual identity. A quiet editing tool might use a restrained saturation; an expressive creative tool might use more. These are defaults for the developer or coding agent to choose, without requiring the end user to configure a theme. Add theme controls only when customization serves the product. The gallery's App theme controls on the Colour page demonstrate the APIs for evaluation.
 
-Saturation is a multiplier from `0.0` to `MAX_SATURATION` (`2.0`): zero makes every palette role grey, `DEFAULT_SATURATION` (`1.0`) preserves the toolkit's original colour strength, and two is more vivid. It applies to the whole palette, including surfaces and semantic colours. Values outside the range are clamped; NaN uses the default. `Palette::from_hue(hue, dark)` retains saturation one; `Palette::from_hue_and_saturation(hue, saturation, dark)` sets it explicitly, and `Palette::neutral(dark)` is greyscale.
+Saturation is a theme intensity from `0.0` to `MAX_SATURATION` (`3.0`): zero makes every palette role grey, `DEFAULT_SATURATION` (`1.0`) preserves the toolkit's original colour strength, and three is the vividness limit. Above one, strong fills and text gain chroma gently while backgrounds gain more; light panels pick up a tint rather than staying white. Zero remains neutral and one preserves the original palette. Values outside the range are clamped; NaN uses the default. `Palette::from_hue(hue, dark)` retains saturation one; `Palette::from_hue_and_saturation(hue, saturation, dark)` sets it explicitly, and `Palette::neutral(dark)` is greyscale.
 
 Follow the desktop's scheme with `self.controls.observe_appearance(window, cx)` in the view's constructor. `Scheme::System` means the desktop's choice; `Light` and `Dark` are explicit overrides if the product needs them. Configure the app's colours before the first render:
 
@@ -119,9 +119,9 @@ self.controls.theme.saturation = 0.55;
 self.controls.observe_appearance(window, cx);
 ```
 
-If the app offers theme customization, `scheme_picker`, `hue_picker` and `saturation_picker` bind directly to `ControlState::theme`; the toolkit handles their drags. The generic `saturation_slider` takes a saturation in `0.0..=2.0` and reports a normalized `0.0..=1.0` track position through `ControlHost::track_dragged`, like other sliders. Convert that position with `Theme::saturation_from_track(at.x)` before storing it.
+If the app offers theme customization, `scheme_picker`, `hue_picker` and `saturation_picker` bind directly to `ControlState::theme`; the toolkit handles their drags. The generic `saturation_slider` takes a saturation in `0.0..=3.0` and reports a normalized `0.0..=1.0` track position through `ControlHost::track_dragged`, like other sliders. Convert that position with `Theme::saturation_from_track(at.x)` before storing it.
 
-The window's own ground is `palette.backdrop`, lit with `vampir::ground(palette.backdrop)` on the root; `scroll_area` fades scrolling content into it at the right height. `vampir::ui_font()` is the system's interface face, for `.font_family` on the root.
+The window's own ground is `palette.backdrop`, lit with `vampir::ground(palette.backdrop)` on the root; `scroll_area` fades scrolling content into it at the right height. `.font(vampir::ui_font_face())` on the root sets text in the system's interface face, with the platform's symbol faces behind it: GPUI-CE's text system falls back only to a few text faces, and draws a stand-in for a symbol none of them has, such as ▣ or ✕ in a menu icon. `ui_font()` is the face's name alone.
 
 A host with a richer theme of its own can build `Palette` directly. It is a plain public struct of `Copy` colour roles: use `Palette::from_hue_and_saturation` or fill it field by field, then pass it, **by value**, into every control. See [Design](design.md#colour) for what the roles mean and when adding one is justified.
 
@@ -133,6 +133,10 @@ Which pop-up is open lives in `ControlState`, and so do the two overlays a host 
 
 - `self.controls.open_dialog("confirm")` opens the `dialog` with that id. It takes the keyboard, and its buttons, Enter, Escape and the scrim hand the keyboard back and close it before the host's callback runs.
 - `self.controls.toggle_palette("commands", &self.query, window, cx)` is what the shortcut for the `command_palette` does; `open_palette` and `close_palette` are the two halves. The palette puts the keyboard in the query, and gives it back where it was when it closes.
+
+### Over a native view
+
+A native view embedded in the host window — a web view, a video player — is composited over everything GPUI draws there, so the in-window palette is hidden wherever the view is. `vampir::open_command_bar(self, "commands", commands, palette, CommandBarOptions::default(), window, cx, on_done)` shows the same palette panel in a small window of its own, owned by the host's: above it and no other application's, following it, the native view visible and live underneath. Opening an open bar brings it back with the keyboard rather than making a second; Escape, a choice, a click elsewhere and a switch to another application close it; `on_done` hears how, once, after the window has gone. `CommandBarOptions { dim: true }` darkens the host window, native view included, while it is open. The host window stays the active one while the bar has the keyboard, and gets it back when the bar closes from inside itself. It is behind the `command-bar-window` feature because it needs the `AnchoredPopup` support of the GPUI-CE vendored in this repository — see [`vendor/LOCAL_PATCHES.md`](../vendor/LOCAL_PATCHES.md) — which a host enables by patching GPUI-CE as this repository's manifest does. On a backend without that support it returns an error rather than opening a palette the view would cover.
 
 A host that removes whatever has focus — switching pages, say — calls `self.controls.focus_root(window, cx)` first. GPUI dispatches nothing from a handle that is no longer in the tree, not even the root's own shortcuts, so a shortcut that "stopped working" is almost always focus left on something that has gone.
 

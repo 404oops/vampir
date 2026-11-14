@@ -1,0 +1,13 @@
+#!/bin/sh
+# Only for `cargo check`, which never links: the resource object can be empty.
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o|--output) out="$2"; shift ;;
+    --output=*) out="${1#--output=}" ;;
+    --version|-V) echo "GNU windres stand-in"; exit 0 ;;
+  esac
+  shift
+done
+[ -n "$out" ] && : > "$out"
+exit 0

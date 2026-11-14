@@ -1,0 +1,8 @@
+#!/bin/sh
+# cc-rs adds its own --target, which zig cannot parse; zig gets its own.
+for arg; do
+  shift
+  case "$arg" in --target=*|-target) continue ;; esac
+  set -- "$@" "$arg"
+done
+exec zig cc -target x86_64-windows-gnu "$@"

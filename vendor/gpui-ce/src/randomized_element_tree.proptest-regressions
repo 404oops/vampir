@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b2d6a87ec06934ff5857e678d073000de42ffadfa3f464f8e92bbcc7bc8d22ee # shrinks to RandomizedElementTreeMatchesFullRenderArgs = RandomizedElementTreeMatchesFullRenderArgs { __seed: 17616487931080810723, seed: 217425397718122 }
+cc 705d7925049b8131aaf984848796a02f1a83d6de05143a7c67093f801325fc15 # shrinks to RandomizedElementTreeMatchesFullRenderArgs = RandomizedElementTreeMatchesFullRenderArgs { __seed: 12387296812301723654, seed: 10039114902063362567 }

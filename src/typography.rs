@@ -21,3 +21,45 @@ pub fn ui_font() -> &'static str {
         "sans-serif"
     }
 }
+
+/// The faces each platform keeps its symbols in — geometric shapes, dingbats,
+/// arrows — in the order to try them after the interface face. GPUI-CE's text
+/// system falls back to a short list of text faces, none of which has them,
+/// and draws a stand-in for a symbol it cannot find. A face a machine does not
+/// have is skipped.
+pub fn symbol_fonts() -> &'static [&'static str] {
+    if cfg!(target_os = "macos") {
+        &["Apple Symbols", "Menlo"]
+    } else if cfg!(target_os = "windows") {
+        &["Segoe UI Symbol", "Segoe UI Emoji"]
+    } else {
+        &["DejaVu Sans", "Noto Sans Symbols 2", "Noto Sans Symbols"]
+    }
+}
+
+/// [`ui_font`] with [`symbol_fonts`] behind it. Put it on the root with
+/// `.font(ui_font_face())`, so a symbol in a label or a menu icon is drawn
+/// rather than a stand-in for it.
+pub fn ui_font_face() -> gpui::Font {
+    gpui::Font {
+        fallbacks: Some(gpui::FontFallbacks::from_fonts(
+            symbol_fonts().iter().map(|face| face.to_string()).collect(),
+        )),
+        ..gpui::font(ui_font())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_interface_face_falls_back_to_the_symbol_faces_in_order() {
+        let face = ui_font_face();
+        assert_eq!(face.family.as_ref(), ui_font());
+        let fallbacks = face
+            .fallbacks
+            .expect("symbol faces behind the interface face");
+        assert_eq!(fallbacks.fallback_list(), symbol_fonts());
+    }
+}
