@@ -1059,7 +1059,8 @@ pub fn combo<V: ControlHost>(
                                 )),
                         ),
                 )
-                .priority(100),
+                // Above dialog panels (150), below command palettes (180).
+                .priority(160),
             )
         })
 }

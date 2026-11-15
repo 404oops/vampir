@@ -211,6 +211,8 @@ struct Gallery {
     sort_by: usize,
 
     // Fields page.
+    dialog_destination: usize,
+    dialog_name: Entity<TextInput>,
     name: Entity<TextInput>,
     notes: Entity<TextInput>,
     query: Entity<TextInput>,
@@ -313,7 +315,25 @@ impl Gallery {
         let palette = controls.palette();
         let style = |size| InputStyle::from_palette(palette, size);
 
-        let name = cx.new(|cx| TextInput::new(cx, "Untitled project", false, style(TEXT_SIZE)));
+        let host = cx.weak_entity();
+        let name = cx.new(|cx| {
+            let mut input = TextInput::new(cx, "Untitled project", false, style(TEXT_SIZE));
+            let edit_host = host.clone();
+            input.on_change = Some(Box::new(move |_, cx| {
+                let _ = edit_host.update(cx, |host, cx| {
+                    let name = host.name.read(cx).text();
+                    host.note(format!("Editing {name}"), cx);
+                });
+            }));
+            input.on_submit = Some(Box::new(move |_, cx| {
+                let _ = host.update(cx, |host, cx| {
+                    // A submit operation reads its fields, just as a login does.
+                    let name = host.name.read(cx).text();
+                    host.note(format!("Submitted {name}"), cx);
+                });
+            }));
+            input
+        });
         let notes = cx.new(|cx| {
             let mut input =
                 TextInput::new(cx, "Anything worth remembering...", true, style(TEXT_SIZE));
@@ -378,6 +398,8 @@ impl Gallery {
             steps: 0.5,
             takes: 24,
             sort_by: 1,
+            dialog_destination: 0,
+            dialog_name: cx.new(|cx| TextInput::new(cx, "File name", false, style(TEXT_SIZE))),
             name,
             notes,
             query,
@@ -769,7 +791,7 @@ impl Render for Gallery {
                     .flex_1(),
                 )
                 .child(self.footer(palette))
-                .children(self.render_dialog(palette, cx))
+                .children(self.render_dialog(palette, window, cx))
                 .children(command_palette(
                     "commands",
                     &self.palette_query,
@@ -1942,16 +1964,31 @@ impl Gallery {
     fn render_dialog(
         &mut self,
         palette: Palette,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap(px(12.0))
+            .child(text_field(&self.dialog_name, palette, window, cx))
+            .child(combo(
+                "dialog-destination",
+                self.dialog_destination,
+                &["Trash".into(), "Archive".into()],
+                None,
+                WidgetContext::new(palette, self, cx),
+                |this, index, _, cx| {
+                    this.dialog_destination = index;
+                    cx.notify();
+                },
+            ));
         dialog(
             "confirm",
-            "Delete this file?",
+            "Move this file?",
             420.0,
             WidgetContext::new(palette, self, cx),
-            div()
-                .text_color(palette.text_secondary)
-                .child("It goes to the Trash, and you can put it back later."),
+            body,
             vec![
                 DialogButton::new(
                     "cancel",
@@ -1961,9 +1998,18 @@ impl Gallery {
                 ),
                 DialogButton::new(
                     "discard",
-                    "Delete",
-                    ButtonVariant::Danger,
-                    |this: &mut Gallery, _window, cx| this.note("Deleted report.pdf", cx),
+                    "Move",
+                    ButtonVariant::Primary,
+                    |this: &mut Gallery, _window, cx| {
+                        let destination = ["Trash", "Archive"][this.dialog_destination];
+                        this.note(
+                            format!(
+                                "Moved {} to {destination}",
+                                this.dialog_name.read(cx).text()
+                            ),
+                            cx,
+                        );
+                    },
                 ),
             ],
             |_this, _window, _cx| {},

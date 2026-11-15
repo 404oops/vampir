@@ -149,7 +149,8 @@ impl Span {
 }
 
 /// Notified with the input's content. Used for both the change and the
-/// submit hooks.
+/// submit hooks. Runs after the input update finishes, so callbacks may read
+/// inputs or update their host. The text is a snapshot of the triggering edit.
 pub type ContentCallback = Box<dyn Fn(&str, &mut App) + 'static>;
 
 /// Turns content into styled spans. Called on every layout, so keep it
@@ -340,10 +341,46 @@ impl TextInput {
     }
 
     fn emit_change(&mut self, cx: &mut Context<Self>) {
-        if let Some(on_change) = self.on_change.take() {
-            on_change(&self.content, cx);
-            self.on_change = Some(on_change);
+        self.defer_callback(false, cx);
+    }
+
+    fn defer_callback(&self, submit: bool, cx: &mut Context<Self>) {
+        let callback = if submit {
+            &self.on_submit
+        } else {
+            &self.on_change
+        };
+        if callback.is_none() {
+            return;
         }
+        let input = cx.weak_entity();
+        let content = self.content.clone();
+        // Calling a host synchronously can read this input while GPUI has
+        // removed it from the entity map for the current update.
+        cx.defer(move |cx| {
+            let Ok(callback) = input.update(cx, |input, _| {
+                if submit {
+                    input.on_submit.take()
+                } else {
+                    input.on_change.take()
+                }
+            }) else {
+                return;
+            };
+            if let Some(callback) = callback {
+                callback(&content, cx);
+                let _ = input.update(cx, |input, _| {
+                    let slot = if submit {
+                        &mut input.on_submit
+                    } else {
+                        &mut input.on_change
+                    };
+                    if slot.is_none() {
+                        *slot = Some(callback);
+                    }
+                });
+            }
+        });
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
@@ -606,9 +643,8 @@ impl TextInput {
         }
         if self.multi_line {
             self.replace_text_in_range(None, "\n", window, cx);
-        } else if let Some(on_submit) = self.on_submit.take() {
-            on_submit(&self.content, cx);
-            self.on_submit = Some(on_submit);
+        } else if self.on_submit.is_some() {
+            self.defer_callback(true, cx);
         } else {
             // Nothing to submit to: the Enter belongs to whatever holds the
             // field. See `up`.

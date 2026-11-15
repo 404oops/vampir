@@ -1817,6 +1817,19 @@ impl ControlState {
         }
     }
 
+    pub(crate) fn active_dialog_panel(&self) -> Option<FocusHandle> {
+        let trap = self.dialog_trap.borrow();
+        let (id, _) = trap.as_ref()?;
+        self.is_dialog_open(id)
+            .then(|| {
+                self.focus_handles
+                    .borrow()
+                    .get(&Tag::new((*id, "panel")))
+                    .cloned()
+            })
+            .flatten()
+    }
+
     /// Where Tab goes next while a modal dialog holds the keyboard, or `None`
     /// when none does.
     ///

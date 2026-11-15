@@ -149,3 +149,11 @@ Which key opens your command palette is your application's business, not a widge
 Write bindings with `secondary` for the platform's primary modifier — it is ⌘ on macOS and Ctrl everywhere else, so `"secondary-k"` is one binding that is right on all three. Label shortcuts with `vampir::display("secondary-k")`, which renders `⌘K` or `Ctrl+K` as the platform writes it; a `⌘` shown on a Windows machine is a symbol with no key behind it.
 
 On macOS the menu bar is not optional. `vampir::edit_menu()` is the Edit menu, wired to the text input's actions with the OS actions macOS needs to route them to the focused text; the rest of the bar is yours. See [Shipping a macOS app](macos-apps.md).
+
+## Text inputs and forms
+
+Create and retain each `Entity<TextInput>` in the host constructor. `TextInput::new` takes a placeholder, not initial content; use `set_text` to load a value without emitting a change. Give it `InputStyle::from_palette` and render through `text_field`, `text_area` or `search_field`, which supply the field surface, focus handling and palette updates. Bind `vampir::bind_keys(cx)` once and use `vampir::root` on the host root for editing and Tab/Shift-Tab navigation.
+
+`on_change` and `on_submit` run after the input update completes, with a snapshot of the triggering text, so a callback may update a weak host entity and the host operation may read its retained inputs. Route Enter and the submit button through that same operation. Avoid strong host captures, which form a reference cycle when the host owns the input. Preserve entered values on validation or operation failure. Dialog Tab navigation includes body fields and dropdowns as well as enabled footer buttons. When switching tabs or pages removes the focused element, call `controls.focus_root(window, cx)` before removal.
+
+The gallery exercises a submit callback that reads its own input through the host ([submission](input-submit.png)), and a dialog with a text field and a working dropdown above the panel in [dark](dialog-dropdown-dark.png) and [light](dialog-dropdown-light.png) schemes. Tab and Shift-Tab visit the field, dropdown and footer buttons without leaving the modal.

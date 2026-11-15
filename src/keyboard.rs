@@ -281,8 +281,28 @@ pub fn move_focus<V: ControlHost>(view: &mut V, window: &mut Window, cx: &mut Ap
     if reveal {
         return;
     }
-    if let Some(next) = view.control_state().trap_next(window, backward) {
-        window.focus(&next, cx);
+    if let Some(panel) = view.control_state().active_dialog_panel() {
+        // Walk the real tab order, including fields and composite controls in
+        // the body. The old button-only trap made forms unreachable by Tab.
+        let mut first = None;
+        loop {
+            if backward {
+                window.focus_prev(cx);
+            } else {
+                window.focus_next(cx);
+            }
+            if panel.contains_focused(window, cx) {
+                return;
+            }
+            let focused = window.focused(cx);
+            if focused.is_none() || first.as_ref() == focused.as_ref() {
+                break;
+            }
+            if first.is_none() {
+                first = focused;
+            }
+        }
+        window.focus(&panel, cx);
         return;
     }
     if backward {
